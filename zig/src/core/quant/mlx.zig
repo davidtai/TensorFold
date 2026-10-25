@@ -557,7 +557,7 @@ test "paired tables keep every scale and bias bit, scale low" {
     const a = std.testing.allocator;
     var sb = [_]u8{ 0x80, 0x3f, 0x00, 0xc0 }; // bf16 1.0, -2.0
     var bb = [_]u8{ 0x40, 0x40, 0x01, 0x80 }; // bf16 3.0, a negative subnormal
-    var wb = [_]u8{0} ** 32;
+    var wb: [32]u8 = @splat(0);
     const shape = [_]usize{ 2, 1, 0, 0, 0 };
     const h: Host = .{
         .words = .{ .dtype = .u32, .rank = 2, .shape = .{ 2, 4, 0, 0, 0 }, .bytes = &wb },
