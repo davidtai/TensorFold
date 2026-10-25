@@ -24,6 +24,7 @@ pub const Fns = struct {
     hc_gates: Function,
     rms_wide: Function,
     hc_mix: Function,
+    hc_up_mix: Function,
     ple_gate: Function,
     ple_conv: Function,
     ngram_ids: Function,
@@ -42,6 +43,7 @@ pub const Fns = struct {
             .hc_gates = try m.function("tf_fn_hc_gates"),
             .rms_wide = try m.function("tf_fn_rms_wide"),
             .hc_mix = try m.function("tf_fn_hc_mix"),
+            .hc_up_mix = try m.function("tf_fn_hc_up_mix"),
             .ple_gate = try m.function("tf_fn_ple_gate"),
             .ple_conv = try m.function("tf_fn_ple_conv"),
             .ngram_ids = try m.function("tf_fn_ngram_ids"),
@@ -167,6 +169,27 @@ pub fn hcMix(
     var a: Args = .{};
     inline for (.{ ad(g), ad(x), ad(mixed), kind, rows, streams, dims }) |v| try a.add(v);
     try l.flat(l.fnx.hc_mix, @as(i64, rows) * dims, s, &a);
+}
+
+/// The shape tf_fn_hc_up_mix is compiled for: 4 streams of 2,560, low rank 320, 4-bit groups of 32, bf16.
+pub const hc_up = struct {
+    pub const streams = 4;
+    pub const hidden = 2560;
+    pub const low = 320;
+    pub const rows = 4; // rows a block
+    pub const cols = 32; // hidden columns a block
+    /// Rows the launch takes at most: decode and verify windows (a prompt's rows take the products).
+    pub const most_rows = 16;
+};
+
+/// The hyper-connection read's gates, up projection and mix in one launch: z [rows, n] the down product's fp32 sums
+/// (n = 324 with the inject gates, which block 0 writes, else 320), x the normed streams, mixed [rows, 2560].
+pub fn hcUpMix(l: *const Launcher, z: CF, n: c_int, words: C, scales: C, biases: C, x: C, mixed: P, inject: P, rows: c_int, s: S) Error!void {
+    if (rows <= 0) return;
+    if (rows > hc_up.most_rows or (n != hc_up.low and n != hc_up.low + hc_up.streams)) return util.invalid("hcUpMix");
+    var a: Args = .{};
+    inline for (.{ ad(z), n, ad(words), ad(scales), ad(biases), ad(x), ad(mixed), ad(inject), rows }) |v| try a.add(v);
+    try l.go(l.fnx.hc_up_mix, dim(hc_up.hidden / hc_up.cols, cdiv(rows, hc_up.rows), 1), dim(threads, 1, 1), 0, s, &a);
 }
 
 /// The n-gram gate of every stream; `normed` is the conv's input rows.

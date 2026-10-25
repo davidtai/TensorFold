@@ -60,6 +60,23 @@ pub const Out = struct { mixed: Tensor, streams: Tensor };
 pub fn hcPre(o: Ops, m: *const model.Model, hc: model.Hc, x: Tensor, rows: usize, inject: ?Tensor) !Tensor {
     const d = m.dims;
     const z = try o.project(x, hc.down, rows, true);
+    if (upMixOf(o, m, hc, rows, inject != null)) |up| {
+        // decode and verify rows: the gates, the up product and the mix in one launch (tf_fn_hc_up_mix)
+        const mixed = try take(o, m.act, rows * d.hidden);
+        try o.l.fn_hc_up_mix(
+            @ptrFromInt(z.ptr),
+            @intCast(hc.down.n),
+            @ptrFromInt(up.words),
+            @ptrFromInt(up.scale),
+            @ptrFromInt(up.bias),
+            @ptrFromInt(x.ptr),
+            @ptrFromInt(mixed.ptr),
+            if (inject) |i| @ptrFromInt(i.ptr) else null,
+            @intCast(rows),
+            o.stream,
+        );
+        return mixed;
+    }
     const act = try take(o, m.act, rows * d.low);
     const kind = @backingInt(m.act);
     try o.l.fn_hc_gates(
@@ -85,6 +102,22 @@ pub fn hcPre(o: Ops, m: *const model.Model, hc: model.Hc, x: Tensor, rows: usize
         o.stream,
     );
     return mixed;
+}
+
+/// The up matrix when tf_fn_hc_up_mix takes the read: window rows (at most 16) of the compiled shape (4 x 2560 streams,
+/// low rank 320, MLX 4-bit g32 with bf16 tables, bf16 activations), one rank, merged launches on; else null.
+fn upMixOf(o: Ops, m: *const model.Model, hc: model.Hc, rows: usize, inject: bool) ?@import("core").quant.mlx.Matrix {
+    const shape = hip.Launcher.fn_hc_up;
+    const d = m.dims;
+    if (!o.window or o.prefill or !o.fused() or m.tp != null or m.act != .bf16 or rows == 0 or rows > shape.most_rows) return null;
+    if (d.streams != shape.streams or d.hidden != shape.hidden or d.low != shape.low) return null;
+    if (hc.down.n != shape.low + if (inject) @as(u32, shape.streams) else 0) return null;
+    const up = switch (hc.up.handle) {
+        .mlx => |x| x,
+        else => return null,
+    };
+    if (hc.up.partial or hc.up.n != d.wide() or hc.up.k != shape.low or up.bits != 4 or up.group != 32 or up.tables != .bf16 or up.words % 16 != 0) return null;
+    return up;
 }
 
 /// A block's output into the streams, then their norm: a tp rank's fp32 share is gathered and summed in the kernel.

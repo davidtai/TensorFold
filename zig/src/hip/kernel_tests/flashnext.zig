@@ -508,3 +508,130 @@ test "n-gram rows: every head's hash of the window, segments cut at eos, exact" 
         };
     }
 }
+
+/// A random MLX 4-bit g32 matrix (n, k) with bf16 tables, on the device.
+const Packed = struct {
+    dev: [3]DeviceBuffer,
+
+    fn init(t: *Rig, rng: *rig.Rng, n: usize, k: usize) !Packed {
+        const words = try gpa.alloc(u32, n * k / 8);
+        defer gpa.free(words);
+        const scale = try gpa.alloc(u16, n * k / 32);
+        defer gpa.free(scale);
+        const bias = try gpa.alloc(u16, scale.len);
+        defer gpa.free(bias);
+        for (words) |*w| w.* = @truncate(rng.next() >> 16);
+        for (scale) |*v| v.* = rig.bf16Bits((rng.unit() + 1.0) / 64.0);
+        for (bias) |*v| v.* = rig.bf16Bits(-rng.unit() / 8.0);
+        return .{ .dev = .{ try t.upload(words), try t.upload(scale), try t.upload(bias) } };
+    }
+
+    fn deinit(p: *Packed) void {
+        for (&p.dev) |*b| b.free();
+    }
+
+    fn affine(p: Packed, n: usize, k: usize) @import("../ops/types.zig").Affine {
+        return .{ .words = at(p.dev[0]), .scale = at(p.dev[1]), .bias = at(p.dev[2]), .tables = .bf16, .n = @intCast(n), .k = @intCast(k), .bits = 4, .group = 32 };
+    }
+};
+
+fn nowNs() u64 {
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(.MONOTONIC, &ts);
+    return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
+}
+
+test "hyper-connection gates, up and mix in one launch: the chain's values, each row alone bit for bit, and its time" {
+    const t = try Rig.open(64 << 20);
+    defer t.close();
+    if (!t.bf16) return; // compiled for bf16 activations
+    var rng: rig.Rng = .{ .state = 0x4C3 };
+    const rows = 5; // a block of 4 rows and one of 1
+    const s = 4;
+    const d = 2560;
+    const w = s * d;
+    const low = 320;
+    var up = try Packed.init(t, &rng, w, low);
+    defer up.deinit();
+    const hx = try acts(t, &rng, rows * w, 1.5);
+    defer gpa.free(hx);
+    var x = try t.upload(hx);
+    defer x.free();
+    const k = t.kind();
+    const st = t.stream.handle;
+    for ([_]bool{ true, false }) |with_inject| {
+        const n: usize = if (with_inject) low + s else low;
+        const zh = try gpa.alloc(f32, rows * n);
+        defer gpa.free(zh);
+        for (zh) |*v| v.* = rng.unit() * 6.0;
+        var z = try t.upload(zh);
+        defer z.free();
+        // the chain: gates, the up product (fp32), the mix
+        var act = try t.alloc(rows * low * 2);
+        defer act.free();
+        var inj = [_]DeviceBuffer{ try t.alloc(rows * s * 2), try t.alloc(rows * s * 2), try t.alloc(rows * s * 2) };
+        defer for (&inj) |*b| b.free();
+        var mixed = [_]DeviceBuffer{ try t.alloc(rows * d * 2), try t.alloc(rows * d * 2), try t.alloc(rows * d * 2) };
+        defer for (&mixed) |*b| b.free();
+        t.arena.reset();
+        try t.on.fn_hc_gates(ptr(?[*]const f32, z), ptr(?*anyopaque, act), if (with_inject) ptr(?*anyopaque, inj[0]) else null, k, rows, low, s, st);
+        const g = try t.ops(&t.on).affine(.{ .ptr = at(act), .kind = .bf16 }, up.affine(w, low), rows, true);
+        try t.on.fn_hc_mix(@ptrFromInt(g.ptr), ptr(?*const anyopaque, x), ptr(?*anyopaque, mixed[0]), k, rows, s, d, st);
+        // one launch for all rows, then one a row
+        const one = struct {
+            fn go(tt: *Rig, nn: usize, zz: DeviceBuffer, u: Packed, xx: DeviceBuffer, mm: DeviceBuffer, ii: DeviceBuffer, r0: usize, m: usize, wi: bool) !void {
+                try tt.on.fn_hc_up_mix(
+                    @ptrFromInt(at(zz) + r0 * nn * 4),
+                    @intCast(nn),
+                    @ptrFromInt(at(u.dev[0])),
+                    @ptrFromInt(at(u.dev[1])),
+                    @ptrFromInt(at(u.dev[2])),
+                    @ptrFromInt(at(xx) + r0 * 10240 * 2),
+                    @ptrFromInt(at(mm) + r0 * 2560 * 2),
+                    if (wi) @ptrFromInt(at(ii) + r0 * 4 * 2) else null,
+                    @intCast(m),
+                    tt.stream.handle,
+                );
+            }
+        }.go;
+        try one(t, n, z, up, x, mixed[1], inj[1], 0, rows, with_inject);
+        for (0..rows) |r| try one(t, n, z, up, x, mixed[2], inj[2], r, 1, with_inject);
+        try t.stream.synchronize();
+        var got: [3][2][]u16 = undefined;
+        for (&got, mixed, inj) |*gg, mb, ib| gg.* = .{ try rig.download(u16, mb), try rig.download(u16, ib) };
+        defer for (got) |gg| for (gg) |v| gpa.free(v);
+        try std.testing.expectEqualSlices(u16, got[1][0], got[2][0]);
+        if (with_inject) {
+            try std.testing.expectEqualSlices(u16, got[1][1], got[2][1]);
+            try std.testing.expectEqualSlices(u16, got[0][1], got[1][1]); // the gates: the same roundings
+        }
+        // a mixed value is a mean of four terms of about unit size: within 4 bf16 steps at that scale
+        var differ: usize = 0;
+        for (got[0][0], got[1][0], 0..) |a, b, i| {
+            const want = value(t, a);
+            differ += @intFromBool(a != b);
+            try rig.expect(@abs(value(t, b) - want) <= 4.0 / 128.0 * @max(@abs(want), 0.5), "hc up mix {d}: {d} vs {d}", .{ i, value(t, b), want });
+        }
+        // back to back: the one launch against gates, product and mix
+        var us: [2]f64 = undefined;
+        for (0..2) |which| {
+            const reps = 200;
+            var t0: u64 = 0;
+            for (0..reps + 10) |i| {
+                if (i == 10) {
+                    try t.stream.synchronize();
+                    t0 = nowNs();
+                }
+                if (which == 0) try one(t, n, z, up, x, mixed[1], inj[1], 0, 1, with_inject) else {
+                    t.arena.reset();
+                    try t.on.fn_hc_gates(ptr(?[*]const f32, z), ptr(?*anyopaque, act), if (with_inject) ptr(?*anyopaque, inj[0]) else null, k, 1, low, s, st);
+                    const g1 = try t.ops(&t.on).affine(.{ .ptr = at(act), .kind = .bf16 }, up.affine(w, low), 1, true);
+                    try t.on.fn_hc_mix(@ptrFromInt(g1.ptr), ptr(?*const anyopaque, x), ptr(?*anyopaque, mixed[0]), k, 1, s, d, st);
+                }
+            }
+            try t.stream.synchronize();
+            us[which] = @as(f64, @floatFromInt(nowNs() - t0)) / reps / 1e3;
+        }
+        std.debug.print("  hc up mix (inject {}): {d} of {d} mixed values differ from the chain's; 1 row {d:.1} us, the chain's three launches {d:.1} us (back to back)\n", .{ with_inject, differ, got[0][0].len, us[0], us[1] });
+    }
+}
