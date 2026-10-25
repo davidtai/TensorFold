@@ -180,7 +180,7 @@ pub const Kernels = struct {
     }
 
     fn resolve(k: *Kernels, comptime dot: []const u8, comptime shape: []const u8, m: Module) Error!void {
-        @setEvalBranchQuota(300_000);
+        @setEvalBranchQuota(600_000); // six widths, four tile families and their _pk kernels
         inline for (bit_widths, 0..) |bits, b| {
             k.block[b] = try m.function(std.fmt.comptimePrint("_ZN2tf4rocm17affine_dot2_blockINS0_{s}ELi{d}EEEvNS0_6AffineE", .{ dot, bits }));
             if (k.matrix) k.wmma_gemm[b] = try m.function(std.fmt.comptimePrint("_ZN2tf4rocm16affine_wmma_gemmILi{d}EEEvNS0_6AffineE", .{bits}));
