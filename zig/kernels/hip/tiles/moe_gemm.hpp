@@ -13,7 +13,7 @@
 //   - K in 64-wide windows: a weight row's 32 bytes come from 2 neighbouring lanes, an x row's 128 bytes from 8;
 //   - a row's scales (or biases) for 8 (gate+up) or 4 (down) groups in one load;
 //   - the sums of x from the x loads (a quad of lanes adds a group's 32 values in order, lane after lane);
-//   - AHEAD windows of loads held in registers, two barriers a window;
+//   - AHEAD windows of loads held in registers across the window barriers, which wait for LDS only (lds_barrier);
 //   - gate+up: both halves of a pair in one lane: no fp32 (gate | up) buffer, no second launch.
 // Inspired by mlx-serve's moe_prefill_cuda.zig (GU_SOURCE: gate rows 0-63, up rows 64-127 of one tile, SwiGLU in the
 // epilogue; register prefetch of K stages ahead).
@@ -30,6 +30,18 @@
 namespace tf {
 namespace rocm {
 
+// A workgroup barrier over LDS only: the LDS ops done (lgkmcnt 0), then s_barrier. __syncthreads() also fences global
+// memory at workgroup scope, and on gfx11 that is s_waitcnt vmcnt(0) at every barrier: the next windows' global loads
+// in flight are drained there, so no load overlaps the matrix work past one barrier. The tile shares only LDS through
+// its barriers; its global loads go to registers whose uses the compiler waits for.
+__device__ __forceinline__ void lds_barrier() {
+#if TF_DEVICE_WMMA_GFX11
+    asm volatile("s_waitcnt lgkmcnt(0)\n\ts_barrier" ::: "memory");
+#else
+    __syncthreads();
+#endif
+}
+
 namespace moe_tile {
 constexpr int kBM = 64;       // rows a pass
 constexpr int kBN = 128;      // staged weight rows a block
@@ -43,6 +55,8 @@ struct MoeGateUp {
     static constexpr int kTG = 8;    // groups a term load covers
     static constexpr bool kAct = true;
     static constexpr int kBlocks = kNI / 64;
+    // windows of loads held in registers (gfx1151, 8,192 rows: 29.1 ms a layer at 4, 30.1 at 2, 33.1 at 8)
+    static constexpr int kAhead = 4;
     // staged row `line` of block x: gate column 64 x + line, then the up column 640 + 64 x + line - 64
     __device__ static int col(int bx, int line) { return line < 64 ? 64 * bx + line : kNI + 64 * bx + line - 64; }
 };
@@ -53,6 +67,8 @@ struct MoeDown {
     static constexpr int kTG = 4;    // 20 groups a row: spans of 4
     static constexpr bool kAct = false;
     static constexpr int kBlocks = kN / 128;
+    // (gfx1151, 8,192 rows: 15.8 ms a layer at 1, 16.0 at 2)
+    static constexpr int kAhead = 1;
     __device__ static int col(int bx, int line) { return 128 * bx + line; }
 };
 
@@ -134,12 +150,19 @@ __device__ __forceinline__ void wmma_moe_tile(Affine a, float limit) {
 #pragma unroll
             for (int j = 0; j < 2; ++j) acc[mt][j] = zero;
         }
-        auto load = [&]<int R>(std::integral_constant<int, R>, int w) {
+        // Every load is issued unconditionally (a window past the last repeats it, and the terms are reloaded each
+        // window): a load behind a branch leaves the compiler no static count, and it waits for vmcnt(0) at each stash.
+        // A window's terms load with it when it starts a span. Whether it does is known at compile time where AHEAD is a
+        // multiple of the span's windows (window w + 1 + AHEAD of step J starts a span when J + 1 does); else every
+        // window reloads them, which costs an L2 read but keeps the loads out of branches.
+        constexpr bool kTermsStatic = AHEAD % kTermEvery == 0;
+        auto load = [&]<int R, bool TERMS = true>(std::integral_constant<int, R>, int w, std::bool_constant<TERMS> = {}) {
+            const int wl = w < kWindows ? w : kWindows - 1;
 #pragma unroll
-            for (int i = 0; i < kWChunks; ++i) wreg[R][i] = *reinterpret_cast<const u32x4*>(wsrc[i] + w * kGW * BITS);
+            for (int i = 0; i < kWChunks; ++i) wreg[R][i] = *reinterpret_cast<const u32x4*>(wsrc[i] + wl * kGW * BITS);
 #pragma unroll
-            for (int i = 0; i < kXChunks; ++i) xreg[R][i] = xsrc[i][w * kXPer];
-            if (w % kTermEvery == 0) treg[R] = tsrc[w / kTermEvery];
+            for (int i = 0; i < kXChunks; ++i) xreg[R][i] = xsrc[i][wl * kXPer];
+            if constexpr (TERMS) treg[R] = tsrc[wl / kTermEvery];
         };
         auto stash = [&]<int R>(std::integral_constant<int, R>, int w) {
 #pragma unroll
@@ -185,13 +208,13 @@ __device__ __forceinline__ void wmma_moe_tile(Affine a, float limit) {
             }
         };
 
-        __syncthreads();
+        lds_barrier();
         [&]<int... R>(std::integer_sequence<int, R...>) {
-            ((R < kWindows ? load(std::integral_constant<int, R>{}, R) : void()), ...);
+            (load(std::integral_constant<int, R>{}, R, std::bool_constant<!kTermsStatic || R % kTermEvery == 0>{}), ...);
         }(std::make_integer_sequence<int, AHEAD>{});
         stash(std::integral_constant<int, 0>{}, 0);
-        if (AHEAD < kWindows) load(std::integral_constant<int, 0>{}, AHEAD);
-        __syncthreads();
+        load(std::integral_constant<int, 0>{}, AHEAD);
+        lds_barrier();
         // Window w: compute it, stash window w + 1 from its slot, refill the slot with window w + 1 + AHEAD.
         auto window = [&]<int J>(std::integral_constant<int, J>, int w) {
             constexpr int next = (J + 1) % AHEAD;
@@ -232,12 +255,11 @@ __device__ __forceinline__ void wmma_moe_tile(Affine a, float limit) {
                     }
                 }
             }
-            __syncthreads();
-            if (w + 1 < kWindows) {
-                stash(std::integral_constant<int, next>{}, w + 1);
-                if (w + 1 + AHEAD < kWindows) load(std::integral_constant<int, next>{}, w + 1 + AHEAD);
-            }
-            __syncthreads();
+            lds_barrier();
+            // past the last window the stash rewrites LDS no later window reads
+            stash(std::integral_constant<int, next>{}, w + 1);
+            load(std::integral_constant<int, next>{}, w + 1 + AHEAD, std::bool_constant<!kTermsStatic || (J + 1) % kTermEvery == 0>{});
+            lds_barrier();
         };
         for (int w0 = 0; w0 < kWindows; w0 += AHEAD) {
             [&]<int... J>(std::integer_sequence<int, J...>) {

@@ -41,19 +41,18 @@ __global__ void __launch_bounds__(256) affine_wmma_gemm(Affine a) {
 // ---- Qwen3.8-Flash-Next's routed expert products of a prompt (tiles/moe_gemm.hpp, gfx11 matrix cores) ----
 
 // 64-wide K windows (gate+up at 2,048 rows on gfx1151: 10.5 ms a layer against 12.7 at 128 and 16.3 for
-// affine_wmma_gemm + moe_act); windows of loads held in registers ahead of their use:
-constexpr int kMoeAhead = 2;
+// affine_wmma_gemm + moe_act); each shape's ring depth is its own (MoeGateUp::kAhead, MoeDown::kAhead).
 
 // gate and up with silu(gate) * up as the epilogue, into a.out16 (bf16)
 template <int BITS>
 __global__ void __launch_bounds__(moe_tile::kThreads) affine_wmma_moe_gu(Affine a, float limit) {
-    wmma_moe_tile<MoeGateUp, BITS, 64, kMoeAhead>(a, limit);
+    wmma_moe_tile<MoeGateUp, BITS, 64, MoeGateUp::kAhead>(a, limit);
 }
 
 // down into a.out (fp32)
 template <int BITS>
 __global__ void __launch_bounds__(moe_tile::kThreads) affine_wmma_moe_down(Affine a) {
-    wmma_moe_tile<MoeDown, BITS, 64, kMoeAhead>(a, 0.f);
+    wmma_moe_tile<MoeDown, BITS, 64, MoeDown::kAhead>(a, 0.f);
 }
 
 // ---- the decode stream tile ----
