@@ -48,6 +48,13 @@ pub const Affine = struct {
     group: u16,
     /// A tensor-parallel slice along K: the product stays fp32, one rank's share of a sum.
     partial: bool = false,
+    /// The tables are one u32 a group (scale bits low, bias bits high), `bias` = `scale` + 2 (quant/mlx.hpp kScaleBF16Pair).
+    paired: bool = false,
+
+    /// The kernels' table kind (quant/mlx.hpp ScaleKind): 3 for paired bf16 tables, else the stored type's.
+    pub fn tableKind(a: Affine) c_int {
+        return if (a.paired) 3 else a.tables.table();
+    }
 
     pub fn check(a: Affine) Error!void {
         const ok_bits = switch (a.bits) {

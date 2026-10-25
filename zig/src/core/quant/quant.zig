@@ -153,6 +153,15 @@ pub fn upload(u: Uploader, h: Host) !Device {
     }
 }
 
+/// `upload` with an MLX projection's bf16 scale and bias paired in one u32 a group (`mlx.pairTables`); the other formats
+/// as `upload`. `a` holds the host pairs until the copy is done.
+pub fn uploadPaired(u: Uploader, a: Allocator, h: Host) !Device {
+    return switch (h) {
+        .mlx => |x| .{ .mlx = try mlx.uploadPaired(u, a, x) },
+        else => upload(u, h),
+    };
+}
+
 /// What the kernels read of a projection, by format.
 pub const Handle = union(Format) {
     mlx: mlx.Matrix,

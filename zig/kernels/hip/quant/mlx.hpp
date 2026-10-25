@@ -13,7 +13,14 @@
 namespace tf {
 namespace rocm {
 
-enum ScaleKind : int { kScaleF32 = 0, kScaleBF16 = 1, kScaleF16 = 2 };
+// kScaleBF16Pair: a group's bf16 scale and bias in one u32 (scale bits low, bias bits high), the checkpoint's values
+// repacked at load (quant/mlx.zig pairTables). The scale table points at the u32s and the bias table 2 bytes past them,
+// both of this kind: entry i is the bf16 at element 2 i. A kernel that wants both in one load reads the u32 at the
+// scale table's p[i].
+enum ScaleKind : int { kScaleF32 = 0, kScaleBF16 = 1, kScaleF16 = 2, kScaleBF16Pair = 3 };
+
+// Bytes from one group's entry to the next in a table of `kind`.
+__host__ __device__ constexpr int table_stride(int kind) { return kind == kScaleF32 || kind == kScaleBF16Pair ? 4 : 2; }
 
 // One (n, k / group) table of scales or biases, row major, in its stored type.
 struct GroupTable {
@@ -21,6 +28,7 @@ struct GroupTable {
     int kind;  // ScaleKind
     __device__ float operator[](long long i) const {
         if (kind == kScaleBF16) return static_cast<float>(static_cast<const hip_bfloat16*>(p)[i]);
+        if (kind == kScaleBF16Pair) return static_cast<float>(static_cast<const hip_bfloat16*>(p)[2 * i]);
         if (kind == kScaleF16) return __half2float(static_cast<const __half*>(p)[i]);
         return static_cast<const float*>(p)[i];
     }
@@ -46,7 +54,7 @@ __device__ inline bool take_item(Affine& a, int z) {
     if (count <= 0) return false;
     const long long expert = item[0];
     const long long groups = a.k / a.group;
-    const int table = a.scale.kind == kScaleF32 ? 4 : 2;
+    const int table = table_stride(a.scale.kind);
     a.words += expert * a.n * (static_cast<long long>(a.k) * a.bits / 32);
     a.scale.p = static_cast<const char*>(a.scale.p) + expert * a.n * groups * table;
     a.bias.p = static_cast<const char*>(a.bias.p) + expert * a.n * groups * table;

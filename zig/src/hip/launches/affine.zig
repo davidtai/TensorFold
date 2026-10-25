@@ -299,7 +299,7 @@ pub const Kernels = struct {
     /// The product of `a` as a shape: `items` is a routed plan's item count.
     pub fn shapeOf(a: Arg, items: c_int) registry.Shape {
         const kind: quant.Tables = switch (a.scale.kind) {
-            1 => .bf16,
+            1, 3 => .bf16, // 3: bf16 scale and bias paired in one u32 a group
             2 => .f16,
             else => .f32,
         };
@@ -461,8 +461,9 @@ pub const Kernels = struct {
         const sh = moe_gu_shape;
         if (k.moe_gu == null or k.mode == .off or k.tile != .gemm) return false;
         if (a.fp16 != 0 or a.n != sh.n or a.k != sh.k or a.bits != sh.bits or a.group != sh.group) return false;
-        // the tile reads 8 groups' bf16 scales (and biases) of a row in one 16-byte load: the bf16 planes only
-        if (a.route.items == 0 or a.route.members == 0 or items < 1 or a.scale.kind != 1 or a.bias.kind != 1) return false;
+        // the tile reads 8 groups' bf16 scales (and biases) of a row in 16-byte loads: bf16 planes or their pairs
+        if (a.route.items == 0 or a.route.members == 0 or items < 1 or a.scale.kind != a.bias.kind) return false;
+        if (a.scale.kind != 1 and a.scale.kind != 3) return false; // 3: kScaleBF16Pair
         return a.x % 16 == 0 and a.words % 16 == 0;
     }
 

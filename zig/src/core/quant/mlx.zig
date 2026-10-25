@@ -164,16 +164,42 @@ pub fn sliceStack(a: Allocator, p: Host, r: slice.Rank, part: usize) slice.Error
     return .{ .words = try slice.takeExperts(a, p.words, r, part), .scales = try slice.takeExperts(a, p.scales, r, part), .biases = try slice.takeExperts(a, p.biases, r, part), .bits = p.bits, .group = p.group };
 }
 
-/// An uploaded projection (or stack of them): the same tensors on the device.
-pub const Device = struct { words: types.Buf, scales: types.Buf, biases: types.Buf, bits: u8, group: u16 };
+/// An uploaded projection (or stack of them): the same tensors on the device. `paired`: `scales` and `biases` are one
+/// u32 table, a group's scale bits low and its bias bits high, of this 16-bit type (`pairTables`).
+pub const Device = struct { words: types.Buf, scales: types.Buf, biases: types.Buf, bits: u8, group: u16, paired: ?types.Tables = null };
 
 /// The checkpoint's words and tables on the device as stored: this format keeps its layout.
 pub fn upload(u: types.Uploader, h: Host) !Device {
     return .{ .words = try u.tensor(h.words), .scales = try u.tensor(h.scales), .biases = try u.tensor(h.biases), .bits = h.bits, .group = h.group };
 }
 
-/// What the kernels read of an MLX projection: the three addresses, the tables' type and the width.
-pub const Matrix = struct { words: u64, scale: u64, bias: u64, tables: types.Tables, bits: u8, group: u16 };
+/// A group's bf16 scale and bias in one u32 (scale bits low, bias bits high), same shape as the scales: the same
+/// values, so a kernel gets both with one 4-byte load. Null for tables of other types (they stay as stored).
+pub fn pairTables(a: Allocator, h: Host) Allocator.Error!?Tensor {
+    if (h.scales.dtype != .bf16 or h.biases.dtype != .bf16 or h.scales.bytes.len != h.biases.bytes.len) return null;
+    if (h.scales.rank != h.biases.rank or !std.mem.eql(usize, h.scales.shape[0..h.scales.rank], h.biases.shape[0..h.biases.rank])) return null;
+    const n = h.scales.bytes.len / 2;
+    const out = try a.alloc(u8, 4 * n);
+    for (0..n) |i| {
+        @memcpy(out[4 * i ..][0..2], h.scales.bytes[2 * i ..][0..2]);
+        @memcpy(out[4 * i + 2 ..][0..2], h.biases.bytes[2 * i ..][0..2]);
+    }
+    var t = h.scales;
+    t.dtype = .u32;
+    t.bytes = out;
+    return t;
+}
+
+/// `upload` with the tables paired (`pairTables`) where they are bf16; the separate tables are not uploaded.
+pub fn uploadPaired(u: types.Uploader, a: Allocator, h: Host) !Device {
+    const pairs = (try pairTables(a, h)) orelse return upload(u, h);
+    const both = try u.tensor(pairs);
+    return .{ .words = try u.tensor(h.words), .scales = both, .biases = both, .bits = h.bits, .group = h.group, .paired = .bf16 };
+}
+
+/// What the kernels read of an MLX projection: the three addresses, the tables' type and the width. `paired`: `scale`
+/// is the u32 pair table and `bias` is `scale + 2`, both read as `tables` values 4 bytes apart.
+pub const Matrix = struct { words: u64, scale: u64, bias: u64, tables: types.Tables, bits: u8, group: u16, paired: bool = false };
 
 pub const View = struct { n: u32, k: u32, matrix: Matrix };
 
@@ -191,6 +217,10 @@ pub fn view(d: Device, stacked: bool) error{UnsupportedTables}!View {
     const lead: usize = @intFromBool(stacked);
     const n = d.words.dim(lead);
     const k = d.words.dim(lead + 1) * 32 / d.bits;
+    if (d.paired) |kind| {
+        const matrix: Matrix = .{ .words = d.words.ptr, .scale = d.scales.ptr, .bias = d.scales.ptr + 2, .tables = kind, .bits = d.bits, .group = d.group, .paired = true };
+        return .{ .n = @intCast(n), .k = @intCast(k), .matrix = matrix };
+    }
     const matrix: Matrix = .{ .words = d.words.ptr, .scale = d.scales.ptr, .bias = d.biases.ptr, .tables = try tableKind(d.scales.dtype), .bits = d.bits, .group = d.group };
     return .{ .n = @intCast(n), .k = @intCast(k), .matrix = matrix };
 }
@@ -521,4 +551,27 @@ test "an entry the kernels do not run refuses every spelling of its module" {
 
 test {
     _ = keys;
+}
+
+test "paired tables keep every scale and bias bit, scale low" {
+    const a = std.testing.allocator;
+    var sb = [_]u8{ 0x80, 0x3f, 0x00, 0xc0 }; // bf16 1.0, -2.0
+    var bb = [_]u8{ 0x40, 0x40, 0x01, 0x80 }; // bf16 3.0, a negative subnormal
+    var wb = [_]u8{0} ** 32;
+    const shape = [_]usize{ 2, 1, 0, 0, 0 };
+    const h: Host = .{
+        .words = .{ .dtype = .u32, .rank = 2, .shape = .{ 2, 4, 0, 0, 0 }, .bytes = &wb },
+        .scales = .{ .dtype = .bf16, .rank = 2, .shape = shape, .bytes = &sb },
+        .biases = .{ .dtype = .bf16, .rank = 2, .shape = shape, .bytes = &bb },
+        .bits = 4,
+        .group = 32,
+    };
+    const t = (try pairTables(a, h)).?;
+    defer a.free(t.bytes);
+    try std.testing.expectEqual(types.DType.u32, t.dtype);
+    try std.testing.expectEqual(@as(u32, 0x4040_3f80), std.mem.readInt(u32, t.bytes[0..4], .little));
+    try std.testing.expectEqual(@as(u32, 0x8001_c000), std.mem.readInt(u32, t.bytes[4..8], .little));
+    var f32h = h;
+    f32h.scales.dtype = .f32;
+    try std.testing.expect((try pairTables(a, f32h)) == null);
 }

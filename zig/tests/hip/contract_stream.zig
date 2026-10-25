@@ -9,14 +9,17 @@ const c = contract.spec;
 const g = contract.gates;
 const Kernels = @FieldType(hip.Launcher, "affine");
 const Arg = @typeInfo(@TypeOf(Kernels.streamGo)).@"fn".param_types[2].?;
+const GroupTable = @FieldType(Arg, "scale");
 
 pub const cases = blk: {
-    const Case = struct { bits: u8, group: usize, name: []const u8 };
-    var out: [18]Case = undefined;
+    const Case = struct { bits: u8, group: usize, name: []const u8, paired: bool = false };
+    var out: [24]Case = undefined;
     for ([_]u8{ 2, 3, 4, 5, 6, 8 }, 0..) |bits, b| {
         for ([_]usize{ 32, 64, 128 }, 0..) |group, i| {
             out[3 * b + i] = .{ .bits = bits, .group = group, .name = std.fmt.comptimePrint("hip affine_dot2_stream ({d}-bit, group {d}, fp32 out)", .{ bits, group }) };
         }
+        // the scale and bias of a group paired in one u32 (quant/mlx.hpp kScaleBF16Pair), as the HIP loaders put them
+        out[18 + b] = .{ .bits = bits, .group = 32, .paired = true, .name = std.fmt.comptimePrint("hip affine_dot2_stream ({d}-bit, group 32, paired tables, fp32 out)", .{bits}) };
     }
     break :blk out;
 };
@@ -51,7 +54,12 @@ pub const Stream = struct {
             .accum = .f32,
             .depth = depth,
             .out = .f32,
-            .served = if (cfg.bits == 4 and cfg.group == 64) &.{
+            .served = if (cfg.paired and cfg.bits == 4) &.{
+                // Qwen3.8 Flash Next: an expert's gate and up, an expert's down, the attention out-projection
+                .{ .rows = 1, .n = 1280, .k = 2560 },
+                .{ .rows = 4, .n = 2560, .k = 640 },
+                .{ .rows = 1, .n = 2560, .k = 6144 },
+            } else if (cfg.bits == 4 and cfg.group == 64) &.{
                 .{ .rows = 1, .n = 1856, .k = 2688 },
                 .{ .rows = 2, .n = 3712, .k = 2688 },
             } else if (cfg.bits == 2) &.{
@@ -101,11 +109,20 @@ pub const Stream = struct {
         }
         const words = try a.alloc(u32, shape.n * shape.k * cfg.bits / 32);
         f.words(words);
+        var scale: GroupTable = .{ .p = try self.rig.input(std.mem.sliceAsBytes(f.scales)), .kind = 1 };
+        var bias: GroupTable = .{ .p = try self.rig.input(std.mem.sliceAsBytes(f.biases)), .kind = 1 };
+        if (cfg.paired) {
+            const pairs = try a.alloc(u32, f.scales.len);
+            for (pairs, f.scales, f.biases) |*pr, sv, bv| pr.* = @as(u32, sv) | @as(u32, bv) << 16;
+            const at = try self.rig.input(std.mem.sliceAsBytes(pairs));
+            scale = .{ .p = at, .kind = 3 };
+            bias = .{ .p = at + 2, .kind = 3 };
+        }
         self.arg = .{
             .x = try self.rig.input(std.mem.sliceAsBytes(xb)),
             .words = try self.rig.input(std.mem.sliceAsBytes(words)),
-            .scale = .{ .p = try self.rig.input(std.mem.sliceAsBytes(f.scales)), .kind = 1 },
-            .bias = .{ .p = try self.rig.input(std.mem.sliceAsBytes(f.biases)), .kind = 1 },
+            .scale = scale,
+            .bias = bias,
             .out = try self.rig.output(f.outputs() * 4),
             .m = @intCast(shape.rows),
             .n = @intCast(shape.n),

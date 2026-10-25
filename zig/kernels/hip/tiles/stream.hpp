@@ -52,7 +52,8 @@ __device__ inline void stream_dots(const typename T::pair (&xp)[RG][16], const u
 }
 
 // Epi::kPair: a lane's CB columns are CB / 2 gate columns and the same up columns; out is silu(gate) * up.
-template <class Dec, class Act, class T, class Epi, int R, int CB, bool WIDE>
+// PK: the tables are paired (kScaleBF16Pair), a group's scale and bias come in one 4-byte load.
+template <class Dec, class Act, class T, class Epi, int R, int CB, bool WIDE, bool PK = false>
 __device__ inline void stream_body(const typename Dec::Args& a, int lpc_log2, int gshift, int bx, int pair_cols, float limit) {
     using pair = typename T::pair;
     constexpr bool PAIR = Epi::kPair;
@@ -99,8 +100,14 @@ __device__ inline void stream_body(const typename Dec::Args& a, int lpc_log2, in
         for (int c = 0; c < CB; ++c) {
             Dec::template load<WIDE>(wp[c] + static_cast<long long>(q) * Dec::kWords, w[c]);
             const long long at = sb[c] + (q >> gshift);
-            sr[c] = terms.scale_raw(at);
-            br[c] = terms.bias_raw(at);
+            if constexpr (PK) {
+                const uint32_t both = terms.pair(at);
+                sr[c] = static_cast<unsigned short>(both);
+                br[c] = static_cast<unsigned short>(both >> 16);
+            } else {
+                sr[c] = terms.scale_raw(at);
+                br[c] = terms.bias_raw(at);
+            }
         }
     };
     // The dots of one round. A lane past the row's last chunk read the last one: its scale and bias are zero.
@@ -227,15 +234,18 @@ __device__ inline void stream_tile(typename Dec::Args& a, const Sides& sides, in
         }
     }
     if (!Dec::take_item(a, blockIdx.z) || static_cast<int>(blockIdx.y) * R >= a.m) return;
-    if constexpr (Dec::kWideBytes == 4) {
-        stream_body<Dec, Act, T, Epi, R, CB, false>(a, lpc_log2, gshift, bx, sides.pair_cols, sides.limit);
-    } else {
-        // every chunk is wide-aligned when the words and the row stride are
-        if (Dec::wide_aligned(a)) {
-            stream_body<Dec, Act, T, Epi, R, CB, true>(a, lpc_log2, gshift, bx, sides.pair_cols, sides.limit);
+    // every chunk is wide-aligned when the words and the row stride are
+    const bool wide = Dec::kWideBytes != 4 && Dec::wide_aligned(a);
+    if (Dec::pairs(a)) {
+        if (wide) {
+            stream_body<Dec, Act, T, Epi, R, CB, Dec::kWideBytes != 4, true>(a, lpc_log2, gshift, bx, sides.pair_cols, sides.limit);
         } else {
-            stream_body<Dec, Act, T, Epi, R, CB, false>(a, lpc_log2, gshift, bx, sides.pair_cols, sides.limit);
+            stream_body<Dec, Act, T, Epi, R, CB, false, true>(a, lpc_log2, gshift, bx, sides.pair_cols, sides.limit);
         }
+    } else if (wide) {
+        stream_body<Dec, Act, T, Epi, R, CB, Dec::kWideBytes != 4>(a, lpc_log2, gshift, bx, sides.pair_cols, sides.limit);
+    } else {
+        stream_body<Dec, Act, T, Epi, R, CB, false>(a, lpc_log2, gshift, bx, sides.pair_cols, sides.limit);
     }
 }
 

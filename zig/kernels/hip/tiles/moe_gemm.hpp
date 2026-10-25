@@ -231,7 +231,7 @@ __device__ __forceinline__ void wmma_moe_gu_tile(Affine a, float limit) {
 // lanes and an x row's 256 bytes from 16 (one load instruction touches 8 weight rows, not 32), the 8 groups' scales and
 // biases of a row come in one 16-byte load each, and the sums of x come from the x loads (a quad of lanes adds a
 // group's 32 values in order, lane after lane). Two barriers a window, the next window's loads in flight across it.
-// BF16 scale and bias planes only (kScaleBF16).
+// BF16 scale and bias planes (kScaleBF16), or the pairs of both (kScaleBF16Pair): the same values either way.
 // KW: K a window, 128 or 64 (4 or 2 groups); a staged row is KW + 8 bf16, so 8 lanes of 16-byte reads hit 32 banks.
 template <int BITS, int KW = 128>
 __device__ __forceinline__ void wmma_moe_gw_tile(Affine a, float limit) {
@@ -268,11 +268,16 @@ __device__ __forceinline__ void wmma_moe_gw_tile(Affine a, float limit) {
     const uint32_t* wsrc[kWChunks];
 #pragma unroll
     for (int i = 0; i < kWChunks; ++i) wsrc[i] = a.words + static_cast<long long>(col_of((256 * i + tid) / kGW)) * kWordsRow + wq * BITS;
-    // terms: thread t loads 8 groups of row t % 128, scales (t < 128) or biases
+    // terms: thread t loads 8 groups of row t % 128, scales (t < 128) or biases; paired tables: groups 0-3 (t < 128)
+    // or 4-7 of the 8, scale and bias each
     const int trow = tid & (kBN - 1);
     const bool tbias = tid >= kBN;
-    const uint4* tsrc = reinterpret_cast<const uint4*>(static_cast<const uint16_t*>(tbias ? a.bias.p : a.scale.p) +
-                                                       static_cast<long long>(col_of(trow)) * kGroups);
+    const bool tpair = a.scale.kind == kScaleBF16Pair;
+    const uint4* tsrc = tpair ? reinterpret_cast<const uint4*>(static_cast<const uint32_t*>(a.scale.p) +
+                                                               static_cast<long long>(col_of(trow)) * kGroups + (tbias ? 4 : 0))
+                              : reinterpret_cast<const uint4*>(static_cast<const uint16_t*>(tbias ? a.bias.p : a.scale.p) +
+                                                               static_cast<long long>(col_of(trow)) * kGroups);
+    const int tstep = tpair ? 2 : 1;  // 16-byte loads from one 8-group term load to the next
     // x: chunk i of thread t is row (256 i + t) / kXPer, 16-byte piece t % kXPer (group piece / 4, quad lane t % 4)
     const int xc = tid % kXPer;
 
@@ -309,7 +314,7 @@ __device__ __forceinline__ void wmma_moe_gw_tile(Affine a, float limit) {
             for (int i = 0; i < kWChunks; ++i) wreg[i] = *reinterpret_cast<const u32x4*>(wsrc[i] + w * kGW * BITS);
 #pragma unroll
             for (int i = 0; i < kXChunks; ++i) xreg[i] = xsrc[i][w * kXPer];
-            if (w % kTermEvery == 0) treg = tsrc[w / kTermEvery];
+            if (w % kTermEvery == 0) treg = tsrc[tstep * (w / kTermEvery)];
         };
         auto stash = [&](int w) {
 #pragma unroll
@@ -349,9 +354,18 @@ __device__ __forceinline__ void wmma_moe_gw_tile(Affine a, float limit) {
             }
             if (w % kTermEvery == 0) {
                 const uint32_t tv[4] = {treg.x, treg.y, treg.z, treg.w};
-                float (*dst)[kBN] = tbias ? bi : sc;
+                if (tpair) {
+                    const int g0 = tbias ? 4 : 0;
 #pragma unroll
-                for (int j = 0; j < 8; ++j) dst[j][trow] = __uint_as_float(((tv[j >> 1] >> (16 * (j & 1))) & 0xffffu) << 16);
+                    for (int j = 0; j < 4; ++j) {
+                        sc[g0 + j][trow] = __uint_as_float(tv[j] << 16);
+                        bi[g0 + j][trow] = __uint_as_float(tv[j] & 0xffff0000u);
+                    }
+                } else {
+                    float (*dst)[kBN] = tbias ? bi : sc;
+#pragma unroll
+                    for (int j = 0; j < 8; ++j) dst[j][trow] = __uint_as_float(((tv[j >> 1] >> (16 * (j & 1))) & 0xffffu) << 16);
+                }
             }
         };
 

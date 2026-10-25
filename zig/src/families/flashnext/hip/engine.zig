@@ -121,7 +121,7 @@ pub const Engine = struct {
         e.keep = .init(gpa);
         errdefer e.keep.deinit();
         const rank: ?core.quant.Rank = if (o.world > 1) .{ .rank = o.rank, .world = o.world } else null;
-        e.weights = try loader.load(gpa, &e.driver, &e.ck, &e.cfg, rank, e.act);
+        e.weights = try loader.load(gpa, &e.driver, &e.ck, &e.cfg, rank, e.act, o.policy.pairsOn());
         errdefer e.weights.deinit();
         e.weights.model.tp = e.comm;
         const spelling = try spellingOf(e.keep.allocator(), io, dir);

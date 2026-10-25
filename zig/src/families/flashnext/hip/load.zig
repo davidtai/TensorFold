@@ -38,6 +38,8 @@ const Loader = struct {
     rank: ?Rank,
     /// The checkpoint stores centred norms as gamma (true) or as gamma - 1 (false).
     around_one: bool,
+    /// The products' bf16 scale and bias go up paired, one u32 a group (policy `tables`; quant.mlx.pairTables).
+    paired: bool = true,
 
     fn key(l: *const Loader, comptime fmt: []const u8, args: anytype) ![]const u8 {
         return std.fmt.allocPrint(l.a, fmt, args);
@@ -56,9 +58,20 @@ const Loader = struct {
     }
 
     fn put(l: *const Loader, h: Host, partial: bool) !model.Projection {
-        var p = try quant.view(try quant.upload(l.up.uploader(), h), false);
+        var p = try quant.view(try l.upload(h), false);
         p.partial = partial;
         return p;
+    }
+
+    /// A product's weights on the device: tables paired when the policy pairs them.
+    fn upload(l: *const Loader, h: Host) !quant.Device {
+        const u = l.up.uploader();
+        return if (l.paired) quant.uploadPaired(u, l.a, h) else quant.upload(u, h);
+    }
+
+    /// A table the gather kernels read as stored (tf_embed_rows): never paired.
+    fn putStored(l: *const Loader, h: Host) !model.Projection {
+        return quant.view(try quant.upload(l.up.uploader(), h), false);
     }
 
     fn tensor(l: *const Loader, t: Tensor) !u64 {
@@ -187,8 +200,8 @@ const Loader = struct {
             .remap = if (r.remap) |t| (try u.tensor(t)).ptr else 0,
             .exact = true,
             .experts = .{
-                .fused = try quant.view(try quant.upload(u, r.experts.fused), true),
-                .down = try quant.view(try quant.upload(u, r.experts.down), true),
+                .fused = try quant.view(try l.upload(r.experts.fused), true),
+                .down = try quant.view(try l.upload(r.experts.down), true),
                 .count = r.experts.count,
                 .width = r.experts.width,
                 .dims = r.experts.dims,
@@ -319,13 +332,14 @@ test "Flash Next proposal: HIP IDs and contiguous stored-row spans retain the or
 }
 
 /// One rank's weights (`rank` null: the whole model) from the mapped checkpoint `ck`; rank 0 also holds the MTP head.
-pub fn load(gpa: Allocator, d: *const hip.Runtime, ck: *core.checkpoint.Checkpoint, c: *const config.Config, rank: ?Rank, act: model.Kind) !Weights {
+/// `paired`: the products' bf16 scale and bias tables go up as one u32 a group (hip.Policy.pairsOn).
+pub fn load(gpa: Allocator, d: *const hip.Runtime, ck: *core.checkpoint.Checkpoint, c: *const config.Config, rank: ?Rank, act: model.Kind, paired: bool) !Weights {
     var w: Weights = .{ .gpa = gpa };
     errdefer w.deinit();
     const tables: Tables = .{ .ck = ck, .cfg = c };
     var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
-    const l: Loader = .{ .a = arena.allocator(), .t = &tables, .up = .{ .r = d, .buffers = &w.buffers, .gpa = gpa }, .rank = rank, .around_one = try aroundOne(arena.allocator(), &tables, c.layers) };
+    const l: Loader = .{ .a = arena.allocator(), .t = &tables, .up = .{ .r = d, .buffers = &w.buffers, .gpa = gpa }, .rank = rank, .around_one = try aroundOne(arena.allocator(), &tables, c.layers), .paired = paired };
     const world_n: usize = if (rank) |r| r.world else 1;
     const dims = try model.Dims.of(c, world_n);
     const head = try l.proj(tensors.lm_head);
@@ -341,7 +355,7 @@ pub fn load(gpa: Allocator, d: *const hip.Runtime, ck: *core.checkpoint.Checkpoi
     w.model = .{
         .dims = dims,
         .act = act,
-        .embed = try l.put(try l.proj(tensors.embed), false),
+        .embed = try l.putStored(try l.proj(tensors.embed)),
         .layers = w.layers,
         .mix = try l.hc(tensors.mixer, false),
         .head = try l.put(try l.rows(head, &.{c.vocab}), false),
