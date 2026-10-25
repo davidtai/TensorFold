@@ -28,6 +28,9 @@ __device__ __forceinline__ float4 widen4(uint2 v) {
 constexpr int kRouterWaves = 4;
 constexpr int kRouterSteps = 16;  // float4 loads a lane keeps in flight
 constexpr int kRouterRows = 16;
+// router_select stages up to this many rows of up to this width in shared memory (a verify window's: 4 x 2560 bf16)
+constexpr int kRouterStaged = 4;
+constexpr int kRouterStagedWidth = 2560;
 
 // Four router weights at `at` of row `w`: fp32 rows as stored, or bf16 rows (ROWS16) widened, which is exact.
 template <bool ROWS16>
@@ -42,14 +45,15 @@ __device__ __forceinline__ float4 router_weights(const void* w, int at) {
 
 // logits[r, e] = x[r] . rows[e], 16 rows a block, a wave an expert; d is a multiple of 4, weight rows 16-byte aligned
 // (8-byte for ROWS16: bf16 rows, the same values as the fp32 rows widened from them, so the same logits).
+// `staged`: x's rows of this block are already in shared memory at `x` (router_select's few rows), not global memory.
 template <int KIND, bool ROWS16 = false>
-__device__ void router_decode(const void* x, const void* rows, float* logits, int r, int d, int e) {
+__device__ void router_decode(const void* x, const void* rows, float* logits, int r, int d, int e, bool staged = false) {
     const int lane = threadIdx.x & 31;
     const int expert = blockIdx.x * kRouterWaves + (threadIdx.x >> 5);
     if (expert >= e) return;
     // blockIdx.y picks a block of 16 rows: a row's sums are the same whichever block it is in
     const int first = blockIdx.y * kRouterRows;
-    x = static_cast<const uint16_t*>(x) + static_cast<long long>(first) * d;
+    if (!staged) x = static_cast<const uint16_t*>(x) + static_cast<long long>(first) * d;
     logits += static_cast<long long>(first) * e;
     r = r - first < kRouterRows ? r - first : kRouterRows;
     const void* w = ROWS16 ? static_cast<const void*>(static_cast<const uint16_t*>(rows) + static_cast<long long>(expert) * d)
@@ -518,8 +522,17 @@ template <int KIND>
 __device__ void router_select(const void* x, const void* rows, float* logits, int r, int d, int e, int* pick, float* wts,
                               int* items, int* members, int capacity, int top_k, unsigned* done) {
     __shared__ bool last;
+    // a verify window's few rows in shared memory once a block: each wave (an expert) reads them there, not from L2
+    __shared__ __attribute__((aligned(16))) uint16_t xs[kRouterStaged * kRouterStagedWidth];
+    const bool staged = r <= kRouterStaged && d <= kRouterStagedWidth && d % 8 == 0 && (reinterpret_cast<uintptr_t>(x) & 15) == 0;
+    if (staged) {
+        const uint4* from = static_cast<const uint4*>(x);
+        uint4* to = reinterpret_cast<uint4*>(xs);
+        for (int i = threadIdx.x; i < r * d / 8; i += 32 * kRouterWaves) to[i] = from[i];
+        __syncthreads();
+    }
     const int expert = blockIdx.x * kRouterWaves + (threadIdx.x >> 5);
-    if (expert < e) router_decode<KIND, true>(x, rows, logits, r, d, e);
+    if (expert < e) router_decode<KIND, true>(staged ? static_cast<const void*>(xs) : x, rows, logits, r, d, e, staged);
     __threadfence();
     __syncthreads();
     if (threadIdx.x == 0) last = atomicAdd(done, 1u) == gridDim.x - 1;
