@@ -561,16 +561,13 @@ __device__ bool select_row_wave(const float* logits, int row, int* pick, float* 
         }
     }
     if (lane == 0) {
+        // thread 0's arithmetic; each exp is taken again for its weight (the same value), not kept in a local array
         const float top = top_v[0];
-        float ex[32];
         float total = 0.f;
-        for (int k = 0; k < top_k; ++k) {
-            ex[k] = expf(top_v[k] - top);
-            total += ex[k];
-        }
+        for (int k = 0; k < top_k; ++k) total += expf(top_v[k] - top);
         for (int k = 0; k < top_k; ++k) {
             pick[row * slots + k] = top_i[k];
-            wts[row * slots + k] = round_bf16_f(ex[k] / total);
+            wts[row * slots + k] = round_bf16_f(expf(top_v[k] - top) / total);
         }
         const float gate = round_bf16_f(__hip_atomic_load(l + experts, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT));
         pick[row * slots + top_k] = experts;
@@ -583,13 +580,17 @@ __device__ bool select_row_wave(const float* logits, int row, int* pick, float* 
 // into members, items of at most `tile` pairs cut a capacity slot each; the same members and items as tf_moe_route's
 // (an expert's pairs in pair order, the same starts, ends and slot search).
 constexpr int kPlanPairs = 64;
-__device__ void route_plan(const int* picks, int pairs, int experts, int tile, int* members, int* items, int capacity) {
+// Shared memory it takes from `pool`, in ints (the router's staged rows, free by then).
+constexpr int kPlanPool = 3 * (kSelectMax + 1) + 2 * 32 * kRouterWaves + kPlanPairs;
+__device__ void route_plan(const int* picks, int pairs, int experts, int tile, int* members, int* items, int capacity,
+                           int* pool) {
     constexpr int kThreads = 32 * kRouterWaves;
-    __shared__ int counts[kSelectMax + 1];
-    __shared__ int starts[kSelectMax + 1];
-    __shared__ int ends[kSelectMax + 1];
-    __shared__ int scan_c[kThreads], scan_n[kThreads];
-    __shared__ int pk[kPlanPairs];
+    int* counts = pool;
+    int* starts = counts + kSelectMax + 1;
+    int* ends = starts + kSelectMax + 1;
+    int* scan_c = ends + kSelectMax + 1;
+    int* scan_n = scan_c + kThreads;
+    int* pk = scan_n + kThreads;
     const int t = threadIdx.x;
     for (int e = t; e < experts; e += kThreads) counts[e] = 0;
     if (t < pairs) pk[t] = picks[t];
@@ -672,12 +673,16 @@ __device__ void router_select(const void* x, const void* rows, float* logits, in
         select_row(logits, 0, pick, wts, items, members, capacity, e - 1, top_k);
     } else if (r <= kRouterWaves && e - 1 <= kSelectMax) {
         // a wave a row; a row with a NaN logit then takes select_row's rank loop
+        // the waves' top lists, then the plan's arrays, in the staged rows' shared memory (free after the router)
+        static_assert(kPlanPool + 2 * 32 * kRouterWaves <= kRouterStaged * kRouterStagedWidth / 2, "plan pool");
         __shared__ int fallback[kRouterWaves];
-        __shared__ float wave_top_v[kRouterWaves][32];
-        __shared__ int wave_top_i[kRouterWaves][32];
+        int* pool = reinterpret_cast<int*>(xs);
+        float* wave_top_v = reinterpret_cast<float*>(pool + kPlanPool);
+        int* wave_top_i = pool + kPlanPool + 32 * kRouterWaves;
         const int wave = threadIdx.x >> 5;
+        __syncthreads();
         if (wave < r) {
-            const bool ok = select_row_wave(logits, wave, pick, wts, e - 1, top_k, wave_top_v[wave], wave_top_i[wave]);
+            const bool ok = select_row_wave(logits, wave, pick, wts, e - 1, top_k, wave_top_v + 32 * wave, wave_top_i + 32 * wave);
             if ((threadIdx.x & 31) == 0) fallback[wave] = !ok;
         }
         __syncthreads();
@@ -685,7 +690,7 @@ __device__ void router_select(const void* x, const void* rows, float* logits, in
             if (fallback[row]) select_row(logits, row, pick, wts, nullptr, nullptr, 0, e - 1, top_k);
         __threadfence_block();
         __syncthreads();
-        if (items != nullptr) route_plan(pick, r * (top_k + 1), e, tile, members, items, capacity);
+        if (items != nullptr) route_plan(pick, r * (top_k + 1), e, tile, members, items, capacity, pool);
     } else {
         for (int row = 0; row < r; ++row) select_row(logits, row, pick, wts, nullptr, nullptr, 0, e - 1, top_k);
     }
