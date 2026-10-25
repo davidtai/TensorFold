@@ -480,7 +480,7 @@ const own_records = [_]Record{
         },
     },
     .{
-        .launch = .{ .name = "MoE router and pick in one launch (decode, bf16 rows) tf_router_select_f16", .symbol = "tf_router_select_f16", .image = "decode", .threads = 128 },
+        .launch = .{ .name = "MoE router and pick in one launch (decode, bf16 rows) tf_router_select_f16", .symbol = "tf_router_select_f16", .image = "decode", .threads = 128, .dynamic = 4 * 2560 * 2 },
         .usage = .{
             .{ .vgprs = 148, .sgprs = 85, .lds = 25912, .private = 0, .bound = 128, .wave = 32 },
             .{ .vgprs = 148, .sgprs = 81, .lds = 25912, .private = 0, .bound = 128, .wave = 32 },
@@ -489,7 +489,7 @@ const own_records = [_]Record{
         },
     },
     .{
-        .launch = .{ .name = "MoE router and pick in one launch (decode, bf16 rows) tf_router_select_bf16", .symbol = "tf_router_select_bf16", .image = "decode", .threads = 128 },
+        .launch = .{ .name = "MoE router and pick in one launch (decode, bf16 rows) tf_router_select_bf16", .symbol = "tf_router_select_bf16", .image = "decode", .threads = 128, .dynamic = 4 * 2560 * 2 },
         .usage = .{
             .{ .vgprs = 148, .sgprs = 85, .lds = 25912, .private = 0, .bound = 128, .wave = 32 },
             .{ .vgprs = 148, .sgprs = 81, .lds = 25912, .private = 0, .bound = 128, .wave = 32 },

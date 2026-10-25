@@ -28,9 +28,6 @@ __device__ __forceinline__ float4 widen4(uint2 v) {
 constexpr int kRouterWaves = 4;
 constexpr int kRouterSteps = 16;  // float4 loads a lane keeps in flight
 constexpr int kRouterRows = 16;
-// router_select stages up to this many rows of up to this width in shared memory (a verify window's: 4 x 2560 bf16)
-constexpr int kRouterStaged = 4;
-constexpr int kRouterStagedWidth = 2560;
 
 // Four router weights at `at` of row `w`: fp32 rows as stored, or bf16 rows (ROWS16) widened, which is exact.
 template <bool ROWS16>
@@ -580,14 +577,13 @@ __device__ bool select_row_wave(const float* logits, int row, int* pick, float* 
 // into members, items of at most `tile` pairs cut a capacity slot each; the same members and items as tf_moe_route's
 // (an expert's pairs in pair order, the same starts, ends and slot search).
 constexpr int kPlanPairs = 64;
-// Shared memory it takes from `pool`, in ints (the router's staged rows, free by then).
-constexpr int kPlanPool = 3 * (kSelectMax + 1) + 2 * 32 * kRouterWaves + kPlanPairs;
+// The shared memory it takes from `pool`, in ints: 3 * experts + 2 * 32 * kRouterWaves + kPlanPairs.
 __device__ void route_plan(const int* picks, int pairs, int experts, int tile, int* members, int* items, int capacity,
                            int* pool) {
     constexpr int kThreads = 32 * kRouterWaves;
     int* counts = pool;
-    int* starts = counts + kSelectMax + 1;
-    int* ends = starts + kSelectMax + 1;
+    int* starts = counts + experts;
+    int* ends = starts + experts;
     int* scan_c = ends + kSelectMax + 1;
     int* scan_n = scan_c + kThreads;
     int* pk = scan_n + kThreads;
@@ -648,21 +644,23 @@ __device__ void route_plan(const int* picks, int pairs, int experts, int tile, i
 // tf_router_decode's logits from bf16 rows, then the pick of every row (tf_select_decode's) by the last block to finish:
 // one launch for both. `e` counts the rows with the shared gate's; `done` is zero between launches (the last block
 // zeroes it). `items` also gets the plan: one row's own, or for 2 to 4 rows tf_moe_route's at `tile` pairs an item.
+// `staged`: the host gave r * d bf16 of dynamic shared memory for x's rows (x 16-byte aligned, d a multiple of 8). A
+// 2 to 4 row plan takes the dynamic shared memory after the router: the waves' top lists, then route_plan's pool.
 template <int KIND>
 __device__ void router_select(const void* x, const void* rows, float* logits, int r, int d, int e, int* pick, float* wts,
-                              int* items, int* members, int capacity, int top_k, int tile, unsigned* done) {
+                              int* items, int* members, int capacity, int top_k, int tile, int staged, unsigned* done) {
     __shared__ bool last;
+    // the dynamic shared memory the host sized (none where it stages nothing and plans nothing; launches/moe.zig)
+    extern __shared__ __attribute__((aligned(16))) uint4 router_shared[];
     // a verify window's few rows in shared memory once a block: each wave (an expert) reads them there, not from L2
-    __shared__ __attribute__((aligned(16))) uint16_t xs[kRouterStaged * kRouterStagedWidth];
-    const bool staged = r <= kRouterStaged && d <= kRouterStagedWidth && d % 8 == 0 && (reinterpret_cast<uintptr_t>(x) & 15) == 0;
+    const void* xs = router_shared;
     if (staged) {
         const uint4* from = static_cast<const uint4*>(x);
-        uint4* to = reinterpret_cast<uint4*>(xs);
-        for (int i = threadIdx.x; i < r * d / 8; i += 32 * kRouterWaves) to[i] = from[i];
+        for (int i = threadIdx.x; i < r * d / 8; i += 32 * kRouterWaves) router_shared[i] = from[i];
         __syncthreads();
     }
     const int expert = blockIdx.x * kRouterWaves + (threadIdx.x >> 5);
-    if (expert < e) router_decode<KIND, true>(staged ? static_cast<const void*>(xs) : x, rows, logits, r, d, e, staged);
+    if (expert < e) router_decode<KIND, true>(staged ? xs : x, rows, logits, r, d, e, staged);
     __threadfence();
     __syncthreads();
     if (threadIdx.x == 0) last = atomicAdd(done, 1u) == gridDim.x - 1;
@@ -673,12 +671,11 @@ __device__ void router_select(const void* x, const void* rows, float* logits, in
         select_row(logits, 0, pick, wts, items, members, capacity, e - 1, top_k);
     } else if (r <= kRouterWaves && e - 1 <= kSelectMax) {
         // a wave a row; a row with a NaN logit then takes select_row's rank loop
-        // the waves' top lists, then the plan's arrays, in the staged rows' shared memory (free after the router)
-        static_assert(kPlanPool + 2 * 32 * kRouterWaves <= kRouterStaged * kRouterStagedWidth / 2, "plan pool");
+        // the waves' top lists, then the plan's arrays, in the dynamic shared memory (the staged rows are free by then)
         __shared__ int fallback[kRouterWaves];
-        int* pool = reinterpret_cast<int*>(xs);
-        float* wave_top_v = reinterpret_cast<float*>(pool + kPlanPool);
-        int* wave_top_i = pool + kPlanPool + 32 * kRouterWaves;
+        float* wave_top_v = reinterpret_cast<float*>(router_shared);
+        int* wave_top_i = reinterpret_cast<int*>(router_shared) + 32 * kRouterWaves;
+        int* pool = wave_top_i + 32 * kRouterWaves;
         const int wave = threadIdx.x >> 5;
         __syncthreads();
         if (wave < r) {
@@ -701,14 +698,14 @@ __device__ void router_select(const void* x, const void* rows, float* logits, in
 
 extern "C" __global__ void __launch_bounds__(32 * kRouterWaves)
     tf_router_select_f16(const void* x, const void* rows, float* logits, int r, int d, int e, int* pick, float* wts,
-                         int* items, int* members, int capacity, int top_k, int tile, unsigned* done) {
-    router_select<1>(x, rows, logits, r, d, e, pick, wts, items, members, capacity, top_k, tile, done);
+                         int* items, int* members, int capacity, int top_k, int tile, int staged, unsigned* done) {
+    router_select<1>(x, rows, logits, r, d, e, pick, wts, items, members, capacity, top_k, tile, staged, done);
 }
 
 extern "C" __global__ void __launch_bounds__(32 * kRouterWaves)
     tf_router_select_bf16(const void* x, const void* rows, float* logits, int r, int d, int e, int* pick, float* wts,
-                          int* items, int* members, int capacity, int top_k, int tile, unsigned* done) {
-    router_select<2>(x, rows, logits, r, d, e, pick, wts, items, members, capacity, top_k, tile, done);
+                          int* items, int* members, int capacity, int top_k, int tile, int staged, unsigned* done) {
+    router_select<2>(x, rows, logits, r, d, e, pick, wts, items, members, capacity, top_k, tile, staged, done);
 }
 
 extern "C" __global__ void __launch_bounds__(32 * kRouterWaves)

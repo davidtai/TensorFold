@@ -75,9 +75,23 @@ pub fn routerSelect(l: *const Launcher, x: C, kind: c_int, rows16: C, logits: F,
     try a.add(capacity);
     try a.add(top_k);
     try a.add(tile);
+    const sh = routerShared(ad(x), r, d, e, items != null);
+    try a.add(@as(c_int, @intFromBool(sh.staged)));
     try a.add(done);
-    try l.go(l.dec.router_select[if (kind == 1) 0 else 1], dim(cdiv(e, 4), 1, 1), dim(128, 1, 1), 0, s, &a);
+    try l.go(l.dec.router_select[if (kind == 1) 0 else 1], dim(cdiv(e, 4), 1, 1), dim(128, 1, 1), sh.bytes, s, &a);
     return true;
+}
+
+/// tf_router_select's dynamic shared memory: a verify window's 2 to 4 rows staged (x 16-byte aligned, d a multiple of 8,
+/// at most 4 x 2560 bf16), then for 2 to 4 rows the waves' top lists and a plan's route_plan pool; the larger of the two,
+/// since the second takes it after the first. One row takes none (its pick and plan are in static shared memory).
+fn routerShared(x: usize, r: c_int, d: c_int, e: c_int, plan: bool) struct { bytes: u32, staged: bool } {
+    if (r < 2 or r > 4) return .{ .bytes = 0, .staged = false };
+    const staged = @rem(d, 8) == 0 and x % 16 == 0 and r * d <= 4 * 2560;
+    const rows: c_int = if (staged) r * d * 2 else 0;
+    // the waves' top values and indices (32 each a wave), then route_plan's counts, starts and ends, scans and pairs
+    const ints: c_int = if (e - 1 <= 1024) 2 * 32 * 4 + (if (plan) 3 * e + 2 * 128 + 64 else 0) else 0;
+    return .{ .bytes = @intCast(@max(rows, ints * 4)), .staged = staged };
 }
 
 pub fn tf_moe_router(l: *const Launcher, x: C, kind: c_int, rows: CF, logits: F, r: c_int, d: c_int, e: c_int, s: S) Error!void {
