@@ -96,6 +96,9 @@ pub const Caches = struct {
     window: hip.DeviceBuffer,
     /// The n-gram conv's input over the last window (the tail, then its rows): a keep takes its new tail from it.
     cin: hip.DeviceBuffer,
+    /// The window snapshot row the DeltaNet layers' states are at (null: their own places), as the device word at
+    /// `start()` says: a keep that drops rows names its last kept row instead of copying it back (`settle` copies).
+    pending: ?usize = null,
     /// Positions kept, and complete blocks pooled in every sparse layer.
     len: usize = 0,
     pooled: usize = 0,
@@ -126,7 +129,8 @@ pub const Caches = struct {
         var mem = try hip.DeviceBuffer.alloc(d, layout.bytes());
         errdefer mem.free();
         try mem.fill8(0);
-        var window = try hip.DeviceBuffer.alloc(d, @max(layout.windowBytes(), 4));
+        // the snapshots, then the i32 naming the row a window starts from (`start`)
+        var window = try hip.DeviceBuffer.alloc(d, layout.windowBytes() + 16);
         errdefer window.free();
         var cin = try hip.DeviceBuffer.alloc(d, layout.cinBytes());
         errdefer cin.free();
@@ -144,6 +148,9 @@ pub const Caches = struct {
     /// The state of fresh caches again, the memory kept: zeros, no positions, eos before any row.
     pub fn reset(c: *Caches, eos: i64) !void {
         try c.mem.fill8(0);
+        try hip.runtime.check(c.window.r.api.hipMemsetD32Async(@ptrFromInt(c.start()), -1, 1, null));
+        try hip.runtime.check(c.window.r.api.hipStreamSynchronize(null));
+        c.pending = null;
         c.len = 0;
         c.pooled = 0;
         c.history = .{ eos, eos };
@@ -173,6 +180,35 @@ pub const Caches = struct {
         const l = c.layout;
         const at = c.mem.base() + l.sparse * l.sparseBytes() + c.slot[layer] * l.linearBytes();
         return .{ .conv = at, .state = at + l.conv_bytes };
+    }
+
+    /// The device i32 the window kernels read: the snapshot row their DeltaNet states start from, -1 for their places.
+    pub fn start(c: *const Caches) u64 {
+        return c.window.base() + c.layout.windowBytes();
+    }
+
+    /// The window starts from snapshot row `row` (null: the states' own places), after the work on `s` so far.
+    pub fn startAt(c: *Caches, row: ?usize, s: hip.Stream) !void {
+        const same = if (row) |r| (if (c.pending) |q| q == r else false) else c.pending == null;
+        if (same) return;
+        const word: c_int = if (row) |r| @intCast(r) else -1;
+        try hip.runtime.check(c.window.r.api.hipMemsetD32Async(@ptrFromInt(c.start()), word, 1, s.handle));
+        c.pending = row;
+    }
+
+    /// The DeltaNet states back in their own places (copied from the snapshot row a keep named), for every reader but
+    /// a window's kernels: a prompt's forward, a saved state.
+    pub fn settle(c: *Caches, s: hip.Stream) !void {
+        const row = c.pending orelse return;
+        const l = c.layout;
+        for (c.linear, 0..) |linear, i| {
+            if (!linear) continue;
+            const from = c.snapshot(i, row);
+            const to = c.linearAt(i);
+            try hip.runtime.check(c.window.r.api.hipMemcpyDtoDAsync(@ptrFromInt(to.conv), @ptrFromInt(from.conv), l.conv_bytes, s.handle));
+            try hip.runtime.check(c.window.r.api.hipMemcpyDtoDAsync(@ptrFromInt(to.state), @ptrFromInt(from.state), l.state_bytes, s.handle));
+        }
+        try c.startAt(null, s);
     }
 
     /// The n-gram conv's tail rows (act dtype, (tail_rows, W)).

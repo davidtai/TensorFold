@@ -52,6 +52,7 @@ pub fn linear(
                 .weight = l.conv,
                 .state = g.c.linearAt(index).conv,
                 .states = g.c.snapshot(index, 0).conv,
+                .from = g.c.start(),
                 .qn = q + at_row * kw * 4,
                 .kn = k + at_row * kw * 4,
                 .v = v + at_row * vw * 4,
@@ -158,6 +159,7 @@ fn recur(
             d.key_dim,
             d.value_dim,
             snaps,
+            if (window) g.c.start() else 0,
         );
         off += n;
     }

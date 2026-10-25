@@ -28,7 +28,8 @@ pub fn tf_gdn_gate(l: *const Launcher, av: C, bv: C, kind: c_int, a_log: CF, dt_
     try l.go(l.gdn_gate[tri(kind)], dim(cdiv(count, 256), 1, 1), dim(256, 1, 1), 0, s, &a);
 }
 
-pub fn tf_gated_delta(l: *const Launcher, q: CF, k: CF, v: CF, gate: CF, beta: CF, state: F, y: F, batch: c_int, length: c_int, key_heads: c_int, value_heads: c_int, dk: c_int, dv: c_int, s: S, states: F) Error!void {
+/// `from`: a device i32 naming the snapshot row (of `states`) a lone stream's window starts from, -1 for `state`; 0: none.
+pub fn tf_gated_delta(l: *const Launcher, q: CF, k: CF, v: CF, gate: CF, beta: CF, state: F, y: F, batch: c_int, length: c_int, key_heads: c_int, value_heads: c_int, dk: c_int, dv: c_int, s: S, states: F, from: u64) Error!void {
     if ((dk != 16 and dk != 128) or dv < 1 or key_heads < 1 or @rem(value_heads, key_heads) != 0 or batch < 1 or length < 1) {
         return invalid("gated delta");
     }
@@ -45,6 +46,8 @@ pub fn tf_gated_delta(l: *const Launcher, q: CF, k: CF, v: CF, gate: CF, beta: C
     try a.add(value_heads);
     try a.add(dv);
     try a.add(ad(states));
+    if (from != 0 and batch != 1) return invalid("gated delta start row");
+    try a.add(from);
     const wide: usize = if (dk == 128) 0 else 1;
     // Eight rows share one k/q tile; a short dv stays on the one-row wave, which is the same scan.
     if (@rem(dv, 8) == 0) {
