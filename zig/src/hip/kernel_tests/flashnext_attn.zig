@@ -528,3 +528,129 @@ fn promptCase(t: *Rig, comptime exact: bool) !void {
         }
     };
 }
+
+test "decode attention on the matrix-core tile in parts: near fp64's softmax, alike at any row count, gated as tf_attn_gate" {
+    if (!@import("../launches/flashnext.zig").promptOnMatrix()) return error.SkipZigTest;
+    const t = try Rig.open(1 << 22);
+    defer t.close();
+    var rng: rig.Rng = .{ .state = 0xDEC2 };
+    const heads = 24;
+    const kv_heads = 2;
+    const dims = 256;
+    const cap = 2600;
+    const stride = 2052;
+    const parts = 32;
+    const scale: f32 = 0.0625;
+    // a full window of listed rows (2,048 picks and tails of 3, 0 and 1), a short dense row
+    const count = [_]i32{ 2051, 2048, 2049, 20 };
+    const sparse = [_]i32{ 1, 1, 1, 0 };
+    const rows = count.len;
+    const hk = try fx.acts(t, &rng, kv_heads * cap * dims, 1.0);
+    defer gpa.free(hk);
+    const hv = try fx.acts(t, &rng, kv_heads * cap * dims, 1.0);
+    defer gpa.free(hv);
+    const hq = try gpa.alloc(f32, rows * heads * dims);
+    defer gpa.free(hq);
+    for (hq) |*x| x.* = rnd(t, rng.unit() * 4.0);
+    const hg = try fx.acts(t, &rng, rows * heads * 2 * dims, 3.0);
+    defer gpa.free(hg);
+    var ids: [rows * stride]i32 = @splat(0);
+    for (0..rows) |r| for (0..stride) |j| {
+        ids[r * stride + j] = @intCast((j * 41 + r * 7) % cap);
+    };
+    var dk = try t.upload(hk);
+    defer dk.free();
+    var dv = try t.upload(hv);
+    defer dv.free();
+    var dq = try t.upload(hq);
+    defer dq.free();
+    var dg = try t.upload(hg);
+    defer dg.free();
+    var di = try t.upload(&ids);
+    defer di.free();
+    var dc = try t.upload(&count);
+    defer dc.free();
+    var ds = try t.upload(&sparse);
+    defer ds.free();
+    var po = try t.alloc(rows * heads * parts * dims * 4);
+    defer po.free();
+    var pm = try t.alloc(rows * heads * parts * 2 * 4);
+    defer pm.free();
+    var out = try t.alloc(rows * heads * dims * 4);
+    defer out.free();
+    var one = try t.alloc(heads * dims * 4);
+    defer one.free();
+    var gated = try t.alloc(rows * heads * dims * 2);
+    defer gated.free();
+    var want_gated = try t.alloc(rows * heads * dims * 2);
+    defer want_gated.free();
+    const st = t.stream.handle;
+    const Run = struct { qg: ?*const anyopaque, out: ?*anyopaque, rows: c_int };
+    for ([_]Run{
+        .{ .qg = null, .out = ptr(?*anyopaque, out), .rows = rows },
+        .{ .qg = null, .out = ptr(?*anyopaque, one), .rows = 1 },
+        .{ .qg = ptr(?*const anyopaque, dg), .out = ptr(?*anyopaque, gated), .rows = rows },
+    }) |run| try t.on.fn_sparse_decode(
+        ptr(?[*]const f32, dq),
+        ptr(?*const anyopaque, dk),
+        ptr(?*const anyopaque, dv),
+        ptr(?[*]const i32, di),
+        stride,
+        ptr(?[*]const i32, dc),
+        ptr(?[*]const i32, ds),
+        ptr(?[*]f32, po),
+        ptr(?[*]f32, pm),
+        run.qg,
+        run.out,
+        t.kind(),
+        run.rows,
+        cap,
+        scale,
+        parts,
+        true,
+        st,
+    );
+    try t.on.tf_attn_gate(ptr(?[*]const f32, out), ptr(?*const anyopaque, dg), ptr(?*anyopaque, want_gated), t.kind(), rows, heads, dims, 1, st);
+    try t.stream.synchronize();
+    const got = try rig.download(f32, out);
+    defer gpa.free(got);
+    const solo = try rig.download(f32, one);
+    defer gpa.free(solo);
+    try std.testing.expectEqualSlices(f32, got[0 .. heads * dims], solo);
+    const gg = try rig.download(u16, gated);
+    defer gpa.free(gg);
+    const wg = try rig.download(u16, want_gated);
+    defer gpa.free(wg);
+    try std.testing.expectEqualSlices(u16, wg, gg);
+    var w: [cap]f64 = undefined;
+    for (0..rows) |r| for (0..heads) |h| {
+        const kvh = h / (heads / kv_heads);
+        const n: usize = @intCast(count[r]);
+        var top: f64 = -std.math.inf(f64);
+        for (0..n) |j| {
+            const key: usize = if (sparse[r] != 0) @intCast(ids[r * stride + j]) else j;
+            var s: f64 = 0;
+            for (0..dims) |d| s += @as(f64, hq[(r * heads + h) * dims + d] * scale) * t.value(hk[(kvh * cap + key) * dims + d]);
+            w[j] = s;
+            top = @max(top, s);
+        }
+        var total: f64 = 0;
+        for (w[0..n]) |*x| {
+            x.* = @exp(x.* - top);
+            total += x.*;
+        }
+        for (0..dims) |d| {
+            var acc: f64 = 0;
+            for (0..n) |j| {
+                const key: usize = if (sparse[r] != 0) @intCast(ids[r * stride + j]) else j;
+                acc += w[j] * t.value(hv[(kvh * cap + key) * dims + d]);
+            }
+            const want = acc / total;
+            try rig.expect(
+                @abs(got[(r * heads + h) * dims + d] - want) <= 1e-4 * @max(@abs(want), 0.1),
+                "decode tile row {d} head {d} dim {d}: {d} against {d}",
+                .{ r, h, d, got[(r * heads + h) * dims + d], want },
+            );
+        }
+    };
+}

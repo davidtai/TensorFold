@@ -33,6 +33,8 @@ pub const Fns = struct {
     sparse_parts: [2]Function, // groups of up to 6 and up to 12 query heads
     sparse_merge: Function,
     sparse_prompt: [2]Function, // q bf16-exact, q any fp32 (hi + lo)
+    sparse_tile_parts: [2]Function, // the same tile over parts of each row's keys
+    sparse_merge_gate: Function,
 
     pub fn load(m: Module) Error!Fns {
         return .{
@@ -49,6 +51,8 @@ pub const Fns = struct {
             .sparse_parts = .{ try m.function("tf_fn_sparse_parts6"), try m.function("tf_fn_sparse_parts12") },
             .sparse_merge = try m.function("tf_fn_sparse_merge"),
             .sparse_prompt = .{ try m.function("tf_fn_sparse_prompt"), try m.function("tf_fn_sparse_prompt_split") },
+            .sparse_tile_parts = .{ try m.function("tf_fn_sparse_tile_parts"), try m.function("tf_fn_sparse_tile_parts_split") },
+            .sparse_merge_gate = try m.function("tf_fn_sparse_merge_gate"),
         };
     }
 };
@@ -474,4 +478,39 @@ pub fn sparsePrompt(
         try a.add(x);
     const f = l.fnx.sparse_prompt[if (exact_q) 0 else 1];
     try l.go(f, dim(rows, prompt_kv_heads, 1), dim(128, 1, 1), 0, s, &a);
+}
+
+/// A few rows' attention (decode, a window): sparsePrompt's tile over `parts` parts of each row's keys, then the parts
+/// merged in part order and gated as tf_attn_gate gates (`kind` rows of `qg` into `out`).
+pub fn sparseDecode(
+    l: *const Launcher,
+    q: CF,
+    k: C,
+    v: C,
+    ids: CI,
+    id_stride: i64,
+    count: CI,
+    sparse: CI,
+    parts_o: F,
+    parts_ms: F,
+    qg: C,
+    out: P,
+    kind: c_int,
+    rows: c_int,
+    cap: i64,
+    scale: f32,
+    parts: c_int,
+    exact_q: bool,
+    s: S,
+) Error!void {
+    if (!promptOnMatrix() or parts < 1) return util.invalid("sparseDecode");
+    if (rows == 0) return;
+    var a: Args = .{};
+    inline for (.{ ad(q), ad(k), ad(v), ad(ids), id_stride, ad(count), ad(sparse), ad(parts_o), ad(parts_ms), cap, scale }) |x|
+        try a.add(x);
+    try l.go(l.fnx.sparse_tile_parts[if (exact_q) 0 else 1], dim(rows, prompt_kv_heads, parts), dim(128, 1, 1), 0, s, &a);
+    var b: Args = .{};
+    inline for (.{ ad(parts_o), ad(parts_ms), ad(qg), kind, ad(out), @as(c_int, prompt_heads), @as(c_int, prompt_dims), parts }) |x|
+        try b.add(x);
+    try l.go(l.fnx.sparse_merge_gate, dim(prompt_heads, rows, 1), dim(256, 1, 1), 0, s, &b);
 }

@@ -152,11 +152,13 @@ __device__ __forceinline__ uint32_t prompt_pack(uint16_t lo, uint16_t hi) {
     return static_cast<uint32_t>(lo) | (static_cast<uint32_t>(hi) << 16);
 }
 
-template <bool SPLIT>
+// PARTS: block (r, g, p) takes part p of gridDim.z of the row's keys (lo = p n / parts, as tf_fn_sparse_parts) and
+// writes its unnormalized o, running max and sum in tf_fn_sparse_parts' layout for tf_fn_sparse_merge(_gate).
+template <bool SPLIT, bool PARTS>
 __device__ void sparse_prompt(const float* __restrict__ q, const uint16_t* __restrict__ k,
                               const uint16_t* __restrict__ v, const int* __restrict__ ids, long long id_stride,
                               const int* __restrict__ count, const int* __restrict__ sparse, const uint16_t* qg,
-                              void* out, long long cap, float scale) {
+                              void* out, float* parts_ms, long long cap, float scale) {
 #if TF_DEVICE_WMMA_GFX11
     using tf::rocm::bf16x16;
     using tf::rocm::f32x8;
@@ -167,7 +169,10 @@ __device__ void sparse_prompt(const float* __restrict__ q, const uint16_t* __res
     const int t = threadIdx.x, lane = t & 31, wave = t >> 5;
     const int col = lane & 15, half = lane >> 4;
     const int dim0 = wave * 64;
-    const int n = count[r];
+    const int n_row = count[r];
+    const int part = PARTS ? static_cast<int>(blockIdx.z) : 0, parts = PARTS ? static_cast<int>(gridDim.z) : 1;
+    const int lo = static_cast<int>(static_cast<long long>(part) * n_row / parts);
+    const int n = static_cast<int>(static_cast<long long>(part + 1) * n_row / parts);
     const bool listed = ids != nullptr && sparse != nullptr && sparse[r] != 0;
     const int* row_ids = ids + r * id_stride;
     const long long head_base = static_cast<long long>(g) * cap * kPromptDims;
@@ -201,7 +206,7 @@ __device__ void sparse_prompt(const float* __restrict__ q, const uint16_t* __res
 #pragma unroll
     for (int j = 0; j < 4; ++j) acc[j] = f32x8{0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
 
-    for (int c0 = 0; c0 < n; c0 += kPromptChunk) {
+    for (int c0 = lo; c0 < n; c0 += kPromptChunk) {
         // this lane's cell (lane = cell): its key, or key 0 past the row's keys (finite values under p = 0)
         const int cell = c0 + lane;
         const bool live = cell < n;
@@ -320,6 +325,16 @@ __device__ void sparse_prompt(const float* __restrict__ q, const uint16_t* __res
     for (int i = 0; i < 8; ++i) {
         const int h = 2 * i + half;
         if (h >= kPromptGroup) continue;
+        if constexpr (PARTS) {
+            const long long row = (static_cast<long long>(r) * kPromptHeads + g * kPromptGroup + h) * parts + part;
+#pragma unroll
+            for (int j = 0; j < 4; ++j) static_cast<float*>(out)[row * kPromptDims + dim0 + j * 16 + col] = acc[j][i];
+            if (wave == 0 && col == 0) {
+                parts_ms[row * 2] = S.m[h];
+                parts_ms[row * 2 + 1] = S.l[h];
+            }
+            continue;
+        }
         const float total = S.l[h];
         const long long at = (static_cast<long long>(r) * kPromptHeads + g * kPromptGroup + h) * kPromptDims;
 #pragma unroll
@@ -342,21 +357,38 @@ __device__ void sparse_prompt(const float* __restrict__ q, const uint16_t* __res
 extern "C" __global__ void __launch_bounds__(kPromptThreads)
 tf_fn_sparse_prompt(const float* q, const void* k, const void* v, const int* ids, long long id_stride,
                     const int* count, const int* sparse, const void* qg, void* out, long long cap, float scale) {
-    sparse_prompt<false>(q, static_cast<const uint16_t*>(k), static_cast<const uint16_t*>(v), ids, id_stride, count,
-                         sparse, static_cast<const uint16_t*>(qg), out, cap, scale);
+    sparse_prompt<false, false>(q, static_cast<const uint16_t*>(k), static_cast<const uint16_t*>(v), ids, id_stride,
+                                count, sparse, static_cast<const uint16_t*>(qg), out, nullptr, cap, scale);
 }
 
 // The same over an fp32 q that need not be bf16-exact: q as bf16 hi + lo.
 extern "C" __global__ void __launch_bounds__(kPromptThreads)
 tf_fn_sparse_prompt_split(const float* q, const void* k, const void* v, const int* ids, long long id_stride,
                           const int* count, const int* sparse, const void* qg, void* out, long long cap, float scale) {
-    sparse_prompt<true>(q, static_cast<const uint16_t*>(k), static_cast<const uint16_t*>(v), ids, id_stride, count,
-                        sparse, static_cast<const uint16_t*>(qg), out, cap, scale);
+    sparse_prompt<true, false>(q, static_cast<const uint16_t*>(k), static_cast<const uint16_t*>(v), ids, id_stride,
+                               count, sparse, static_cast<const uint16_t*>(qg), out, nullptr, cap, scale);
 }
 
-// Block (h, r), a thread a dim: the parts of head h of row r combined in part order, fp32 rows-major out.
-extern "C" __global__ void tf_fn_sparse_merge(const float* parts_o, const float* parts_ms, float* out, int heads,
-                                              int dims, int parts) {
+// The decode and window rows: the same tile over part blockIdx.z of each row's keys, into tf_fn_sparse_parts' parts.
+extern "C" __global__ void __launch_bounds__(kPromptThreads)
+tf_fn_sparse_tile_parts(const float* q, const void* k, const void* v, const int* ids, long long id_stride,
+                        const int* count, const int* sparse, float* parts_o, float* parts_ms, long long cap,
+                        float scale) {
+    sparse_prompt<false, true>(q, static_cast<const uint16_t*>(k), static_cast<const uint16_t*>(v), ids, id_stride,
+                               count, sparse, nullptr, parts_o, parts_ms, cap, scale);
+}
+extern "C" __global__ void __launch_bounds__(kPromptThreads)
+tf_fn_sparse_tile_parts_split(const float* q, const void* k, const void* v, const int* ids, long long id_stride,
+                              const int* count, const int* sparse, float* parts_o, float* parts_ms, long long cap,
+                              float scale) {
+    sparse_prompt<true, true>(q, static_cast<const uint16_t*>(k), static_cast<const uint16_t*>(v), ids, id_stride,
+                              count, sparse, nullptr, parts_o, parts_ms, cap, scale);
+}
+
+// Block (h, r), a thread a dim: the parts of head h of row r combined in part order, fp32 rows-major out; with qg,
+// the row gated as tf_attn_gate gates it (out = round(o sigmoid(gate)) in the activation kind).
+__device__ __forceinline__ void sparse_merge(const float* parts_o, const float* parts_ms, const void* qg, int kind,
+                                             void* out, int heads, int dims, int parts) {
     const int h = blockIdx.x, r = blockIdx.y;
     const long long at = (static_cast<long long>(r) * heads + h) * parts;
     float top = -INFINITY;
@@ -369,8 +401,21 @@ extern "C" __global__ void tf_fn_sparse_merge(const float* parts_o, const float*
             total += parts_ms[(at + p) * 2 + 1] * w;
             acc += parts_o[(at + p) * dims + d] * w;
         }
-        out[(static_cast<long long>(r) * heads + h) * dims + d] = total > 0.f ? acc / total : 0.f;
+        const float o = total > 0.f ? acc / total : 0.f;
+        const long long i = (static_cast<long long>(r) * heads + h) * dims + d;
+        if (qg == nullptr) static_cast<float*>(out)[i] = o;
+        else store(out, kind, i, o * sigmoid(load(qg, kind, (i - d) * 2 + dims + d)));
     }
+}
+
+extern "C" __global__ void tf_fn_sparse_merge(const float* parts_o, const float* parts_ms, float* out, int heads,
+                                              int dims, int parts) {
+    sparse_merge(parts_o, parts_ms, nullptr, 0, out, heads, dims, parts);
+}
+
+extern "C" __global__ void tf_fn_sparse_merge_gate(const float* parts_o, const float* parts_ms, const void* qg,
+                                                   int kind, void* out, int heads, int dims, int parts) {
+    sparse_merge(parts_o, parts_ms, qg, kind, out, heads, dims, parts);
 }
 
 }  // namespace

@@ -217,9 +217,11 @@ pub fn sparse(
     try o.qkRope(idx, width, di, s.iq_norm, d.eps, rows, d.index_heads, di, d.rotary, d.theta, dev_pos, iq, null, 0);
     const graphed = o.window and staged != null;
     // a prompt's rows attend in one pass on the matrix cores and write the gated rows themselves
-    const prompt = !graphed and rows >= prompt_rows and promptFits(m, d);
+    // on the matrix cores a prompt's rows attend in one pass, a few rows in parts; both write the gated rows
+    const tile = promptFits(m, d);
+    const prompt = tile and !graphed and rows >= prompt_rows;
     const gated = try take(o, m.act, rows * d.heads * hd);
-    const att = if (prompt) 0 else try o.arena.of(f32, rows * d.heads * hd);
+    const att = if (tile) 0 else try o.arena.of(f32, rows * d.heads * hd);
     var off: usize = 0;
     for (segs) |g| {
         const n = g.tokens.len;
@@ -315,7 +317,8 @@ pub fn sparse(
             cap,
             q32 + off * d.heads * hd * 4,
             iq + off * d.index_heads * di * 4,
-            att + off * d.heads * hd * 4,
+            if (tile) 0 else att + off * d.heads * hd * 4,
+            if (tile) .{ .qg = forward.at(qg, off * d.heads * 2 * hd).ptr, .gated = forward.at(gated, off * d.heads * hd).ptr } else null,
             n,
             pos,
             host,
@@ -324,12 +327,18 @@ pub fn sparse(
         );
         off += n;
     }
-    if (!prompt) try o.attnGate(att, qg, gated, rows, d.heads, hd, true);
+    if (!tile) try o.attnGate(att, qg, gated, rows, d.heads, hd, true);
     return o.project(gated, s.o, rows, s.o.partial);
 }
 
-/// Rows from which a call's attention takes the prompt kernel: below, the parts kernel's wider grid wins.
+/// Rows from which a call's attention takes the prompt kernel: below, the tile runs in parts for a wider grid.
 const prompt_rows = 16;
+
+/// Parts of a decode or window row's keys on the matrix-core tile: 2,051 keys in 64-key parts, 66 blocks a row.
+const tile_parts = 32;
+
+/// Where `attend` writes the gated rows when the tile runs: the q-and-gate projection rows and the output.
+const Fused = struct { qg: u64, gated: u64 };
 
 /// The prompt kernel's geometry: Flash Next's whole 24 x 256 heads over 2 kv heads, bf16, on matrix cores.
 fn promptFits(m: *const model.Model, d: model.Dims) bool {
@@ -435,6 +444,7 @@ fn attend(
     q32: u64,
     iq: u64,
     att: u64,
+    fused: ?Fused,
     rows: usize,
     pos: usize,
     host: *forward.Host,
@@ -504,9 +514,34 @@ fn attend(
             sparse_flags = flags;
             count = counts;
         }
-        const po = try o.arena.of(f32, n * d.heads * parts * hd);
-        const pm = try o.arena.of(f32, n * d.heads * parts * 2);
+        const np: usize = if (fused != null) tile_parts else parts;
+        const po = try o.arena.of(f32, n * d.heads * np * hd);
+        const pm = try o.arena.of(f32, n * d.heads * np * 2);
         const scale: f32 = @floatCast(1.0 / std.math.sqrt(@as(f64, @floatFromInt(hd))));
+        if (fused) |fz| {
+            // q32 holds activation-kind values (qkRope rounds them) and 1 / 16 is a power of two: one product is exact
+            try o.l.fn_sparse_decode(
+                @ptrFromInt(q32 + r0 * d.heads * hd * 4),
+                @ptrFromInt(kv.k),
+                @ptrFromInt(kv.v),
+                if (ids) |i| @ptrFromInt(i) else null,
+                @intCast(key_stride),
+                @ptrFromInt(count),
+                if (sparse_flags) |f| @ptrFromInt(f) else null,
+                @ptrFromInt(po),
+                @ptrFromInt(pm),
+                @ptrFromInt(fz.qg + r0 * d.heads * 2 * hd * m.act.size()),
+                @ptrFromInt(fz.gated + r0 * d.heads * hd * m.act.size()),
+                kind,
+                @intCast(n),
+                @intCast(cap),
+                scale,
+                @intCast(tile_parts),
+                true,
+                o.stream,
+            );
+            continue;
+        }
         try o.l.fn_sparse_attention(
             @ptrFromInt(q32 + r0 * d.heads * hd * 4),
             @ptrFromInt(kv.k),
