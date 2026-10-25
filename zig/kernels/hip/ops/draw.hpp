@@ -246,8 +246,11 @@ extern "C" __global__ void tf_topk_part(const uint16_t* logits, int n, const int
     if (own > 0) topk_slice({logits + static_cast<long long>(r) * n + base, base, len}, own, cand_ids + at, cand_vals + at);
 }
 
+// Candidates a row's join holds in shared memory at most (tf_topk_parts' parts * stride).
+constexpr int kJoinMost = 4096;
+
 // Row r's tf_topk from its parts' candidates: the same k-th key, then the same order (the keys above it by id, then
-// the k-th's lowest ids), each entry's slot counted from the candidates with lower ids.
+// the k-th's lowest ids), each entry's slot counted from the candidates with lower ids (in shared memory).
 extern "C" __global__ void tf_topk_join(const int* cand_ids, const uint16_t* cand_vals, int parts, const int* ks, int stride,
                                         int* ids, uint16_t* values) {
     const int r = blockIdx.x, k = ks[r];
@@ -256,21 +259,25 @@ extern "C" __global__ void tf_topk_join(const int* cand_ids, const uint16_t* can
     const Candidates e{cand_ids + at, cand_vals + at, parts * stride};
     __shared__ int hist[256];
     __shared__ int pick[4];
+    __shared__ int sid[kJoinMost];
+    __shared__ uint32_t skey[kJoinMost];
     topk_kth(e, k, hist, pick);
     const uint32_t kth = (static_cast<uint32_t>(pick[0]) << 8) | static_cast<uint32_t>(pick[1]);
     const int above = pick[2], take = pick[3];
+    // each candidate's id and class: 2 above the k-th, 1 the k-th's, 0 neither (or absent)
     for (int i = threadIdx.x; i < e.n; i += kThreads) {
-        if (!e.has(i)) continue;
-        const uint32_t key = order_key(e.bits(i));
-        const bool gt = key > kth;
-        if (!gt && key != kth) continue;
-        const int id = e.id(i);
+        const uint32_t key = e.has(i) ? order_key(e.bits(i)) : 0u;
+        sid[i] = e.ids[i];
+        skey[i] = !e.has(i) ? 0u : key > kth ? 2u : key == kth ? 1u : 0u;
+    }
+    __syncthreads();
+    for (int i = threadIdx.x; i < e.n; i += kThreads) {
+        const uint32_t cls = skey[i];
+        if (cls == 0) continue;
+        const bool gt = cls == 2;
+        const int id = sid[i];
         int before = 0;  // the candidates of the same class with lower ids
-        for (int j = 0; j < e.n; ++j) {
-            if (!e.has(j) || e.id(j) >= id) continue;
-            const uint32_t kj = order_key(e.bits(j));
-            before += gt ? (kj > kth) : (kj == kth);
-        }
+        for (int j = 0; j < e.n; ++j) before += skey[j] == cls && sid[j] < id;
         if (gt) {
             ids[r * stride + before] = id;
             values[r * stride + before] = e.bits(i);
