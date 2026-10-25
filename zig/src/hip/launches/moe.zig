@@ -53,6 +53,30 @@ pub fn routerWindow(l: *const Launcher, x: C, kind: c_int, rows: CF, logits: F, 
     return true;
 }
 
+/// A decode call's router logits from bf16 rows and the pick of each row (tf_select_decode's) in one launch, the plan too
+/// when `items` is given (one row); false (nothing launched) where the shape keeps the router and the pick apart.
+/// `done` is a u32 that is zero between launches.
+pub fn routerSelect(l: *const Launcher, x: C, kind: c_int, rows16: C, logits: F, pick: I, wts: F, items: I, members: I, capacity: c_int, r: c_int, d: c_int, e: c_int, top_k: c_int, done: u64, s: S) Error!bool {
+    if (!l.fuse or done == 0 or r < 1 or r > 16 or @rem(d, 4) != 0 or ad(rows16) % 8 != 0 or ad(x) % 8 != 0) return false;
+    if (e - 1 > 1024 or top_k < 1 or top_k > 31 or (items != null and r != 1)) return false;
+    var a: Args = .{};
+    try a.add(ad(x));
+    try a.add(ad(rows16));
+    try a.add(ad(logits));
+    try a.add(r);
+    try a.add(d);
+    try a.add(e);
+    try a.add(ad(pick));
+    try a.add(ad(wts));
+    try a.add(ad(items));
+    try a.add(ad(members));
+    try a.add(capacity);
+    try a.add(top_k);
+    try a.add(done);
+    try l.go(l.dec.router_select[if (kind == 1) 0 else 1], dim(cdiv(e, 4), 1, 1), dim(128, 1, 1), 0, s, &a);
+    return true;
+}
+
 pub fn tf_moe_router(l: *const Launcher, x: C, kind: c_int, rows: CF, logits: F, r: c_int, d: c_int, e: c_int, s: S) Error!void {
     // a prompt's rows take the 64 x 64 tiles, a round's few rows a wave an expert; each logit's sum is the same
     var a: Args = .{};

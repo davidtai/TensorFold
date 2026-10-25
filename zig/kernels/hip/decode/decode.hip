@@ -29,9 +29,21 @@ constexpr int kRouterWaves = 4;
 constexpr int kRouterSteps = 16;  // float4 loads a lane keeps in flight
 constexpr int kRouterRows = 16;
 
-// logits[r, e] = x[r] . rows[e], 16 rows a block, a wave an expert; d is a multiple of 4, weight rows 16-byte aligned.
-template <int KIND>
-__device__ void router_decode(const void* x, const float* rows, float* logits, int r, int d, int e) {
+// Four router weights at `at` of row `w`: fp32 rows as stored, or bf16 rows (ROWS16) widened, which is exact.
+template <bool ROWS16>
+__device__ __forceinline__ float4 router_weights(const void* w, int at) {
+    if constexpr (ROWS16) {
+        const uint2 v = *reinterpret_cast<const uint2*>(static_cast<const uint16_t*>(w) + at);
+        return make_float4(bf16_up(v.x & 0xffffu), bf16_up(v.x >> 16), bf16_up(v.y & 0xffffu), bf16_up(v.y >> 16));
+    } else {
+        return *reinterpret_cast<const float4*>(static_cast<const float*>(w) + at);
+    }
+}
+
+// logits[r, e] = x[r] . rows[e], 16 rows a block, a wave an expert; d is a multiple of 4, weight rows 16-byte aligned
+// (8-byte for ROWS16: bf16 rows, the same values as the fp32 rows widened from them, so the same logits).
+template <int KIND, bool ROWS16 = false>
+__device__ void router_decode(const void* x, const void* rows, float* logits, int r, int d, int e) {
     const int lane = threadIdx.x & 31;
     const int expert = blockIdx.x * kRouterWaves + (threadIdx.x >> 5);
     if (expert >= e) return;
@@ -40,7 +52,8 @@ __device__ void router_decode(const void* x, const float* rows, float* logits, i
     x = static_cast<const uint16_t*>(x) + static_cast<long long>(first) * d;
     logits += static_cast<long long>(first) * e;
     r = r - first < kRouterRows ? r - first : kRouterRows;
-    const float* w = rows + static_cast<long long>(expert) * d;
+    const void* w = ROWS16 ? static_cast<const void*>(static_cast<const uint16_t*>(rows) + static_cast<long long>(expert) * d)
+                           : static_cast<const void*>(static_cast<const float*>(rows) + static_cast<long long>(expert) * d);
     float acc[kRouterRows];
 #pragma unroll
     for (int k = 0; k < kRouterRows; ++k) acc[k] = 0.f;
@@ -49,7 +62,7 @@ __device__ void router_decode(const void* x, const float* rows, float* logits, i
 #pragma unroll
         for (int s = 0; s < kRouterSteps; ++s) {
             const int at = base + (lane + 32 * s) * 4;
-            wv[s] = at < d ? *reinterpret_cast<const float4*>(w + at) : make_float4(0.f, 0.f, 0.f, 0.f);
+            wv[s] = at < d ? router_weights<ROWS16>(w, at) : make_float4(0.f, 0.f, 0.f, 0.f);
         }
 #pragma unroll
         for (int k = 0; k < kRouterRows; ++k) {
@@ -386,7 +399,150 @@ __device__ void select_body(const float* logits, int* pick, float* wts, int* ite
     }
 }
 
+// The pick of row `row` (select_body's rule and arithmetic) by the router's block of 32 * kRouterWaves threads: the k-th
+// pick is the best expert left under select_body's order (value descending, index ascending), which is the expert of
+// rank k there, so top_v and top_i are the same. A row with a NaN logit takes select_body's rank loop instead (its
+// order is not a total order there). Logits are read with coherent loads: other blocks of this launch wrote them.
+__device__ void select_row(const float* logits, int row, int* pick, float* wts, int* items, int* members, int capacity,
+                           int experts, int top_k) {
+    constexpr int kThreads = 32 * kRouterWaves;
+    __shared__ float v[kSelectMax];
+    __shared__ unsigned char taken[kSelectMax];
+    __shared__ float top_v[32];
+    __shared__ int top_i[32];
+    __shared__ float wave_v[kRouterWaves];
+    __shared__ int wave_i[kRouterWaves];
+    __shared__ int has_nan;
+    const int slots = top_k + 1;
+    const int lane = threadIdx.x & 31, wave = threadIdx.x >> 5;
+    float* l = const_cast<float*>(logits) + static_cast<long long>(row) * (experts + 1);
+    if (threadIdx.x == 0) has_nan = 0;
+    __syncthreads();
+    for (int i = threadIdx.x; i < experts; i += kThreads) {
+        const float vi = __hip_atomic_load(l + i, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+        v[i] = vi;
+        taken[i] = 0;
+        if (vi != vi) has_nan = 1;
+    }
+    __syncthreads();
+    if (has_nan) {
+        for (int i = threadIdx.x; i < experts; i += kThreads) {
+            const float vi = v[i];
+            int rank = 0;
+            for (int j = 0; j < experts; ++j) {
+                const float vj = v[j];
+                rank += (vj > vi) || (vj == vi && j < i);
+            }
+            if (rank < top_k) {
+                top_v[rank] = vi;
+                top_i[rank] = i;
+            }
+        }
+    } else {
+        for (int k = 0; k < top_k; ++k) {
+            float bv = 0.f;
+            int bi = 0x7fffffff;
+            for (int i = threadIdx.x; i < experts; i += kThreads) {
+                const float vi = v[i];
+                if (!taken[i] && (bi == 0x7fffffff || vi > bv || (vi == bv && i < bi))) {
+                    bv = vi;
+                    bi = i;
+                }
+            }
+#pragma unroll
+            for (int mask = 16; mask > 0; mask >>= 1) {
+                const float ov = __shfl_xor(bv, mask, 32);
+                const int oi = __shfl_xor(bi, mask, 32);
+                if (oi != 0x7fffffff && (bi == 0x7fffffff || ov > bv || (ov == bv && oi < bi))) {
+                    bv = ov;
+                    bi = oi;
+                }
+            }
+            if (lane == 0) {
+                wave_v[wave] = bv;
+                wave_i[wave] = bi;
+            }
+            __syncthreads();
+            if (threadIdx.x == 0) {
+                float cv = wave_v[0];
+                int ci = wave_i[0];
+                for (int w = 1; w < kRouterWaves; ++w) {
+                    const float ov = wave_v[w];
+                    const int oi = wave_i[w];
+                    if (oi != 0x7fffffff && (ci == 0x7fffffff || ov > cv || (ov == cv && oi < ci))) {
+                        cv = ov;
+                        ci = oi;
+                    }
+                }
+                top_v[k] = cv;
+                top_i[k] = ci;
+                taken[ci] = 1;
+            }
+            __syncthreads();
+        }
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        const float top = top_v[0];
+        float ex[32];
+        float total = 0.f;
+        for (int k = 0; k < top_k; ++k) {
+            ex[k] = expf(top_v[k] - top);
+            total += ex[k];
+        }
+        for (int k = 0; k < top_k; ++k) {
+            pick[row * slots + k] = top_i[k];
+            wts[row * slots + k] = round_bf16_f(ex[k] / total);
+        }
+        const float gate = round_bf16_f(__hip_atomic_load(l + experts, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT));
+        pick[row * slots + top_k] = experts;
+        wts[row * slots + top_k] = round_bf16_f(1.f / (1.f + expf(-gate)));
+    }
+    if (items != nullptr) {
+        __syncthreads();
+        for (int k = threadIdx.x; k < capacity; k += kThreads) {
+            const bool real = k < slots;
+            items[3 * k] = real ? pick[k] : 0;
+            items[3 * k + 1] = real ? k : 0;
+            items[3 * k + 2] = real ? 1 : 0;
+            if (real) members[k] = k;
+        }
+    }
+    __syncthreads();
+}
+
+// tf_router_decode's logits from bf16 rows, then the pick of every row (tf_select_decode's) by the last block to finish:
+// one launch for both. `e` counts the rows with the shared gate's; `done` is zero between launches (the last block
+// zeroes it). `items` (one row only) also gets the plan.
+template <int KIND>
+__device__ void router_select(const void* x, const void* rows, float* logits, int r, int d, int e, int* pick, float* wts,
+                              int* items, int* members, int capacity, int top_k, unsigned* done) {
+    __shared__ bool last;
+    const int expert = blockIdx.x * kRouterWaves + (threadIdx.x >> 5);
+    if (expert < e) router_decode<KIND, true>(x, rows, logits, r, d, e);
+    __threadfence();
+    __syncthreads();
+    if (threadIdx.x == 0) last = atomicAdd(done, 1u) == gridDim.x - 1;
+    __syncthreads();
+    if (!last) return;
+    __threadfence();
+    for (int row = 0; row < r; ++row) select_row(logits, row, pick, wts, items, members, capacity, e - 1, top_k);
+    if (threadIdx.x == 0) *done = 0u;
+}
+
 }  // namespace
+
+extern "C" __global__ void __launch_bounds__(32 * kRouterWaves)
+    tf_router_select_f16(const void* x, const void* rows, float* logits, int r, int d, int e, int* pick, float* wts,
+                         int* items, int* members, int capacity, int top_k, unsigned* done) {
+    router_select<1>(x, rows, logits, r, d, e, pick, wts, items, members, capacity, top_k, done);
+}
+
+extern "C" __global__ void __launch_bounds__(32 * kRouterWaves)
+    tf_router_select_bf16(const void* x, const void* rows, float* logits, int r, int d, int e, int* pick, float* wts,
+                          int* items, int* members, int capacity, int top_k, unsigned* done) {
+    router_select<2>(x, rows, logits, r, d, e, pick, wts, items, members, capacity, top_k, done);
+}
 
 extern "C" __global__ void __launch_bounds__(32 * kRouterWaves)
     tf_router_decode_f16(const void* x, const float* rows, float* logits, int r, int d, int e) {

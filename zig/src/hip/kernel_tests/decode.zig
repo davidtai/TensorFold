@@ -116,6 +116,70 @@ fn tails(t: *Rig, rng: *rig.Rng, rows: usize, width: usize, slots: usize) !void 
     try std.testing.expect(errs[1][1] <= 2 * errs[0][1] + 1e-7);
 }
 
+/// The router over bf16 rows and the pick in one launch against tf_moe_router over the widened rows and tf_select_decode:
+/// the same logits, picks, weights and plan, byte for byte; `ties` copies expert rows so logits tie.
+fn routerSelect(t: *Rig, rng: *rig.Rng, rows: usize, d: usize, e: usize, top_k: usize, ties: bool) !void {
+    const slots = top_k + 1;
+    const cap: usize = 16 * slots + 16 * slots / 8;
+    const hx = try gpa.alloc(u16, rows * d);
+    defer gpa.free(hx);
+    for (hx) |*v| v.* = t.bits(rng.unit());
+    const h16 = try gpa.alloc(u16, e * d);
+    defer gpa.free(h16);
+    for (h16) |*v| v.* = rig.bf16Bits(rng.unit() / 8.0);
+    if (ties) for ([_]usize{ 3, 9, 100, 511 }) |dst| @memcpy(h16[dst * d ..][0..d], h16[0..d]);
+    const h32 = try gpa.alloc(f32, e * d);
+    defer gpa.free(h32);
+    for (h16, h32) |b, *v| v.* = @bitCast(@as(u32, b) << 16);
+    var x = try t.upload(hx);
+    defer x.free();
+    var w16 = try t.upload(h16);
+    defer w16.free();
+    var w32 = try t.upload(h32);
+    defer w32.free();
+    var done = try t.upload(@as([]const u32, &.{0}));
+    defer done.free();
+    const sizes = [_]usize{ rows * e * 4, rows * slots * 4, rows * slots * 4, cap * 12, rows * slots * 4 };
+    var got: [3][5][]u8 = undefined;
+    // 0: the two launches; 1 and 2: the one launch twice (its block counter is zero again after each)
+    for (0..3) |v| {
+        var bufs: [5]@import("../memory.zig").DeviceBuffer = undefined;
+        for (&bufs, sizes) |*b, n| {
+            b.* = try t.alloc(n);
+            const zero = try gpa.alloc(u8, n);
+            defer gpa.free(zero);
+            @memset(zero, 0);
+            try b.upload(0, zero);
+        }
+        defer for (&bufs) |*b| b.free();
+        const s = t.stream.handle;
+        const items: ?[*]i32 = if (rows == 1) @ptrFromInt(at(bufs[3])) else null;
+        const members: ?[*]i32 = if (rows == 1) @ptrFromInt(at(bufs[4])) else null;
+        if (v == 0) {
+            try t.on.tf_moe_router(p(x), t.kind(), @ptrFromInt(at(w32)), @ptrFromInt(at(bufs[0])), @intCast(rows), @intCast(d), @intCast(e), s);
+            try t.on.tf_moe_select(@ptrFromInt(at(bufs[0])), @ptrFromInt(at(bufs[1])), @ptrFromInt(at(bufs[2])), items, members, @intCast(cap), @intCast(rows), @intCast(e - 1), @intCast(top_k), s);
+        } else {
+            try std.testing.expect(try t.on.routerSelect(p(x), t.kind(), p(w16), @ptrFromInt(at(bufs[0])), @ptrFromInt(at(bufs[1])), @ptrFromInt(at(bufs[2])), items, members, @intCast(cap), @intCast(rows), @intCast(d), @intCast(e), @intCast(top_k), at(done), s));
+        }
+        try t.stream.synchronize();
+        for (&got[v], bufs) |*g, b| g.* = try rig.download(u8, b);
+    }
+    defer for (&got) |*g| for (g) |b| gpa.free(b);
+    for (1..3) |v| for (0..5) |k| {
+        if (!std.mem.eql(u8, got[0][k], got[v][k])) {
+            std.debug.print("router+pick rows={d} ties={} run {d}: buffer {d} differs\n", .{ rows, ties, v, k });
+            return error.TestUnexpectedResult;
+        }
+    };
+}
+
+test "the router and the pick in one launch give the two launches' bytes (Qwen3.8 Flash Next: 513 x 2560, top 10)" {
+    const t = try Rig.open(1 << 20);
+    defer t.close();
+    var rng: rig.Rng = .{ .state = 0x9E3779B97F4A7C15 };
+    for ([_]usize{ 1, 2, 3, 4, 16 }) |rows| for ([_]bool{ false, true }) |ties| try routerSelect(t, &rng, rows, 2560, 513, 10, ties);
+}
+
 test "the merged router launch is no further from float64 than twice the launch it replaces" {
     const t = try Rig.open(1 << 20);
     defer t.close();
