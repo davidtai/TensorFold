@@ -301,3 +301,96 @@ test "the routed gate and up with its activation in one launch is no further fro
     try pair(t, &rng, 1, 768, 2048, 6, 64);
     try pair(t, &rng, 1, 512, 2048, 4, 128);
 }
+
+/// Flash Next's prompt gate and up (tiles/moe_gemm.hpp) against the 128-row matrix tile then moe_act: the same bytes.
+/// `skew` piles the pairs onto a few experts (items of 128 rows and of 1 row); `limit` > 0 clamps before the activation.
+fn promptPair(t: *Rig, rng: *rig.Rng, rows: usize, experts: usize, skew: bool, limit: f32) !void {
+    const kernels = &t.on.affine;
+    const sh = affine.Kernels.moe_gu_shape;
+    const slots = 11;
+    const pairs = rows * slots;
+    const width = sh.n / 2;
+    var m = try Matrix.init(t, rng, sh.n, sh.k, sh.bits, sh.group, experts);
+    defer m.deinit();
+    const hx = try gpa.alloc(u16, rows * sh.k);
+    defer gpa.free(hx);
+    for (hx) |*v| v.* = t.bits(rng.unit());
+    var x = try t.upload(hx);
+    defer x.free();
+    // each pair draws an expert; sorted by expert (stable), cut into items of at most 128 pairs, as moe_route plans a prompt
+    const pick = try gpa.alloc(u32, pairs);
+    defer gpa.free(pick);
+    for (pick) |*e| {
+        const r = rng.next();
+        e.* = @intCast(if (skew and r % 4 != 0) r % 3 else r % experts);
+    }
+    const members = try gpa.alloc(i32, pairs);
+    defer gpa.free(members);
+    var n_members: usize = 0;
+    const items = try gpa.alloc(i32, 3 * (pairs + experts + 8));
+    defer gpa.free(items);
+    @memset(items, 0);
+    var n_items: usize = 0;
+    for (0..experts) |e| {
+        var run: usize = 0;
+        for (0..pairs) |pi| {
+            if (pick[pi] != e) continue;
+            if (run == 0) {
+                items[3 * n_items ..][0..3].* = .{ @intCast(e), @intCast(n_members), 0 };
+                n_items += 1;
+            }
+            members[n_members] = @intCast(pi);
+            n_members += 1;
+            items[3 * (n_items - 1) + 2] += 1;
+            run = if (run + 1 == 128) 0 else run + 1;
+        }
+    }
+    // a plan's capacity holds empty items past the used ones
+    const count = n_items + 8;
+    var dev_items = try t.upload(items[0 .. 3 * count]);
+    defer dev_items.free();
+    var dev_members = try t.upload(members);
+    defer dev_members.free();
+    var both = try t.alloc(pairs * sh.n * 4);
+    defer both.free();
+    var acts: [2]@import("../memory.zig").DeviceBuffer = .{ try t.alloc(pairs * width * 2), try t.alloc(pairs * width * 2) };
+    defer for (&acts) |*a| a.free();
+    var a = m.arg(t, at(x), 128, at(both));
+    a.route = .{ .items = at(dev_items), .members = at(dev_members), .x_div = slots };
+    try kernels.blockGo(&t.r, a, t.stream.handle, @intCast(count), .matrix);
+    try t.off.tf_moe_act(@ptrFromInt(at(both)), @ptrFromInt(at(acts[0])), t.kind(), @intCast(pairs), @intCast(width), limit, t.stream.handle);
+    a.out = 0;
+    a.out16 = at(acts[1]);
+    try std.testing.expect(try kernels.moeGateUp(&t.r, a, @intCast(count), limit, t.stream.handle));
+    try t.stream.synchronize();
+    const want = try rig.download(u16, acts[0]);
+    defer gpa.free(want);
+    const got = try rig.download(u16, acts[1]);
+    defer gpa.free(got);
+    var differ: usize = 0;
+    for (want, got, 0..) |w, g, i| if (w != g) {
+        if (differ < 4) std.debug.print("  prompt pair rows {d} skew {}: pair {d} column {d}: {x} against {x}\n", .{ rows, skew, i / width, i % width, g, w });
+        differ += 1;
+    };
+    try std.testing.expectEqual(@as(usize, 0), differ);
+    // and the matrix tile's sums are float64's within its bound: a few pairs' gate and up
+    const prob = m.problem(t, hx);
+    const sums = try rig.download(f32, both);
+    defer gpa.free(sums);
+    for (0..8) |s| {
+        const pi = s * (pairs - 1) / 7;
+        const r = ref.reference(prob, pi / slots, pick[pi], (s * 97) % width);
+        try std.testing.expect(@abs(@as(f64, sums[pi * sh.n + (s * 97) % width]) - r.y) <= 1e-5 * r.norm + 1e-7);
+    }
+}
+
+test "Flash Next's prompt gate and up with its activation in one launch writes the bytes of the matrix tile and moe_act" {
+    const t = try Rig.open(1 << 20);
+    defer t.close();
+    if (t.on.affine.moe_gu == null) return error.SkipZigTest;
+    var rng: rig.Rng = .{ .state = 0x9E3779B97F4A7C15 };
+    try promptPair(t, &rng, 300, 24, false, 0);
+    try promptPair(t, &rng, 2048, 24, true, 0);
+    try promptPair(t, &rng, 64, 24, false, 0);
+    try promptPair(t, &rng, 512, 24, false, 7.0);
+}

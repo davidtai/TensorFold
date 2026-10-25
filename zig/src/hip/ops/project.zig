@@ -301,9 +301,30 @@ pub fn affineGroup(o: Ops, x: Tensor, ws: []const Affine, m: usize, outs: []Tens
 /// Routed gate and up in one launch, silu(gate) * up as epilogue into x's kind; null when the tile cannot.
 pub fn affineRoutedAct(o: Ops, x: Tensor, w: Affine, items: u64, count: usize, members: u64, pairs: usize, x_div: usize, rows: usize, limit: f32) Error!?Tensor {
     const z = o.l;
-    if (o.prefill or !o.fused() or x.kind == .f32 or w.n % 2 != 0) return null;
+    if (!o.fused() or x.kind == .f32 or w.n % 2 != 0) return null;
     try w.check();
     const kind = w.tables.table();
+    if (o.prefill) {
+        // Flash Next's shape on the matrix cores (tiles/moe_gemm.hpp); any other prompt keeps the GEMM and moe_act
+        var arg: affine_launch.Arg = .{
+            .x = x.ptr,
+            .words = w.words,
+            .scale = .{ .p = w.scale, .kind = kind },
+            .bias = .{ .p = w.bias, .kind = kind },
+            .out = 0,
+            .m = int(rows),
+            .n = int(w.n),
+            .k = int(w.k),
+            .bits = int(w.bits),
+            .group = int(w.group),
+            .fp16 = @intFromBool(x.kind == .f16),
+            .route = .{ .items = items, .members = members, .x_div = int(x_div) },
+        };
+        if (!z.affine.moeGateUpTakes(arg, int(count))) return null;
+        arg.out16 = try o.arena.take(pairs * (w.n / 2) * 2);
+        if (!try z.affine.moeGateUp(z.r, arg, int(count), limit, o.stream)) return error.BadShape;
+        return .{ .ptr = arg.out16, .kind = x.kind };
+    }
     var shape = shapeOf(o, x, w, rows);
     shape.pairs = true;
     if (z.affine.choose(.routed_act, .decode, shape) == null) return null;

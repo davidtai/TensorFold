@@ -137,6 +137,8 @@ pub const Kernels = struct {
     block: [bit_widths.len]Function,
     gemm: [bit_widths.len]Function,
     wmma_gemm: [bit_widths.len]Function,
+    /// Qwen3.8-Flash-Next's routed gate and up of a prompt with the activation as epilogue (tiles/moe_gemm.hpp); gfx11.
+    moe_gu: ?Function,
     kp: [bit_widths.len][kp_tiles.len]Function,
     span: [2]Function,
     fold: Function,
@@ -167,6 +169,7 @@ pub const Kernels = struct {
         k.tiled = try dot2_obj.function(r ++ "17affine_dot2_tiledENS0_6AffineE");
         k.reference = try dot2_obj.function(r ++ "18affine_dot2_kernelENS0_6AffineE");
         k.fill = try dot2_obj.function(r ++ "13fill_byte_lutEP6__half");
+        k.moe_gu = if (k.matrix) try tiles_obj.function(r ++ "18affine_wmma_moe_guILi4EEEvNS0_6AffineEf") else null;
         return k;
     }
 
@@ -448,6 +451,32 @@ pub const Kernels = struct {
             .block => k.block[b],
         };
         try go(r, f, .{ .x = cdiv(a.n, 128), .y = cdiv(a.m, 128), .z = @intCast(items) }, .{ .x = 256 }, s, &args);
+    }
+
+    /// The shape tiles/moe_gemm.hpp compiles: Flash Next's stacked (gate | up) expert bank, 4-bit group 32, bf16.
+    pub const moe_gu_shape = .{ .n = 1280, .k = 2560, .bits = 4, .group = 32, .block_cols = 64 };
+
+    /// Whether moeGateUp takes the plan `a` of `items` items (its output aside).
+    pub fn moeGateUpTakes(k: *const Kernels, a: Arg, items: c_int) bool {
+        const sh = moe_gu_shape;
+        if (k.moe_gu == null or k.mode == .off or k.tile != .gemm) return false;
+        if (a.fp16 != 0 or a.n != sh.n or a.k != sh.k or a.bits != sh.bits or a.group != sh.group) return false;
+        // the tile reads 8 groups' bf16 scales (and biases) of a row in one 16-byte load: the bf16 planes only
+        if (a.route.items == 0 or a.route.members == 0 or items < 1 or a.scale.kind != 1 or a.bias.kind != 1) return false;
+        return a.x % 16 == 0 and a.words % 16 == 0;
+    }
+
+    /// A prompt's routed gate and up of that shape as silu(gate) * up into `a.out16` (bf16, pairs x n / 2): the bytes of
+    /// the matrix tile followed by moe_act_kernel. False, nothing launched, for any other shape or with the matrix off.
+    pub fn moeGateUp(k: *const Kernels, r: *const runtime.Runtime, a: Arg, items: c_int, limit: f32, s: abi.Stream) Error!bool {
+        if (!k.moeGateUpTakes(a, items) or a.out16 == 0) return false;
+        const f = k.moe_gu.?;
+        const sh = moe_gu_shape;
+        var args: hl.Args = .{};
+        try args.add(a);
+        try args.add(limit);
+        try go(r, f, .{ .x = @divExact(sh.n / 2, sh.block_cols), .z = @intCast(items) }, .{ .x = 256 }, s, &args);
+        return true;
     }
 
     /// K-parallel tile `tier` (an index of kp_tiles) of a short prompt.
