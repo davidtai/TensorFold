@@ -116,8 +116,9 @@ fn tails(t: *Rig, rng: *rig.Rng, rows: usize, width: usize, slots: usize) !void 
     try std.testing.expect(errs[1][1] <= 2 * errs[0][1] + 1e-7);
 }
 
-/// The router over bf16 rows and the pick in one launch against tf_moe_router over the widened rows and tf_select_decode:
-/// the same logits, picks, weights and plan, byte for byte; `ties` copies expert rows so logits tie.
+/// The router over bf16 rows and the pick in one launch against tf_moe_router over the widened rows and tf_select_decode
+/// (and tf_moe_route for 2 to 4 rows): the same logits, picks, weights and plan, byte for byte; `ties` copies expert rows
+/// so logits tie. The plan of 2 to 4 rows is the window's (tile 8, the decode tile's rows).
 fn routerSelect(t: *Rig, rng: *rig.Rng, rows: usize, d: usize, e: usize, top_k: usize, ties: bool) !void {
     const slots = top_k + 1;
     const cap: usize = 16 * slots + 16 * slots / 8;
@@ -153,13 +154,17 @@ fn routerSelect(t: *Rig, rng: *rig.Rng, rows: usize, d: usize, e: usize, top_k: 
         }
         defer for (&bufs) |*b| b.free();
         const s = t.stream.handle;
-        const items: ?[*]i32 = if (rows == 1) @ptrFromInt(at(bufs[3])) else null;
-        const members: ?[*]i32 = if (rows == 1) @ptrFromInt(at(bufs[4])) else null;
+        const planned = rows <= 4;
+        const tile: usize = if (rows == 1) 0 else 8;
+        const items: ?[*]i32 = if (planned) @ptrFromInt(at(bufs[3])) else null;
+        const members: ?[*]i32 = if (planned) @ptrFromInt(at(bufs[4])) else null;
         if (v == 0) {
             try t.on.tf_moe_router(p(x), t.kind(), @ptrFromInt(at(w32)), @ptrFromInt(at(bufs[0])), @intCast(rows), @intCast(d), @intCast(e), s);
-            try t.on.tf_moe_select(@ptrFromInt(at(bufs[0])), @ptrFromInt(at(bufs[1])), @ptrFromInt(at(bufs[2])), items, members, @intCast(cap), @intCast(rows), @intCast(e - 1), @intCast(top_k), s);
+            const one = rows == 1;
+            try t.on.tf_moe_select(@ptrFromInt(at(bufs[0])), @ptrFromInt(at(bufs[1])), @ptrFromInt(at(bufs[2])), if (one) items else null, if (one) members else null, @intCast(cap), @intCast(rows), @intCast(e - 1), @intCast(top_k), s);
+            if (planned and !one) try t.on.tf_moe_route(@ptrFromInt(at(bufs[1])), @intCast(rows * slots), @intCast(e), @intCast(tile), members, items, @intCast(cap), s);
         } else {
-            try std.testing.expect(try t.on.routerSelect(p(x), t.kind(), p(w16), @ptrFromInt(at(bufs[0])), @ptrFromInt(at(bufs[1])), @ptrFromInt(at(bufs[2])), items, members, @intCast(cap), @intCast(rows), @intCast(d), @intCast(e), @intCast(top_k), at(done), s));
+            try std.testing.expect(try t.on.routerSelect(p(x), t.kind(), p(w16), @ptrFromInt(at(bufs[0])), @ptrFromInt(at(bufs[1])), @ptrFromInt(at(bufs[2])), items, members, @intCast(cap), @intCast(rows), @intCast(d), @intCast(e), @intCast(top_k), @intCast(tile), at(done), s));
         }
         try t.stream.synchronize();
         for (&got[v], bufs) |*g, b| g.* = try rig.download(u8, b);

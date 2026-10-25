@@ -128,19 +128,23 @@ fn expertParts(o: Ops, kind: Kind, r: Routed, x: Tensor, rows: usize, logits: u6
     var tile: usize = undefined;
     if (rows == 1) {
         // the router and the pick (and the plan) in one launch where the decode kernels take it
-        if (!try o.moeRouterSelect(x, r.rows16, r.done, logits, pick, wts, .{ .items = items, .members = members }, cap, 1, ex.dims, r.rows, r.top_k)) {
+        if (!try o.moeRouterSelect(x, r.rows16, r.done, logits, pick, wts, .{ .items = items, .members = members }, cap, 1, ex.dims, r.rows, r.top_k, 0)) {
             try o.moeRouter(x, r.rows32, logits, rows, ex.dims, r.rows);
             try o.moeSelect(logits, pick, wts, .{ .items = items, .members = members }, cap, 1, r.count(), r.top_k);
         }
         tile = 1;
         count = slots;
     } else {
-        if (!try o.moeRouterSelect(x, r.rows16, r.done, logits, pick, wts, null, 0, rows, ex.dims, r.rows, r.top_k)) {
-            try o.moeRouter(x, r.rows32, logits, rows, ex.dims, r.rows);
-            try o.moeSelect(logits, pick, wts, null, 0, rows, r.count(), r.top_k);
-        }
         tile = tileFor(o, rows);
-        try o.moeRoute(pick, pairs, r.rows, tile, members, items, cap);
+        // a verify window's 2 to 4 rows: the router, the pick and tf_moe_route's plan in one launch
+        const planned = rows <= 4 and try o.moeRouterSelect(x, r.rows16, r.done, logits, pick, wts, .{ .items = items, .members = members }, cap, rows, ex.dims, r.rows, r.top_k, tile);
+        if (!planned) {
+            if (!try o.moeRouterSelect(x, r.rows16, r.done, logits, pick, wts, null, 0, rows, ex.dims, r.rows, r.top_k, 0)) {
+                try o.moeRouter(x, r.rows32, logits, rows, ex.dims, r.rows);
+                try o.moeSelect(logits, pick, wts, null, 0, rows, r.count(), r.top_k);
+            }
+            try o.moeRoute(pick, pairs, r.rows, tile, members, items, cap);
+        }
     }
     // the gate and up's activation is the launch's epilogue when the tile takes the shape
     const act_t: Tensor = if (try o.projectRoutedAct(x, ex.fused, items, count, members, pairs, slots, @min(tile, rows), ex.limit)) |t| t else blk: {

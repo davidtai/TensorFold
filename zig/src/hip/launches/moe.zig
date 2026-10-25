@@ -54,11 +54,13 @@ pub fn routerWindow(l: *const Launcher, x: C, kind: c_int, rows: CF, logits: F, 
 }
 
 /// A decode call's router logits from bf16 rows and the pick of each row (tf_select_decode's) in one launch, the plan too
-/// when `items` is given (one row); false (nothing launched) where the shape keeps the router and the pick apart.
-/// `done` is a u32 that is zero between launches.
-pub fn routerSelect(l: *const Launcher, x: C, kind: c_int, rows16: C, logits: F, pick: I, wts: F, items: I, members: I, capacity: c_int, r: c_int, d: c_int, e: c_int, top_k: c_int, done: u64, s: S) Error!bool {
+/// when `items` is given: one row's own, or for 2 to 4 rows tf_moe_route's at `tile` pairs an item; false (nothing
+/// launched) where the shape keeps the router and the pick apart. `done` is a u32 that is zero between launches.
+pub fn routerSelect(l: *const Launcher, x: C, kind: c_int, rows16: C, logits: F, pick: I, wts: F, items: I, members: I, capacity: c_int, r: c_int, d: c_int, e: c_int, top_k: c_int, tile: c_int, done: u64, s: S) Error!bool {
     if (!l.fuse or done == 0 or r < 1 or r > 16 or @rem(d, 4) != 0 or ad(rows16) % 8 != 0 or ad(x) % 8 != 0) return false;
-    if (e - 1 > 1024 or top_k < 1 or top_k > 31 or (items != null and r != 1)) return false;
+    if (e - 1 > 1024 or top_k < 1 or top_k > 31) return false;
+    // the plan in the launch: one row, or 2 to 4 rows of at most 64 pairs (the last block's waves, route_plan's buffers)
+    if (items != null and r != 1 and (r > 4 or r * (top_k + 1) > 64 or tile < 1)) return false;
     var a: Args = .{};
     try a.add(ad(x));
     try a.add(ad(rows16));
@@ -72,6 +74,7 @@ pub fn routerSelect(l: *const Launcher, x: C, kind: c_int, rows16: C, logits: F,
     try a.add(ad(members));
     try a.add(capacity);
     try a.add(top_k);
+    try a.add(tile);
     try a.add(done);
     try l.go(l.dec.router_select[if (kind == 1) 0 else 1], dim(cdiv(e, 4), 1, 1), dim(128, 1, 1), 0, s, &a);
     return true;
