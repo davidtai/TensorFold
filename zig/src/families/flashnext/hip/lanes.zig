@@ -635,10 +635,11 @@ pub const Fx = struct {
             var chained: usize = 0;
             while (d < depth) : (d += 1) {
                 var tok: [1]u32 = undefined;
-                var prob: [1]f32 = undefined;
-                // a sampled stream drafts the keyed choice the target makes at this position (head.keyed)
+                var prob: [1]f32 = .{1.0};
+                // a sampled stream drafts the keyed choice the target makes at this position (head.keyed); its
+                // probability only where the confidence gate reads it (a probability is never under 0)
                 const keyed = if (sampling(r.stream)) |sm|
-                    try head_mod.keyed(o, m, &e.host, e.stream, mixed, f.draft_ids, sm, r.position + d, &prob[0])
+                    try head_mod.keyed(o, m, &e.host, e.stream, mixed, f.draft_ids, sm, r.position + d, if (stop_under > 0) &prob[0] else null)
                 else
                     null;
                 if (keyed) |t| tok[0] = t else try head_mod.draws(o, m, &e.host, e.stream, mixed, 1, f.draft_ids, &tok, &prob);

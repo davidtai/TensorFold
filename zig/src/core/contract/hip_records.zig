@@ -425,6 +425,24 @@ const own_records = [_]Record{
         },
     },
     .{
+        .launch = .{ .name = "top-k tf_topk_part", .symbol = "tf_topk_part", .image = "ops", .threads = 1024 },
+        .usage = .{
+            .{ .vgprs = 0, .sgprs = 0, .lds = 0, .private = 0, .bound = 1024, .wave = 32 },
+            .{ .vgprs = 0, .sgprs = 0, .lds = 0, .private = 0, .bound = 1024, .wave = 32 },
+            .{ .vgprs = 0, .sgprs = 0, .lds = 0, .private = 0, .bound = 1024, .wave = 32 },
+            .{ .vgprs = 0, .sgprs = 0, .lds = 0, .private = 0, .bound = 1024, .wave = 32 },
+        },
+    },
+    .{
+        .launch = .{ .name = "top-k tf_topk_join", .symbol = "tf_topk_join", .image = "ops", .threads = 1024 },
+        .usage = .{
+            .{ .vgprs = 0, .sgprs = 0, .lds = 0, .private = 0, .bound = 1024, .wave = 32 },
+            .{ .vgprs = 0, .sgprs = 0, .lds = 0, .private = 0, .bound = 1024, .wave = 32 },
+            .{ .vgprs = 0, .sgprs = 0, .lds = 0, .private = 0, .bound = 1024, .wave = 32 },
+            .{ .vgprs = 0, .sgprs = 0, .lds = 0, .private = 0, .bound = 1024, .wave = 32 },
+        },
+    },
+    .{
         .launch = .{ .name = "argmax tf_argmax_join", .symbol = "tf_argmax_join", .image = "ops", .threads = 256 },
         .usage = .{
             .{ .vgprs = 10, .sgprs = 21, .lds = 2048, .private = 0, .bound = 256, .wave = 32 },

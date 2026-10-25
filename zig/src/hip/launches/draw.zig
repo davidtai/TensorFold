@@ -67,3 +67,28 @@ pub fn tf_topk_rows(l: *const Launcher, logits: C, rows: c_int, n: c_int, ks: CI
     try a.add(ad(values));
     try l.go(l.op.topk, dim(rows, 1, 1), dim(1024, 1, 1), 0, s, &a);
 }
+
+/// tf_topk_rows' ids and values in two launches: each of `parts` parts of `per` values its own top ks[r] into
+/// `stride` slots of `cand_ids` / `cand_vals` (rows * parts * stride), then each row's from those, in tf_topk's order.
+pub fn tf_topk_parts(l: *const Launcher, logits: C, rows: c_int, n: c_int, ks: CI, stride: c_int, per: c_int, parts: c_int, cand_ids: I, cand_vals: P, ids: I, values: P, s: S) Error!void {
+    if (rows == 0) return;
+    if (per < 1 or parts < 1 or @as(i64, per) * parts < n) return util.invalid("topk parts");
+    var a: Args = .{};
+    try a.add(ad(logits));
+    try a.add(n);
+    try a.add(ad(ks));
+    try a.add(per);
+    try a.add(stride);
+    try a.add(ad(cand_ids));
+    try a.add(ad(cand_vals));
+    try l.go(l.op.topk_part, dim(parts, rows, 1), dim(1024, 1, 1), 0, s, &a);
+    var b: Args = .{};
+    try b.add(ad(cand_ids));
+    try b.add(ad(cand_vals));
+    try b.add(parts);
+    try b.add(ad(ks));
+    try b.add(stride);
+    try b.add(ad(ids));
+    try b.add(ad(values));
+    try l.go(l.op.topk_join, dim(rows, 1, 1), dim(1024, 1, 1), 0, s, &b);
+}

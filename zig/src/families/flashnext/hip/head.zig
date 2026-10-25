@@ -122,7 +122,8 @@ pub const max_keyed = 64;
 /// the keyed Gumbel-max over its own top-k/top-p survivors (lanes.sampling.choose: seed, position, token id); the draft
 /// is the same keyed choice over the head's survivors, so the two agree whenever the head's distribution puts the
 /// target's winner where the target does. The target never reads the draft: a verify keeps the target's draws, so
-/// the output is the same token for token. `prob` is the head's argmax probability (the confidence gate's), as `draws`.
+/// the output is the same token for token. `prob` gets the head's argmax probability (the confidence gate's), as
+/// `draws`; null where no gate reads it (no argmax, no softmax pass).
 /// Null when the request's sampling is greedy or wider than `max_keyed`: the caller drafts the argmax.
 pub fn keyed(
     o: Ops,
@@ -133,7 +134,7 @@ pub fn keyed(
     ids: []const u32,
     sampling: lanes.Sampling,
     position: u64,
-    prob: *f32,
+    prob: ?*f32,
 ) !?u32 {
     if (sampling.temperature <= 0 or sampling.top_k == 0) return null;
     const w = &m.mtp.?;
@@ -145,15 +146,17 @@ pub fn keyed(
     const ks = try host.put(o, std.mem.asBytes(&k));
     // argmax, its probability, then the candidates' ids and values: one download
     const dev = try o.arena.take(8 + stride * 6);
-    try o.argmaxRows(logits, 1, n, dev);
-    try o.tokenProb(logits, 1, n, dev, dev + 4);
+    if (prob != null) {
+        try o.argmaxRows(logits, 1, n, dev);
+        try o.tokenProb(logits, 1, n, dev, dev + 4);
+    }
     try o.topkRows(logits, 1, n, ks, stride, dev + 8, dev + 8 + stride * 4);
     const at = std.mem.alignForward(usize, host.used, 16);
     const bytes = host.staging.bytes[at..][0 .. 8 + stride * 6];
     try hip.runtime.check(host.d.api.hipMemcpyDtoHAsync(bytes.ptr, @ptrFromInt(dev), bytes.len, s.handle));
     try s.synchronize();
     const words = std.mem.bytesAsSlice(u32, @as([]align(4) u8, @alignCast(bytes[0 .. 8 + stride * 4])));
-    prob.* = @bitCast(words[1]);
+    if (prob) |q| q.* = @bitCast(words[1]);
     const vals = std.mem.bytesAsSlice(u16, @as([]align(2) u8, @alignCast(bytes[8 + stride * 4 ..])));
     var values: [max_keyed]f64 = undefined;
     var tokens: [max_keyed]u64 = undefined;
