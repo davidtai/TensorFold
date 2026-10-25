@@ -482,19 +482,19 @@ const own_records = [_]Record{
     .{
         .launch = .{ .name = "MoE router and pick in one launch (decode, bf16 rows) tf_router_select_f16", .symbol = "tf_router_select_f16", .image = "decode", .threads = 128 },
         .usage = .{
-            .{ .vgprs = 108, .sgprs = 79, .lds = 5416, .private = 0, .bound = 128, .wave = 32 },
-            .{ .vgprs = 92, .sgprs = 79, .lds = 5416, .private = 0, .bound = 128, .wave = 32 },
-            .{ .vgprs = 92, .sgprs = 79, .lds = 5416, .private = 0, .bound = 128, .wave = 32 },
-            .{ .vgprs = 92, .sgprs = 80, .lds = 5416, .private = 0, .bound = 128, .wave = 32 },
+            .{ .vgprs = 148, .sgprs = 85, .lds = 25912, .private = 0, .bound = 128, .wave = 32 },
+            .{ .vgprs = 148, .sgprs = 81, .lds = 25912, .private = 0, .bound = 128, .wave = 32 },
+            .{ .vgprs = 148, .sgprs = 81, .lds = 25912, .private = 0, .bound = 128, .wave = 32 },
+            .{ .vgprs = 148, .sgprs = 82, .lds = 25912, .private = 0, .bound = 128, .wave = 32 },
         },
     },
     .{
         .launch = .{ .name = "MoE router and pick in one launch (decode, bf16 rows) tf_router_select_bf16", .symbol = "tf_router_select_bf16", .image = "decode", .threads = 128 },
         .usage = .{
-            .{ .vgprs = 108, .sgprs = 79, .lds = 5416, .private = 0, .bound = 128, .wave = 32 },
-            .{ .vgprs = 93, .sgprs = 79, .lds = 5416, .private = 0, .bound = 128, .wave = 32 },
-            .{ .vgprs = 93, .sgprs = 79, .lds = 5416, .private = 0, .bound = 128, .wave = 32 },
-            .{ .vgprs = 93, .sgprs = 80, .lds = 5416, .private = 0, .bound = 128, .wave = 32 },
+            .{ .vgprs = 148, .sgprs = 85, .lds = 25912, .private = 0, .bound = 128, .wave = 32 },
+            .{ .vgprs = 148, .sgprs = 81, .lds = 25912, .private = 0, .bound = 128, .wave = 32 },
+            .{ .vgprs = 148, .sgprs = 81, .lds = 25912, .private = 0, .bound = 128, .wave = 32 },
+            .{ .vgprs = 148, .sgprs = 82, .lds = 25912, .private = 0, .bound = 128, .wave = 32 },
         },
     },
     .{
