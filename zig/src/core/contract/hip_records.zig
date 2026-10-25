@@ -436,10 +436,10 @@ const own_records = [_]Record{
     .{
         .launch = .{ .name = "top-k tf_topk_join", .symbol = "tf_topk_join", .image = "ops", .threads = 1024 },
         .usage = .{
-            .{ .vgprs = 13, .sgprs = 36, .lds = 1040, .private = 0, .bound = 1024, .wave = 32 },
-            .{ .vgprs = 12, .sgprs = 36, .lds = 1040, .private = 0, .bound = 1024, .wave = 32 },
-            .{ .vgprs = 12, .sgprs = 36, .lds = 1040, .private = 0, .bound = 1024, .wave = 32 },
-            .{ .vgprs = 12, .sgprs = 37, .lds = 1040, .private = 0, .bound = 1024, .wave = 32 },
+            .{ .vgprs = 16, .sgprs = 36, .lds = 33808, .private = 0, .bound = 1024, .wave = 32 },
+            .{ .vgprs = 16, .sgprs = 36, .lds = 33808, .private = 0, .bound = 1024, .wave = 32 },
+            .{ .vgprs = 16, .sgprs = 36, .lds = 33808, .private = 0, .bound = 1024, .wave = 32 },
+            .{ .vgprs = 16, .sgprs = 37, .lds = 33808, .private = 0, .bound = 1024, .wave = 32 },
         },
     },
     .{
