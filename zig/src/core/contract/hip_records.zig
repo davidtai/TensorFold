@@ -464,37 +464,37 @@ const own_records = [_]Record{
     .{
         .launch = .{ .name = "MoE router (decode, fp32 rows) tf_router_decode_f16", .symbol = "tf_router_decode_f16", .image = "decode", .threads = 128 },
         .usage = .{
-            .{ .vgprs = 0, .sgprs = 0, .lds = 0, .private = 0, .bound = 0, .wave = 0 },
-            .{ .vgprs = 0, .sgprs = 0, .lds = 0, .private = 0, .bound = 0, .wave = 0 },
-            .{ .vgprs = 0, .sgprs = 0, .lds = 0, .private = 0, .bound = 0, .wave = 0 },
-            .{ .vgprs = 0, .sgprs = 0, .lds = 0, .private = 0, .bound = 0, .wave = 0 },
+            .{ .vgprs = 106, .sgprs = 75, .lds = 0, .private = 0, .bound = 128, .wave = 32 },
+            .{ .vgprs = 90, .sgprs = 75, .lds = 0, .private = 0, .bound = 128, .wave = 32 },
+            .{ .vgprs = 90, .sgprs = 75, .lds = 0, .private = 0, .bound = 128, .wave = 32 },
+            .{ .vgprs = 90, .sgprs = 76, .lds = 0, .private = 0, .bound = 128, .wave = 32 },
         },
     },
     .{
         .launch = .{ .name = "MoE router (decode, fp32 rows) tf_router_decode_bf16", .symbol = "tf_router_decode_bf16", .image = "decode", .threads = 128 },
         .usage = .{
-            .{ .vgprs = 0, .sgprs = 0, .lds = 0, .private = 0, .bound = 0, .wave = 0 },
-            .{ .vgprs = 0, .sgprs = 0, .lds = 0, .private = 0, .bound = 0, .wave = 0 },
-            .{ .vgprs = 0, .sgprs = 0, .lds = 0, .private = 0, .bound = 0, .wave = 0 },
-            .{ .vgprs = 0, .sgprs = 0, .lds = 0, .private = 0, .bound = 0, .wave = 0 },
+            .{ .vgprs = 106, .sgprs = 75, .lds = 0, .private = 0, .bound = 128, .wave = 32 },
+            .{ .vgprs = 91, .sgprs = 75, .lds = 0, .private = 0, .bound = 128, .wave = 32 },
+            .{ .vgprs = 91, .sgprs = 75, .lds = 0, .private = 0, .bound = 128, .wave = 32 },
+            .{ .vgprs = 91, .sgprs = 76, .lds = 0, .private = 0, .bound = 128, .wave = 32 },
         },
     },
     .{
         .launch = .{ .name = "MoE router and pick in one launch (decode, bf16 rows) tf_router_select_f16", .symbol = "tf_router_select_f16", .image = "decode", .threads = 128 },
         .usage = .{
-            .{ .vgprs = 0, .sgprs = 0, .lds = 0, .private = 0, .bound = 0, .wave = 0 },
-            .{ .vgprs = 0, .sgprs = 0, .lds = 0, .private = 0, .bound = 0, .wave = 0 },
-            .{ .vgprs = 0, .sgprs = 0, .lds = 0, .private = 0, .bound = 0, .wave = 0 },
-            .{ .vgprs = 0, .sgprs = 0, .lds = 0, .private = 0, .bound = 0, .wave = 0 },
+            .{ .vgprs = 108, .sgprs = 79, .lds = 5416, .private = 0, .bound = 128, .wave = 32 },
+            .{ .vgprs = 92, .sgprs = 79, .lds = 5416, .private = 0, .bound = 128, .wave = 32 },
+            .{ .vgprs = 92, .sgprs = 79, .lds = 5416, .private = 0, .bound = 128, .wave = 32 },
+            .{ .vgprs = 92, .sgprs = 80, .lds = 5416, .private = 0, .bound = 128, .wave = 32 },
         },
     },
     .{
         .launch = .{ .name = "MoE router and pick in one launch (decode, bf16 rows) tf_router_select_bf16", .symbol = "tf_router_select_bf16", .image = "decode", .threads = 128 },
         .usage = .{
-            .{ .vgprs = 0, .sgprs = 0, .lds = 0, .private = 0, .bound = 0, .wave = 0 },
-            .{ .vgprs = 0, .sgprs = 0, .lds = 0, .private = 0, .bound = 0, .wave = 0 },
-            .{ .vgprs = 0, .sgprs = 0, .lds = 0, .private = 0, .bound = 0, .wave = 0 },
-            .{ .vgprs = 0, .sgprs = 0, .lds = 0, .private = 0, .bound = 0, .wave = 0 },
+            .{ .vgprs = 108, .sgprs = 79, .lds = 5416, .private = 0, .bound = 128, .wave = 32 },
+            .{ .vgprs = 93, .sgprs = 79, .lds = 5416, .private = 0, .bound = 128, .wave = 32 },
+            .{ .vgprs = 93, .sgprs = 79, .lds = 5416, .private = 0, .bound = 128, .wave = 32 },
+            .{ .vgprs = 93, .sgprs = 80, .lds = 5416, .private = 0, .bound = 128, .wave = 32 },
         },
     },
 } ++ @import("hip_records_pair.zig").records;
