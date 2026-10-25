@@ -506,6 +506,42 @@ const own_records = [_]Record{
             .{ .vgprs = 0, .sgprs = 0, .lds = 0, .private = 0, .bound = 256, .wave = 32 },
         },
     },
+    .{
+        .launch = .{ .name = "Flash Next prompt sparse attention tile", .symbol = "tf_fn_sparse_prompt", .image = "flashnext", .threads = 128, .served = limits.gfx11_only },
+        .usage = .{
+            .{ .vgprs = 0, .sgprs = 0, .lds = 0, .private = 0, .bound = 128, .wave = 32 },
+            .{ .vgprs = 251, .sgprs = 42, .lds = 31424, .private = 0, .bound = 128, .wave = 32 },
+            .{ .vgprs = 251, .sgprs = 31, .lds = 31424, .private = 0, .bound = 128, .wave = 32 },
+            .{ .vgprs = 0, .sgprs = 0, .lds = 0, .private = 0, .bound = 128, .wave = 32 },
+        },
+    },
+    .{
+        .launch = .{ .name = "Flash Next prompt sparse attention tile, split", .symbol = "tf_fn_sparse_prompt_split", .image = "flashnext", .threads = 128, .served = limits.gfx11_only },
+        .usage = .{
+            .{ .vgprs = 0, .sgprs = 0, .lds = 0, .private = 0, .bound = 128, .wave = 32 },
+            .{ .vgprs = 248, .sgprs = 42, .lds = 31424, .private = 0, .bound = 128, .wave = 32 },
+            .{ .vgprs = 248, .sgprs = 33, .lds = 31424, .private = 0, .bound = 128, .wave = 32 },
+            .{ .vgprs = 0, .sgprs = 0, .lds = 0, .private = 0, .bound = 128, .wave = 32 },
+        },
+    },
+    .{
+        .launch = .{ .name = "Flash Next decode sparse attention tile parts", .symbol = "tf_fn_sparse_tile_parts", .image = "flashnext", .threads = 128, .served = limits.gfx11_only },
+        .usage = .{
+            .{ .vgprs = 0, .sgprs = 0, .lds = 0, .private = 0, .bound = 128, .wave = 32 },
+            .{ .vgprs = 247, .sgprs = 48, .lds = 31424, .private = 0, .bound = 128, .wave = 32 },
+            .{ .vgprs = 247, .sgprs = 48, .lds = 31424, .private = 0, .bound = 128, .wave = 32 },
+            .{ .vgprs = 0, .sgprs = 0, .lds = 0, .private = 0, .bound = 128, .wave = 32 },
+        },
+    },
+    .{
+        .launch = .{ .name = "Flash Next decode sparse attention tile parts, split", .symbol = "tf_fn_sparse_tile_parts_split", .image = "flashnext", .threads = 128, .served = limits.gfx11_only },
+        .usage = .{
+            .{ .vgprs = 0, .sgprs = 0, .lds = 0, .private = 0, .bound = 128, .wave = 32 },
+            .{ .vgprs = 246, .sgprs = 48, .lds = 31424, .private = 0, .bound = 128, .wave = 32 },
+            .{ .vgprs = 246, .sgprs = 48, .lds = 31424, .private = 0, .bound = 128, .wave = 32 },
+            .{ .vgprs = 0, .sgprs = 0, .lds = 0, .private = 0, .bound = 128, .wave = 32 },
+        },
+    },
 } ++ @import("hip_records_pair.zig").records;
 
 pub const records = own_records ++ @import("hip_records_stream.zig").records;
