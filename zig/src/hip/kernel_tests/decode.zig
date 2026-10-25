@@ -371,17 +371,21 @@ test "the routed gate and up with its activation in one launch is no further fro
     try pair(t, &rng, 1, 512, 2048, 4, 128);
 }
 
-/// Flash Next's prompt gate and up (tiles/moe_gemm.hpp) against the 128-row matrix tile then moe_act: the same bytes.
+/// Flash Next's prompt expert products (tiles/moe_gemm.hpp) against the 128-row matrix tile: the same bytes. Gate and
+/// up (`down` false) is compared after moe_act on both sides; down (`down` true) on the fp32 sums, x a row a pair.
 /// `skew` piles the pairs onto a few experts (items of 128 rows and of 1 row); `limit` > 0 clamps before the activation.
-fn promptPair(t: *Rig, rng: *rig.Rng, rows: usize, experts: usize, skew: bool, limit: f32) !void {
+fn promptExperts(t: *Rig, rng: *rig.Rng, down: bool, rows: usize, experts: usize, skew: bool, limit: f32) !void {
     const kernels = &t.on.affine;
-    const sh = affine.Kernels.moe_gu_shape;
+    const sh = if (down) affine.Kernels.moe_down_shape else affine.Kernels.moe_gu_shape;
+    const n: usize = @intCast(sh.n);
+    const k: usize = @intCast(sh.k);
     const slots = 11;
     const pairs = rows * slots;
-    const width = sh.n / 2;
-    var m = try Matrix.init(t, rng, sh.n, sh.k, sh.bits, sh.group, experts);
+    const width = if (down) n else n / 2;
+    var m = try Matrix.init(t, rng, n, k, @intCast(sh.bits), @intCast(sh.group), experts);
     defer m.deinit();
-    const hx = try gpa.alloc(u16, rows * sh.k);
+    const x_rows = if (down) pairs else rows;
+    const hx = try gpa.alloc(u16, x_rows * k);
     defer gpa.free(hx);
     for (hx) |*v| v.* = t.bits(rng.unit());
     var x = try t.upload(hx);
@@ -420,36 +424,45 @@ fn promptPair(t: *Rig, rng: *rig.Rng, rows: usize, experts: usize, skew: bool, l
     defer dev_items.free();
     var dev_members = try t.upload(members);
     defer dev_members.free();
-    var both = try t.alloc(pairs * sh.n * 4);
-    defer both.free();
+    var sums = [2]@import("../memory.zig").DeviceBuffer{ try t.alloc(pairs * n * 4), try t.alloc(pairs * n * 4) };
+    defer for (&sums) |*b| b.free();
     var acts: [2]@import("../memory.zig").DeviceBuffer = .{ try t.alloc(pairs * width * 2), try t.alloc(pairs * width * 2) };
-    defer for (&acts) |*a| a.free();
-    var a = m.arg(t, at(x), 128, at(both));
-    a.route = .{ .items = at(dev_items), .members = at(dev_members), .x_div = slots };
+    defer for (&acts) |*b| b.free();
+    try sums[1].fill8(0xA5);
+    var a = m.arg(t, at(x), 128, at(sums[0]));
+    a.route = .{ .items = at(dev_items), .members = at(dev_members), .x_div = if (down) 1 else slots };
     try kernels.blockGo(&t.r, a, t.stream.handle, @intCast(count), .matrix);
-    try t.off.tf_moe_act(@ptrFromInt(at(both)), @ptrFromInt(at(acts[0])), t.kind(), @intCast(pairs), @intCast(width), limit, t.stream.handle);
-    a.out = 0;
-    a.out16 = at(acts[1]);
-    try std.testing.expect(try kernels.moeGateUp(&t.r, a, @intCast(count), limit, t.stream.handle));
+    if (down) {
+        a.out = at(sums[1]);
+        try std.testing.expect(try kernels.moeDown(&t.r, a, @intCast(count), t.stream.handle));
+    } else {
+        try t.off.tf_moe_act(@ptrFromInt(at(sums[0])), @ptrFromInt(at(acts[0])), t.kind(), @intCast(pairs), @intCast(width), limit, t.stream.handle);
+        a.out = 0;
+        a.out16 = at(acts[1]);
+        try std.testing.expect(try kernels.moeGateUp(&t.r, a, @intCast(count), limit, t.stream.handle));
+    }
     try t.stream.synchronize();
-    const want = try rig.download(u16, acts[0]);
+    const cmp = if (down) sums else acts;
+    const want = try rig.download(u8, cmp[0]);
     defer gpa.free(want);
-    const got = try rig.download(u16, acts[1]);
+    const got = try rig.download(u8, cmp[1]);
     defer gpa.free(got);
+    const size: usize = if (down) 4 else 2;
     var differ: usize = 0;
-    for (want, got, 0..) |w, g, i| if (w != g) {
-        if (differ < 4) std.debug.print("  prompt pair rows {d} skew {}: pair {d} column {d}: {x} against {x}\n", .{ rows, skew, i / width, i % width, g, w });
+    for (0..want.len / size) |e| if (!std.mem.eql(u8, want[e * size ..][0..size], got[e * size ..][0..size])) {
+        if (differ < 4) std.debug.print("  prompt experts down {} rows {d} skew {}: pair {d} column {d} differs\n", .{ down, rows, skew, e / width, e % width });
         differ += 1;
     };
     try std.testing.expectEqual(@as(usize, 0), differ);
-    // and the matrix tile's sums are float64's within its bound: a few pairs' gate and up
+    // and the matrix tile's sums are float64's within its bound
     const prob = m.problem(t, hx);
-    const sums = try rig.download(f32, both);
-    defer gpa.free(sums);
+    const ref_sums = try rig.download(f32, sums[0]);
+    defer gpa.free(ref_sums);
     for (0..8) |s| {
         const pi = s * (pairs - 1) / 7;
-        const r = ref.reference(prob, pi / slots, pick[pi], (s * 97) % width);
-        try std.testing.expect(@abs(@as(f64, sums[pi * sh.n + (s * 97) % width]) - r.y) <= 1e-5 * r.norm + 1e-7);
+        const col = (s * 97) % width;
+        const r = ref.reference(prob, if (down) pi else pi / slots, pick[pi], col);
+        try std.testing.expect(@abs(@as(f64, ref_sums[pi * n + col]) - r.y) <= 1e-5 * r.norm + 1e-7);
     }
 }
 
@@ -458,8 +471,18 @@ test "Flash Next's prompt gate and up with its activation in one launch writes t
     defer t.close();
     if (t.on.affine.moe_gu == null) return error.SkipZigTest;
     var rng: rig.Rng = .{ .state = 0x9E3779B97F4A7C15 };
-    try promptPair(t, &rng, 300, 24, false, 0);
-    try promptPair(t, &rng, 2048, 24, true, 0);
-    try promptPair(t, &rng, 64, 24, false, 0);
-    try promptPair(t, &rng, 512, 24, false, 7.0);
+    try promptExperts(t, &rng, false, 300, 24, false, 0);
+    try promptExperts(t, &rng, false, 2048, 24, true, 0);
+    try promptExperts(t, &rng, false, 64, 24, false, 0);
+    try promptExperts(t, &rng, false, 512, 24, false, 7.0);
+}
+
+test "Flash Next's prompt expert down writes the bytes of the matrix tile" {
+    const t = try Rig.open(1 << 20);
+    defer t.close();
+    if (t.on.affine.moe_down == null) return error.SkipZigTest;
+    var rng: rig.Rng = .{ .state = 0x2545F4914F6CDD1D };
+    try promptExperts(t, &rng, true, 300, 24, false, 0);
+    try promptExperts(t, &rng, true, 2048, 24, true, 0);
+    try promptExperts(t, &rng, true, 64, 24, false, 0);
 }

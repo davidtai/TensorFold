@@ -139,6 +139,8 @@ pub const Kernels = struct {
     wmma_gemm: [bit_widths.len]Function,
     /// Qwen3.8-Flash-Next's routed gate and up of a prompt with the activation as epilogue (tiles/moe_gemm.hpp); gfx11.
     moe_gu: ?Function,
+    /// The same tile's routed down of a prompt, fp32 out.
+    moe_down: ?Function,
     kp: [bit_widths.len][kp_tiles.len]Function,
     span: [2]Function,
     fold: Function,
@@ -170,6 +172,7 @@ pub const Kernels = struct {
         k.reference = try dot2_obj.function(r ++ "18affine_dot2_kernelENS0_6AffineE");
         k.fill = try dot2_obj.function(r ++ "13fill_byte_lutEP6__half");
         k.moe_gu = if (k.matrix) try tiles_obj.function(r ++ "18affine_wmma_moe_guILi4EEEvNS0_6AffineEf") else null;
+        k.moe_down = if (k.matrix) try tiles_obj.function(r ++ "20affine_wmma_moe_downILi4EEEvNS0_6AffineE") else null;
         return k;
     }
 
@@ -453,13 +456,23 @@ pub const Kernels = struct {
         try go(r, f, .{ .x = cdiv(a.n, 128), .y = cdiv(a.m, 128), .z = @intCast(items) }, .{ .x = 256 }, s, &args);
     }
 
-    /// The shape tiles/moe_gemm.hpp compiles: Flash Next's stacked (gate | up) expert bank, 4-bit group 32, bf16.
-    pub const moe_gu_shape = .{ .n = 1280, .k = 2560, .bits = 4, .group = 32, .block_cols = 64 };
+    /// The shapes tiles/moe_gemm.hpp compiles (MoeGateUp, MoeDown): Flash Next's expert banks, 4-bit group 32, bf16 x.
+    pub const MoeShape = struct { n: c_int, k: c_int, bits: c_int = 4, group: c_int = 32, blocks: c_uint };
+    pub const moe_gu_shape: MoeShape = .{ .n = 1280, .k = 2560, .blocks = 10 };
+    pub const moe_down_shape: MoeShape = .{ .n = 2560, .k = 640, .blocks = 20 };
 
     /// Whether moeGateUp takes the plan `a` of `items` items (its output aside).
     pub fn moeGateUpTakes(k: *const Kernels, a: Arg, items: c_int) bool {
-        const sh = moe_gu_shape;
-        if (k.moe_gu == null or k.mode == .off or k.tile != .gemm) return false;
+        return k.moe_gu != null and k.moeTakes(a, items, moe_gu_shape);
+    }
+
+    /// Whether moeDown takes the plan `a` of `items` items (its output aside).
+    pub fn moeDownTakes(k: *const Kernels, a: Arg, items: c_int) bool {
+        return k.moe_down != null and k.moeTakes(a, items, moe_down_shape);
+    }
+
+    fn moeTakes(k: *const Kernels, a: Arg, items: c_int, sh: MoeShape) bool {
+        if (k.mode == .off or k.tile != .gemm) return false;
         if (a.fp16 != 0 or a.n != sh.n or a.k != sh.k or a.bits != sh.bits or a.group != sh.group) return false;
         // the tile reads 8 groups' bf16 scales (and biases) of a row in one 16-byte load: the bf16 planes only
         if (a.route.items == 0 or a.route.members == 0 or items < 1 or a.scale.kind != 1 or a.bias.kind != 1) return false;
@@ -470,12 +483,20 @@ pub const Kernels = struct {
     /// the matrix tile followed by moe_act_kernel. False, nothing launched, for any other shape or with the matrix off.
     pub fn moeGateUp(k: *const Kernels, r: *const runtime.Runtime, a: Arg, items: c_int, limit: f32, s: abi.Stream) Error!bool {
         if (!k.moeGateUpTakes(a, items) or a.out16 == 0) return false;
-        const f = k.moe_gu.?;
-        const sh = moe_gu_shape;
         var args: hl.Args = .{};
         try args.add(a);
         try args.add(limit);
-        try go(r, f, .{ .x = @divExact(sh.n / 2, sh.block_cols), .z = @intCast(items) }, .{ .x = 256 }, s, &args);
+        try go(r, k.moe_gu.?, .{ .x = moe_gu_shape.blocks, .z = @intCast(items) }, .{ .x = 256 }, s, &args);
+        return true;
+    }
+
+    /// A prompt's routed down of that shape into `a.out` (fp32, pairs x n): the bytes of the matrix tile. False, nothing
+    /// launched, for any other shape or with the matrix off.
+    pub fn moeDown(k: *const Kernels, r: *const runtime.Runtime, a: Arg, items: c_int, s: abi.Stream) Error!bool {
+        if (!k.moeDownTakes(a, items) or a.out == 0 or a.out16 != 0) return false;
+        var args: hl.Args = .{};
+        try args.add(a);
+        try go(r, k.moe_down.?, .{ .x = moe_down_shape.blocks, .z = @intCast(items) }, .{ .x = 256 }, s, &args);
         return true;
     }
 
