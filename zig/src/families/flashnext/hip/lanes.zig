@@ -557,7 +557,12 @@ pub const Fx = struct {
             while (d < depth) : (d += 1) {
                 var tok: [1]u32 = undefined;
                 var prob: [1]f32 = undefined;
-                try head_mod.draws(o, m, &e.host, e.stream, mixed, 1, f.draft_ids, &tok, &prob);
+                // a sampled stream drafts the keyed choice the target makes at this position (head.keyed)
+                const keyed = if (sampling(r.stream)) |sm|
+                    try head_mod.keyed(o, m, &e.host, e.stream, mixed, f.draft_ids, sm, r.position + d, &prob[0])
+                else
+                    null;
+                if (keyed) |t| tok[0] = t else try head_mod.draws(o, m, &e.host, e.stream, mixed, 1, f.draft_ids, &tok, &prob);
                 lane.held[d] = tok[0];
                 chained = d + 1;
                 if (d + 1 == depth or prob[0] < stop_under) break;
