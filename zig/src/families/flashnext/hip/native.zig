@@ -18,6 +18,10 @@ pub const formats: []const []const u8 = &.{ "mlx-q3g32", "mlx-q4g32", "mlx-q6g32
 pub const default_context: i64 = 32768;
 /// The engine cuts prompts itself.
 pub const prefill_step: u32 = 0;
+/// The prompt chunk Flash Next takes on HIP where the policy names none (the HIP default is 1,024 rows). Measured on
+/// gfx1151 with the MLX 4-bit MTP checkpoint (2026-10-25, a 17,755-token prompt): prefill +4.8 % in a two-seed ABBA,
+/// the same tokens and logits at every step, 1.5 GiB more scratch on the device.
+pub const policy_prefill_step: u32 = 2048;
 /// Device bytes a rank keeps for the forward's scratch until the engine counts its own.
 pub const scratch_bytes: u64 = 2 << 30;
 
