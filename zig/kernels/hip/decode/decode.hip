@@ -584,7 +584,7 @@ __device__ void route_plan(const int* picks, int pairs, int experts, int tile, i
     int* counts = pool;
     int* starts = counts + experts;
     int* ends = starts + experts;
-    int* scan_c = ends + kSelectMax + 1;
+    int* scan_c = ends + experts;
     int* scan_n = scan_c + kThreads;
     int* pk = scan_n + kThreads;
     const int t = threadIdx.x;
