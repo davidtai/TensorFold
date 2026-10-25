@@ -215,8 +215,11 @@ pub fn sparse(
     );
     const iq = try o.arena.of(f32, rows * d.index_heads * di);
     try o.qkRope(idx, width, di, s.iq_norm, d.eps, rows, d.index_heads, di, d.rotary, d.theta, dev_pos, iq, null, 0);
-    const att = try o.arena.of(f32, rows * d.heads * hd);
     const graphed = o.window and staged != null;
+    // a prompt's rows attend in one pass on the matrix cores and write the gated rows themselves
+    const prompt = !graphed and rows >= prompt_rows and promptFits(m, d);
+    const gated = try take(o, m.act, rows * d.heads * hd);
+    const att = if (prompt) 0 else try o.arena.of(f32, rows * d.heads * hd);
     var off: usize = 0;
     for (segs) |g| {
         const n = g.tokens.len;
@@ -291,7 +294,20 @@ pub fn sparse(
             .complete = st.complete + off * 4,
             .bound = st.bound,
         } else null;
-        try attend(
+        if (prompt) try attendPrompt(
+            o,
+            m,
+            d,
+            kv,
+            cap,
+            q32 + off * d.heads * hd * 4,
+            iq + off * d.index_heads * di * 4,
+            forward.at(qg, off * d.heads * 2 * hd).ptr,
+            forward.at(gated, off * d.heads * hd).ptr,
+            n,
+            pos,
+            host,
+        ) else try attend(
             o,
             m,
             d,
@@ -308,9 +324,105 @@ pub fn sparse(
         );
         off += n;
     }
-    const gated = try take(o, m.act, rows * d.heads * hd);
-    try o.attnGate(att, qg, gated, rows, d.heads, hd, true);
+    if (!prompt) try o.attnGate(att, qg, gated, rows, d.heads, hd, true);
     return o.project(gated, s.o, rows, s.o.partial);
+}
+
+/// Rows from which a call's attention takes the prompt kernel: below, the parts kernel's wider grid wins.
+const prompt_rows = 16;
+
+/// The prompt kernel's geometry: Flash Next's whole 24 x 256 heads over 2 kv heads, bf16, on matrix cores.
+fn promptFits(m: *const model.Model, d: model.Dims) bool {
+    return hip.Launcher.fn_sparse_prompt_on() and m.act == .bf16 and d.head_dim == 256 and d.heads == 24 and
+        d.kv_heads == 2;
+}
+
+/// One stream's prompt rows: the indexer in slices (its scores stay bounded), then every row's attention in one launch.
+fn attendPrompt(
+    o: Ops,
+    m: *const model.Model,
+    d: model.Dims,
+    kv: cache.SparseView,
+    cap: usize,
+    q32: u64,
+    iq: u64,
+    qg: u64,
+    gated: u64,
+    rows: usize,
+    pos: usize,
+    host: *forward.Host,
+) !void {
+    const di = d.index_dim;
+    const kind = @backingInt(m.act);
+    const key_stride = d.index_top * d.index_ratio + d.index_ratio;
+    const list = try o.arena.of(i32, rows * key_stride);
+    const counts = try o.arena.of(i32, rows);
+    const flags = try o.arena.of(i32, rows);
+    var r0: usize = 0;
+    while (r0 < rows) : (r0 += slice_rows) {
+        const n = @min(slice_rows, rows - r0);
+        const mark = o.arena.mark();
+        defer o.arena.release(mark);
+        var complete: [slice_rows]i32 = undefined;
+        var ends: [slice_rows]i32 = undefined;
+        var sparse_rows = false;
+        for (0..n) |r| {
+            ends[r] = @intCast(pos + r0 + r + 1);
+            complete[r] = @divFloor(ends[r], @as(i32, @intCast(d.index_ratio)));
+            sparse_rows = sparse_rows or complete[r] > d.index_top;
+        }
+        const dev_complete = try host.put(o, std.mem.sliceAsBytes(complete[0..n]));
+        const dev_ends = try host.put(o, std.mem.sliceAsBytes(ends[0..n]));
+        const nb: usize = if (sparse_rows) @intCast(complete[n - 1]) else 0;
+        const scores = try o.arena.of(f32, @max(n * nb, 1));
+        if (sparse_rows) try o.l.fn_idx_scores(
+            @ptrFromInt(iq + r0 * d.index_heads * di * 4),
+            @ptrFromInt(kv.pooled),
+            @ptrFromInt(dev_complete),
+            @ptrFromInt(scores),
+            kind,
+            @intCast(n),
+            @intCast(d.index_heads),
+            @intCast(di),
+            @intCast(nb),
+            @intCast(nb),
+            @intCast(d.index_top),
+            o.stream,
+        );
+        // dense rows (no more complete blocks than the budget) take count = end and no list, without the scores
+        try o.l.fn_idx_select(
+            @ptrFromInt(scores),
+            @intCast(nb),
+            @ptrFromInt(dev_complete),
+            @ptrFromInt(dev_ends),
+            @ptrFromInt(list + r0 * key_stride * 4),
+            @intCast(key_stride),
+            @ptrFromInt(counts + r0 * 4),
+            @ptrFromInt(flags + r0 * 4),
+            @intCast(n),
+            @intCast(d.index_top),
+            @intCast(d.index_ratio),
+            o.stream,
+        );
+    }
+    const scale: f32 = @floatCast(1.0 / std.math.sqrt(@as(f64, @floatFromInt(d.head_dim))));
+    // q32 holds activation-kind values (qkRope rounds them) and 1 / 16 is a power of two: one product is exact
+    try o.l.fn_sparse_prompt(
+        @ptrFromInt(q32),
+        @ptrFromInt(kv.k),
+        @ptrFromInt(kv.v),
+        @ptrFromInt(list),
+        @intCast(key_stride),
+        @ptrFromInt(counts),
+        @ptrFromInt(flags),
+        @ptrFromInt(qg),
+        @ptrFromInt(gated),
+        @intCast(rows),
+        @intCast(cap),
+        scale,
+        true,
+        o.stream,
+    );
 }
 
 /// One stream's `rows` rows from `pos` in slices; `graphed`: every row scored and selected over `staged.bound` blocks.

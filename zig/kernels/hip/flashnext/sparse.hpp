@@ -1,6 +1,7 @@
 #pragma once
 
 #include "../ops/common.hpp"
+#include "common/wmma.hpp"
 
 // Attention over a row's listed keys (the indexer's), or its first n keys, in parts merged in part order.
 
@@ -115,6 +116,242 @@ tf_fn_sparse_parts12(const float* q, const void* k, const void* v, int cache_kin
                      int dims, long long cap, float scale, int parts) {
     sparse_parts<12>(q, k, v, cache_kind, ids, id_stride, count, sparse, parts_o, parts_ms, heads, kv_heads, dims, cap,
                      scale, parts);
+}
+
+// ---- A prompt's sparse attention on the gfx11 matrix cores (v_wmma_f32_16x16x16_bf16), Qwen3.8 Flash Next only:
+// 24 query heads of 256, 2 kv heads, bf16 caches. Block (r, g): row r's 12 heads of kv head g over all its keys in one
+// pass, so no parts and no merge; the grid runs kv head 0's rows first, its keys and values (18 MB at 17.7K) stay in
+// the MALL. Wave w owns dims 64 w .. 64 w + 63 of q.k and p.v; a 32-key chunk at a time:
+//   q.k: A = q (16 rows: the 12 heads, 4 zero), B = keys (16 dims x 16 keys), the four waves' partial scores added in
+//        wave order in LDS; q is bf16-exact in the model (tf_qk_rope rounds it, the scale 1/16 is a power of two), so
+//        one product is exact; SPLIT carries an fp32 q as bf16 hi + lo (two products) for any other caller.
+//   softmax: fp32, online, natural exp as tf_fn_sparse_parts.
+//   p.v: A = p as bf16 hi + lo (two products: p keeps about 16 bits), B = values (16 keys x 16 dims) read from a
+//        transposed LDS copy of the wave's 64 dims of the chunk's value rows.
+// gfx11 fragments (wave32): A lane l holds all 16 k of row l % 16, B lane l all 16 k of column l % 16 (lanes 16-31
+// repeat 0-15), D lane l holds D[2 i + l / 16][l % 16]. Other chips build a trap; the launcher never picks it there.
+// With qg, the output is the gated bf16 row tf_attn_gate writes; without, the fp32 attention (rows, 24, 256).
+// After Strata's gfx11 prompt attention (github.com/Niko1221/Strata, MIT, src/kernels/cuda/qsa_prompt_attn.cu@7dd5cf18,
+// prompt_attn_wmma_kernel: waves over 64-dim groups, hi + lo operands) and mlx-serve's qsa_nax.metal (rows = heads).
+constexpr int kPromptHeads = 24;
+constexpr int kPromptGroup = 12;
+constexpr int kPromptDims = 256;
+constexpr int kPromptThreads = 128;
+constexpr int kPromptChunk = 32;
+constexpr int kPromptPRow = kPromptChunk + 4;  // fp32 p row: 16-byte aligned, banks spread
+constexpr int kPromptVRow = kPromptChunk + 8;  // bf16 transposed value row (a dim): 80 bytes
+
+struct alignas(16) PromptSmem {
+    float part[4][16][kPromptChunk + 1];
+    float p[16][kPromptPRow];
+    uint16_t vt[4][64][kPromptVRow];
+    float m[16], l[16], alpha[16];
+};
+
+__device__ __forceinline__ uint32_t prompt_pack(uint16_t lo, uint16_t hi) {
+    return static_cast<uint32_t>(lo) | (static_cast<uint32_t>(hi) << 16);
+}
+
+template <bool SPLIT>
+__device__ void sparse_prompt(const float* __restrict__ q, const uint16_t* __restrict__ k,
+                              const uint16_t* __restrict__ v, const int* __restrict__ ids, long long id_stride,
+                              const int* __restrict__ count, const int* __restrict__ sparse, const uint16_t* qg,
+                              void* out, long long cap, float scale) {
+#if TF_DEVICE_WMMA_GFX11
+    using tf::rocm::bf16x16;
+    using tf::rocm::f32x8;
+    using tf::rocm::u32x8;
+    using Mma = tf::rocm::WmmaBF16;
+    __shared__ PromptSmem S;
+    const int r = blockIdx.x, g = blockIdx.y;
+    const int t = threadIdx.x, lane = t & 31, wave = t >> 5;
+    const int col = lane & 15, half = lane >> 4;
+    const int dim0 = wave * 64;
+    const int n = count[r];
+    const bool listed = ids != nullptr && sparse != nullptr && sparse[r] != 0;
+    const int* row_ids = ids + r * id_stride;
+    const long long head_base = static_cast<long long>(g) * cap * kPromptDims;
+
+    // q fragments of this wave's 64 dims: row col (heads 12..15 zero), k = dim0 + 16 kk + 0..15
+    bf16x16 qh[4], ql[4];
+#pragma unroll
+    for (int kk = 0; kk < 4; ++kk) {
+        u32x8 hw, lw;
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            float x0 = 0.f, x1 = 0.f;
+            if (col < kPromptGroup) {
+                const float* src = q + (static_cast<long long>(r) * kPromptHeads + g * kPromptGroup + col) * kPromptDims +
+                                   dim0 + kk * 16 + 2 * i;
+                x0 = src[0] * scale;
+                x1 = src[1] * scale;
+            }
+            const uint16_t h0 = float_to_bf16(x0), h1 = float_to_bf16(x1);
+            hw[i] = prompt_pack(h0, h1);
+            if constexpr (SPLIT) lw[i] = prompt_pack(float_to_bf16(x0 - bf16_to_float(h0)), float_to_bf16(x1 - bf16_to_float(h1)));
+        }
+        qh[kk] = __builtin_bit_cast(bf16x16, hw);
+        if constexpr (SPLIT) ql[kk] = __builtin_bit_cast(bf16x16, lw);
+    }
+    if (t < 16) {
+        S.m[t] = -INFINITY;
+        S.l[t] = 0.f;
+    }
+    f32x8 acc[4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) acc[j] = f32x8{0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+
+    for (int c0 = 0; c0 < n; c0 += kPromptChunk) {
+        // this lane's cell (lane = cell): its key, or key 0 past the row's keys (finite values under p = 0)
+        const int cell = c0 + lane;
+        const bool live = cell < n;
+        const int key = live ? (listed ? row_ids[cell] : cell) : 0;
+        // every read of the chunk first: the keys of the two 16-cell tiles (this wave's dims), the lane's value row
+        uint4 kx[2][4][2];
+#pragma unroll
+        for (int nt = 0; nt < 2; ++nt) {
+            const int kr = __shfl(key, nt * 16 + col, 32);
+            const uint4* src = reinterpret_cast<const uint4*>(k + head_base + static_cast<long long>(kr) * kPromptDims + dim0);
+#pragma unroll
+            for (int kk = 0; kk < 4; ++kk) {
+                kx[nt][kk][0] = src[2 * kk];
+                kx[nt][kk][1] = src[2 * kk + 1];
+            }
+        }
+        uint4 vx[8];
+        {
+            const uint4* src = reinterpret_cast<const uint4*>(v + head_base + static_cast<long long>(key) * kPromptDims + dim0);
+#pragma unroll
+            for (int i = 0; i < 8; ++i) vx[i] = src[i];
+        }
+        // partial scores of this wave's dims, rows 2 i + half, cell nt * 16 + col
+#pragma unroll
+        for (int nt = 0; nt < 2; ++nt) {
+            f32x8 s = f32x8{0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+            for (int kk = 0; kk < 4; ++kk) {
+                const u32x8 w = {kx[nt][kk][0].x, kx[nt][kk][0].y, kx[nt][kk][0].z, kx[nt][kk][0].w,
+                                 kx[nt][kk][1].x, kx[nt][kk][1].y, kx[nt][kk][1].z, kx[nt][kk][1].w};
+                const bf16x16 b = __builtin_bit_cast(bf16x16, w);
+                s = Mma::mma(qh[kk], b, s);
+                if constexpr (SPLIT) s = Mma::mma(ql[kk], b, s);
+            }
+#pragma unroll
+            for (int i = 0; i < 8; ++i) S.part[wave][2 * i + half][nt * 16 + col] = s[i];
+        }
+        // the wave's value rows, transposed: vt[wave][dim][cell]
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const uint32_t w4[4] = {vx[i].x, vx[i].y, vx[i].z, vx[i].w};
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                S.vt[wave][i * 8 + 2 * j][lane] = static_cast<uint16_t>(w4[j] & 0xffffu);
+                S.vt[wave][i * 8 + 2 * j + 1][lane] = static_cast<uint16_t>(w4[j] >> 16);
+            }
+        }
+        __syncthreads();
+        // online softmax: row t / 8, cells 4 (t % 8) ..; the four waves' partials in wave order
+        {
+            const int row = t >> 3, sub = t & 7;
+            float x[4], mx = -INFINITY;
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const int c = sub * 4 + j;
+                const float sc = ((S.part[0][row][c] + S.part[1][row][c]) + S.part[2][row][c]) + S.part[3][row][c];
+                x[j] = c0 + c < n ? sc : -INFINITY;
+                mx = fmaxf(mx, x[j]);
+            }
+#pragma unroll
+            for (int mask = 1; mask < 8; mask <<= 1) mx = fmaxf(mx, __shfl_xor(mx, mask, 32));
+            const float m_old = S.m[row];
+            const float m_new = fmaxf(m_old, mx);
+            float sum = 0.f;
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const float e = x[j] == -INFINITY ? 0.f : expf(x[j] - m_new);
+                S.p[row][sub * 4 + j] = e;
+                sum += e;
+            }
+#pragma unroll
+            for (int mask = 1; mask < 8; mask <<= 1) sum += __shfl_xor(sum, mask, 32);
+            if (sub == 0) {
+                const float f = expf(m_old - m_new);
+                S.alpha[row] = f;
+                S.l[row] = S.l[row] * f + sum;
+                S.m[row] = m_new;
+            }
+        }
+        __syncthreads();
+        // o = o alpha + p v over this wave's dims: 4 tiles of 16 dims, 2 steps of 16 cells
+        float a[8];
+#pragma unroll
+        for (int i = 0; i < 8; ++i) a[i] = S.alpha[2 * i + half];
+#pragma unroll
+        for (int j = 0; j < 4; ++j)
+#pragma unroll
+            for (int i = 0; i < 8; ++i) acc[j][i] *= a[i];
+#pragma unroll
+        for (int ks = 0; ks < 2; ++ks) {
+            u32x8 hw, lw;
+            const float* pr = &S.p[col][ks * 16];
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const float p0 = pr[2 * i], p1 = pr[2 * i + 1];
+                const uint16_t h0 = float_to_bf16(p0), h1 = float_to_bf16(p1);
+                hw[i] = prompt_pack(h0, h1);
+                lw[i] = prompt_pack(float_to_bf16(p0 - bf16_to_float(h0)), float_to_bf16(p1 - bf16_to_float(h1)));
+            }
+            const bf16x16 ph = __builtin_bit_cast(bf16x16, hw), pl = __builtin_bit_cast(bf16x16, lw);
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const uint4* src = reinterpret_cast<const uint4*>(&S.vt[wave][j * 16 + col][ks * 16]);
+                const uint4 lo = src[0], hi = src[1];
+                const u32x8 w = {lo.x, lo.y, lo.z, lo.w, hi.x, hi.y, hi.z, hi.w};
+                const bf16x16 b = __builtin_bit_cast(bf16x16, w);
+                acc[j] = Mma::mma(ph, b, acc[j]);
+                acc[j] = Mma::mma(pl, b, acc[j]);
+            }
+        }
+        // no barrier: part and vt are rewritten before the next first barrier only by their own wave, p and alpha
+        // after it, which every wave reaches once its p.v is done
+    }
+    __syncthreads();
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const int h = 2 * i + half;
+        if (h >= kPromptGroup) continue;
+        const float total = S.l[h];
+        const long long at = (static_cast<long long>(r) * kPromptHeads + g * kPromptGroup + h) * kPromptDims;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int d = dim0 + j * 16 + col;
+            const float o = total > 0.f ? acc[j][i] / total : 0.f;
+            if (qg == nullptr) {
+                static_cast<float*>(out)[at + d] = o;
+            } else {
+                const float gate = bf16_to_float(qg[at * 2 + kPromptDims + d]);
+                static_cast<uint16_t*>(out)[at + d] = float_to_bf16(o * sigmoid(gate));
+            }
+        }
+    }
+#else
+    __builtin_trap();
+#endif
+}
+
+extern "C" __global__ void __launch_bounds__(kPromptThreads)
+tf_fn_sparse_prompt(const float* q, const void* k, const void* v, const int* ids, long long id_stride,
+                    const int* count, const int* sparse, const void* qg, void* out, long long cap, float scale) {
+    sparse_prompt<false>(q, static_cast<const uint16_t*>(k), static_cast<const uint16_t*>(v), ids, id_stride, count,
+                         sparse, static_cast<const uint16_t*>(qg), out, cap, scale);
+}
+
+// The same over an fp32 q that need not be bf16-exact: q as bf16 hi + lo.
+extern "C" __global__ void __launch_bounds__(kPromptThreads)
+tf_fn_sparse_prompt_split(const float* q, const void* k, const void* v, const int* ids, long long id_stride,
+                          const int* count, const int* sparse, const void* qg, void* out, long long cap, float scale) {
+    sparse_prompt<true>(q, static_cast<const uint16_t*>(k), static_cast<const uint16_t*>(v), ids, id_stride, count,
+                        sparse, static_cast<const uint16_t*>(qg), out, cap, scale);
 }
 
 // Block (h, r), a thread a dim: the parts of head h of row r combined in part order, fp32 rows-major out.

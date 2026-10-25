@@ -16,6 +16,8 @@ const Error = util.Error;
 const ad = util.ad;
 const dim = util.dim;
 const cdiv = util.cdiv;
+const caps = @import("../caps.zig");
+const kernels = @import("../kernels.zig");
 
 pub const Fns = struct {
     hc_norm: Function,
@@ -30,6 +32,7 @@ pub const Fns = struct {
     idx_select: Function,
     sparse_parts: [2]Function, // groups of up to 6 and up to 12 query heads
     sparse_merge: Function,
+    sparse_prompt: [2]Function, // q bf16-exact, q any fp32 (hi + lo)
 
     pub fn load(m: Module) Error!Fns {
         return .{
@@ -45,6 +48,7 @@ pub const Fns = struct {
             .idx_select = try m.function("tf_fn_idx_select"),
             .sparse_parts = .{ try m.function("tf_fn_sparse_parts6"), try m.function("tf_fn_sparse_parts12") },
             .sparse_merge = try m.function("tf_fn_sparse_merge"),
+            .sparse_prompt = .{ try m.function("tf_fn_sparse_prompt"), try m.function("tf_fn_sparse_prompt_split") },
         };
     }
 };
@@ -430,4 +434,44 @@ pub fn sparseAttention(
     var b: Args = .{};
     inline for (.{ ad(parts_o), ad(parts_ms), ad(out), heads, dims, parts }) |x| try b.add(x);
     try l.go(l.fnx.sparse_merge, dim(heads, rows, 1), dim(256, 1, 1), 0, s, &b);
+}
+
+/// The prompt attention's geometry: Qwen3.8 Flash Next's 24 heads of 256 over 2 kv heads, bf16 caches.
+pub const prompt_heads = 24;
+pub const prompt_kv_heads = 2;
+pub const prompt_dims = 256;
+
+/// Whether this build's kernels run the prompt attention on matrix cores (gfx11 WMMA, bf16 activations).
+pub fn promptOnMatrix() bool {
+    const c = caps.Caps.of(kernels.arch) orelse return false;
+    return c.matrix == .wmma11 and c.act == .bf16;
+}
+
+/// A prompt's attention of each row's 12 heads a kv head over its listed keys (or its first count[r] keys) in one pass
+/// on the matrix cores; with `qg` the gated bf16 rows (tf_attn_gate's), else fp32 (rows, 24, 256). `exact_q`: q holds
+/// bf16 values and `scale` is a power of two (one product), else q is carried as bf16 hi + lo.
+pub fn sparsePrompt(
+    l: *const Launcher,
+    q: CF,
+    k: C,
+    v: C,
+    ids: CI,
+    id_stride: i64,
+    count: CI,
+    sparse: CI,
+    qg: C,
+    out: P,
+    rows: c_int,
+    cap: i64,
+    scale: f32,
+    exact_q: bool,
+    s: S,
+) Error!void {
+    if (!promptOnMatrix()) return util.invalid("sparsePrompt");
+    if (rows == 0) return;
+    var a: Args = .{};
+    inline for (.{ ad(q), ad(k), ad(v), ad(ids), id_stride, ad(count), ad(sparse), ad(qg), ad(out), cap, scale }) |x|
+        try a.add(x);
+    const f = l.fnx.sparse_prompt[if (exact_q) 0 else 1];
+    try l.go(f, dim(rows, prompt_kv_heads, 1), dim(128, 1, 1), 0, s, &a);
 }
