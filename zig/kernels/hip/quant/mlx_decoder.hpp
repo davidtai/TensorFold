@@ -161,9 +161,6 @@ struct MlxDecoder {
         return ((reinterpret_cast<uintptr_t>(a.words) | static_cast<uintptr_t>(words_row * 4)) & (kWideBytes - 1)) == 0;
     }
 
-    // Whether the tables are paired (kScaleBF16Pair): the stream tile then loads a group's scale and bias as one u32.
-    __device__ static bool pairs(const Args& a) { return a.scale.kind == kScaleBF16Pair; }
-
     // The words and tables of side s of a group of products that share x.
     template <class Sides>
     __device__ static void bind(Args& a, const Sides& sides, int s) {
@@ -216,12 +213,11 @@ struct MlxDecoder {
     }
 
     // The stream tile's group terms: 16-bit BF16 or FP16 table entries, loaded as stored and widened where used.
-    // Paired tables (kScaleBF16Pair) are 4 bytes a group: `pair` loads a group's scale and bias as one u32.
+    // Paired tables (kScaleBF16Pair) are 4 bytes a group: the PK kernels load a group's scale and bias with `pair`.
     struct StreamTerms {
         const unsigned short* scale;
         const unsigned short* bias;
         bool half;
-        int step;  // 16-bit entries from one group to the next
 
         struct Raw {
             unsigned short scale;
@@ -231,12 +227,11 @@ struct MlxDecoder {
         __device__ explicit StreamTerms(const Args& a)
             : scale(static_cast<const unsigned short*>(a.scale.p)),
               bias(static_cast<const unsigned short*>(a.bias.p)),
-              half(a.scale.kind == kScaleF16),
-              step(a.scale.kind == kScaleBF16Pair ? 2 : 1) {}
+              half(a.scale.kind == kScaleF16) {}
 
-        __device__ unsigned short scale_raw(long long at) const { return scale[at * step]; }
-        __device__ unsigned short bias_raw(long long at) const { return bias[at * step]; }
-        // A paired table's group: the scale in the low half, the bias in the high half.
+        __device__ unsigned short scale_raw(long long at) const { return scale[at]; }
+        __device__ unsigned short bias_raw(long long at) const { return bias[at]; }
+        // A paired table's group (the stream tile's PK kernels): the scale in the low half, the bias in the high half.
         __device__ uint32_t pair(long long at) const { return reinterpret_cast<const uint32_t*>(scale)[at]; }
 
         __device__ float widen(unsigned short v) const {

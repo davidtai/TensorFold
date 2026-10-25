@@ -56,6 +56,9 @@ pub const StreamSides = extern struct {
     limit: f32 = 0,
 };
 
+/// quant/mlx.hpp kScaleBF16Pair: a group's bf16 scale and bias in one u32 (scale at p, bias at p + 2).
+pub const paired_kind: c_int = 3;
+
 /// One side of a group: its matrix and where its (rows, n) output goes.
 pub const Side = struct { words: u64, scale: u64, bias: u64, n: c_int, out: u64 };
 
@@ -129,6 +132,9 @@ pub const Kernels = struct {
     stream: [bit_widths.len][stream_rows.len][stream_cbs.len]?Function,
     /// The same tile with the (gate | up) activation as its epilogue.
     pairs: [bit_widths.len][stream_rows.len][stream_cbs.len]?Function,
+    /// `stream` and `pairs` over paired tables (quant/mlx.hpp kScaleBF16Pair): affine_dot2_stream_pk.
+    stream_pk: [bit_widths.len][stream_rows.len][stream_cbs.len]?Function,
+    pairs_pk: [bit_widths.len][stream_rows.len][stream_cbs.len]?Function,
     /// The same tile with Nemotron's relu^2 as its epilogue, and with two such products in one launch.
     relu2: [bit_widths.len][stream_rows.len][stream_cbs.len]?Function,
     relu2_pair: [bit_widths.len][stream_rows.len][stream_cbs.len]?Function,
@@ -196,6 +202,14 @@ pub const Kernels = struct {
                         null;
                     k.pairs[b][r][c] = if (cb * rows <= 16)
                         try m.function(std.fmt.comptimePrint("_ZN2tf4rocm18affine_dot2_streamINS0_{s}ELi{d}ELi{d}ELi{d}ELb1EEEvNS0_6AffineENS0_11StreamSidesEii", .{ dot, bits, rows, cb }))
+                    else
+                        null;
+                    k.stream_pk[b][r][c] = if (cb * rows <= 16)
+                        try m.function(std.fmt.comptimePrint("_ZN2tf4rocm21affine_dot2_stream_pkINS0_{s}ELi{d}ELi{d}ELi{d}ELb0EEEvNS0_6AffineENS0_11StreamSidesEii", .{ dot, bits, rows, cb }))
+                    else
+                        null;
+                    k.pairs_pk[b][r][c] = if (cb * rows <= 16)
+                        try m.function(std.fmt.comptimePrint("_ZN2tf4rocm21affine_dot2_stream_pkINS0_{s}ELi{d}ELi{d}ELi{d}ELb1EEEvNS0_6AffineENS0_11StreamSidesEii", .{ dot, bits, rows, cb }))
                     else
                         null;
                     k.relu2[b][r][c] = if (cb * rows <= 16)
@@ -328,6 +342,7 @@ pub const Kernels = struct {
     /// `streamGo` with Nemotron's relu^2 as the epilogue: `a.out16` takes relu(round(sum))^2 in the activation type.
     pub fn relu2Go(k: *const Kernels, r: *const runtime.Runtime, a: Arg, items: c_int, s: abi.Stream) Error!void {
         if (a.out16 == 0 or a.out != 0) return refuse("relu2 output");
+        if (a.scale.kind == paired_kind) return refuse("relu2 over paired tables");
         return k.streamWith(r, a, .{}, a.n, items, s, true);
     }
 
@@ -377,7 +392,9 @@ pub const Kernels = struct {
             64 => 1,
             else => 2,
         }));
-        const table = if (sides.pair_cols > 0) &k.pairs else if (relu2) &k.relu2 else &k.stream;
+        const pk = a.scale.kind == paired_kind;
+        if (pk and relu2) return refuse("relu2 over paired tables");
+        const table = if (pk) (if (sides.pair_cols > 0) &k.pairs_pk else &k.stream_pk) else if (sides.pair_cols > 0) &k.pairs else if (relu2) &k.relu2 else &k.stream;
         const f = table[b][ri][pick].?;
         try go(r, f, .{ .x = blocks, .y = cdiv(a.m, stream_rows[ri]), .z = @intCast(items) }, .{ .x = 32 * stream_waves }, s, &args);
     }
@@ -539,6 +556,7 @@ pub const Kernels = struct {
     pub fn routedRelu2(k: *const Kernels, r: *const runtime.Runtime, arg: Arg, items: c_int, s: abi.Stream) Error!bool {
         if ((arg.fp16 != 0) == k.wmma or items < 1) return false;
         if (arg.route.items == 0 or arg.route.members == 0 or arg.route.x_div < 1) return false;
+        if (arg.scale.kind == paired_kind) return false; // the relu^2 tiles read stored tables
         var plain = arg;
         plain.out16 = 0;
         const e = k.reg.select(k.env(), .mlx, .routed, .decode, shapeOf(plain, items)) orelse return false;

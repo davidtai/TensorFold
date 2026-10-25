@@ -218,7 +218,8 @@ __device__ inline void stream_body(const typename Dec::Args& a, int lpc_log2, in
 }
 
 // Item z of the plan (or plain product, or a group's side) at CB columns a lane, R rows; chunk group is q >> gshift.
-template <class Dec, class Act, class T, class Epi, int R, int CB, class Sides>
+// PK: the tables are paired (Dec::pairs), its own kernels, so the stored-table kernels compile as they did.
+template <class Dec, class Act, class T, class Epi, int R, int CB, class Sides, bool PK = false>
 __device__ inline void stream_tile(typename Dec::Args& a, const Sides& sides, int lpc_log2, int gshift) {
     int bx = blockIdx.x;
     if (sides.count > 0) {
@@ -234,18 +235,15 @@ __device__ inline void stream_tile(typename Dec::Args& a, const Sides& sides, in
         }
     }
     if (!Dec::take_item(a, blockIdx.z) || static_cast<int>(blockIdx.y) * R >= a.m) return;
-    // every chunk is wide-aligned when the words and the row stride are
-    const bool wide = Dec::kWideBytes != 4 && Dec::wide_aligned(a);
-    if (Dec::pairs(a)) {
-        if (wide) {
-            stream_body<Dec, Act, T, Epi, R, CB, Dec::kWideBytes != 4, true>(a, lpc_log2, gshift, bx, sides.pair_cols, sides.limit);
-        } else {
-            stream_body<Dec, Act, T, Epi, R, CB, false, true>(a, lpc_log2, gshift, bx, sides.pair_cols, sides.limit);
-        }
-    } else if (wide) {
-        stream_body<Dec, Act, T, Epi, R, CB, Dec::kWideBytes != 4>(a, lpc_log2, gshift, bx, sides.pair_cols, sides.limit);
+    if constexpr (Dec::kWideBytes == 4) {
+        stream_body<Dec, Act, T, Epi, R, CB, false, PK>(a, lpc_log2, gshift, bx, sides.pair_cols, sides.limit);
     } else {
-        stream_body<Dec, Act, T, Epi, R, CB, false>(a, lpc_log2, gshift, bx, sides.pair_cols, sides.limit);
+        // every chunk is wide-aligned when the words and the row stride are
+        if (Dec::wide_aligned(a)) {
+            stream_body<Dec, Act, T, Epi, R, CB, true, PK>(a, lpc_log2, gshift, bx, sides.pair_cols, sides.limit);
+        } else {
+            stream_body<Dec, Act, T, Epi, R, CB, false, PK>(a, lpc_log2, gshift, bx, sides.pair_cols, sides.limit);
+        }
     }
 }
 

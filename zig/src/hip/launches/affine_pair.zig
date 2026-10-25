@@ -20,6 +20,7 @@ pub fn relu2PairGo(k: *const Kernels, r: *const runtime.Runtime, a: Arg, b: Arg,
     if (a.route.items == 0 or b.route.items != 0) return false;
     if (a.k != b.k or a.bits != b.bits or a.group != b.group or a.m != b.m or a.fp16 != b.fp16) return false;
     if (a.scale.kind != b.scale.kind or a.bias.kind != b.bias.kind or items < 1) return false;
+    if (a.scale.kind == affine.paired_kind) return false; // the relu^2 tiles read stored tables
     var ra = a;
     ra.out16 = 0;
     const ea = k.reg.select(k.env(), .mlx, .routed, .decode, Kernels.shapeOf(ra, items)) orelse return false;
