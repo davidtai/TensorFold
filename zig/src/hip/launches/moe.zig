@@ -82,12 +82,17 @@ pub fn routerSelect(l: *const Launcher, x: C, kind: c_int, rows16: C, logits: F,
     return true;
 }
 
-/// tf_router_select's dynamic shared memory: a verify window's 2 to 4 rows staged (x 16-byte aligned, d a multiple of 8,
-/// at most 4 x 2560 bf16), then for 2 to 4 rows the waves' top lists and a plan's route_plan pool; the larger of the two,
-/// since the second takes it after the first. One row takes none (its pick and plan are in static shared memory).
+/// The most bytes of x tf_router_select stages: 2 rows of 2560 bf16. On gfx1151, 3 and 4 staged rows (15 and 20 KB a
+/// block) cost more in blocks a WGP than they save in L2 reads (4 rows: 67.8 us staged, 61.5 us not; 2 rows: 50.4 us
+/// staged, 55.1 us not; work/tensorfold-halo/w4/bench/router_bench.hip).
+const STAGED = 2 * 2560 * 2;
+
+/// tf_router_select's dynamic shared memory: a verify window's rows staged (x 16-byte aligned, d a multiple of 8, at most
+/// STAGED bytes), then for 2 to 4 rows the waves' top lists and a plan's route_plan pool; the larger of the two, since the
+/// second takes it after the first. One row takes none (its pick and plan are in static shared memory).
 fn routerShared(x: usize, r: c_int, d: c_int, e: c_int, plan: bool) struct { bytes: u32, staged: bool } {
     if (r < 2 or r > 4) return .{ .bytes = 0, .staged = false };
-    const staged = @rem(d, 8) == 0 and x % 16 == 0 and r * d <= 4 * 2560;
+    const staged = @rem(d, 8) == 0 and x % 16 == 0 and r * d * 2 <= STAGED;
     const rows: c_int = if (staged) r * d * 2 else 0;
     // the waves' top values and indices (32 each a wave), then route_plan's counts, starts and ends, scans and pairs
     const ints: c_int = if (e - 1 <= 1024) 2 * 32 * 4 + (if (plan) 3 * e + 2 * 128 + 64 else 0) else 0;
