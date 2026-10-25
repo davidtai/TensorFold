@@ -171,7 +171,7 @@ fn margin(e: *fx.engine.Engine, y: hip.ops.Tensor, n: usize) !void {
     const row = try e.gpa.alloc(u16, e.cfg.vocab);
     defer e.gpa.free(row);
     try e.stream.synchronize();
-    try hip.runtime.check(e.driver.api.hipMemcpyDtoH(row.ptr, @ptrFromInt(y.ptr), row.len * 2));
+    try hip.runtime.check(e.driver.api.hipMemcpyDtoH(@ptrCast(row.ptr), @ptrFromInt(y.ptr), row.len * 2));
     var best: [2]struct { id: usize, v: f32 } = .{ .{ .id = 0, .v = -std.math.inf(f32) }, .{ .id = 0, .v = -std.math.inf(f32) } };
     for (row, 0..) |b, i| {
         const v: f32 = if (y.kind == .f16) @floatCast(@as(f16, @bitCast(b))) else @bitCast(@as(u32, b) << 16);
