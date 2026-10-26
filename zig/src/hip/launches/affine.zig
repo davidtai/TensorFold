@@ -139,6 +139,8 @@ pub const Kernels = struct {
     relu2_pair: [bit_widths.len][stream_rows.len][stream_cbs.len]?Function,
     /// Off keeps the decode tiles before the stream tile (the policy's reference switch).
     stream_on: bool,
+    /// A test's forced columns a lane (a stream_cbs value; 0: the rule), where the shape takes it.
+    stream_cb_force: c_int,
     block: [bit_widths.len]Function,
     gemm: [bit_widths.len]Function,
     wmma_gemm: [bit_widths.len]Function,
@@ -167,6 +169,7 @@ pub const Kernels = struct {
         k.mode = choices.matrix;
         k.tile = if (choices.gemm) .gemm else .block;
         k.stream_on = choices.stream;
+        k.stream_cb_force = 0;
         k.reg = Registry.init(tableFor(caps), &mlx_entries.all);
         k.reg.verify(k.env(), .mlx) catch return error.Invalid;
         // the GEMM tile's rows of x a lane keeps (tiles/gemm.hpp GemmShape): 8 for BF16, 16 for FP16
@@ -372,6 +375,10 @@ pub const Kernels = struct {
             pick = c;
             const per_block: c_int = stream_waves * (@as(c_int, 32) >> lpc_log2) * @divExact(stream_cbs[c], pair_div);
             if (@as(u64, cdiv(total_n, per_block)) * stream_waves * @as(u64, @intCast(items)) * cdiv(a.m, stream_rows[ri]) >= streams_wanted) break;
+        }
+        for (stream_cbs, 0..) |cb, i| {
+            if (cb != k.stream_cb_force or cb * stream_rows[ri] > 16 or cb * a.bits > stream_code_words or (cb < 2 and (pair_div == 2 or relu2))) continue;
+            pick = i;
         }
         const per_block: c_int = stream_waves * (@as(c_int, 32) >> lpc_log2) * @divExact(stream_cbs[pick], pair_div);
         var blocks: c_uint = cdiv(total_n, per_block);
