@@ -222,3 +222,70 @@ test "a prompt cut on either side of 64 rows gives the same rows and state as on
         try std.testing.expectEqualSlices(u32, @ptrCast(ws), @ptrCast(gs));
     }
 }
+
+/// One window of `length` rows from row `at` with each row's state kept in `snaps`, starting where `from` (a device
+/// i32, 0: none) says: -1 the state, row f the snapshot after row f of the last window in `snaps`.
+fn window(t: *Rig, sh: Shape, in: [5]DeviceBuffer, state: DeviceBuffer, y: DeviceBuffer, snaps: DeviceBuffer, from: u64, at: usize, length: usize) !void {
+    const q, const k, const v, const gate, const beta = in;
+    const qk = at * sh.key_heads * d * 4;
+    const vy = at * sh.value_heads * d * 4;
+    const gb = at * sh.value_heads * 4;
+    try t.ops(&t.on).gatedDelta(rig.at(q) + qk, rig.at(k) + qk, rig.at(v) + vy, rig.at(gate) + gb, rig.at(beta) + gb, rig.at(state), rig.at(y) + vy, length, sh.key_heads, sh.value_heads, d, d, rig.at(snaps), from);
+}
+
+test "a window started from the last window's snapshot row gives the bits of that snapshot copied back" {
+    const t = try Rig.open(1 << 30);
+    defer t.close();
+    const sh: Shape = .{ .length = 8, .key_heads = 2, .value_heads = 4 };
+    const rows = 4;
+    const in = try Inputs.make(sh, 0x5747e);
+    defer in.free();
+    var bufs: [5]DeviceBuffer = undefined;
+    for (&bufs, [_][]f32{ in.q, in.k, in.v, in.gate, in.beta }) |*b, a| b.* = try t.upload(a);
+    defer for (&bufs) |*b| b.free();
+    const state_bytes = sh.value_heads * d * d * 4;
+    var y = try t.alloc(sh.length * sh.value_heads * d * 4);
+    defer y.free();
+    for ([_]i32{ -1, 0, 1, 2, 3 }) |f| {
+        // the first window: rows 0-3 from the input state, each row's state into `snaps`
+        var state = try t.upload(in.state);
+        defer state.free();
+        var snaps = try t.alloc(rows * state_bytes);
+        defer snaps.free();
+        var none = try t.upload(&[_]i32{-1});
+        defer none.free();
+        try window(t, sh, bufs, state, y, snaps, rig.at(none), 0, rows);
+        try t.stream.synchronize();
+        // the copy: the start's bytes in a state of their own, then rows 4-7 from it
+        const first = try rig.download(u8, snaps);
+        defer gpa.free(first);
+        const after = try rig.download(u8, state);
+        defer gpa.free(after);
+        const start = if (f < 0) after else first[@as(usize, @intCast(f)) * state_bytes ..][0..state_bytes];
+        var copied = try t.upload(start);
+        defer copied.free();
+        var copied_snaps = try t.alloc(rows * state_bytes);
+        defer copied_snaps.free();
+        try y.fill8(0);
+        try window(t, sh, bufs, copied, y, copied_snaps, rig.at(none), rows, rows);
+        try t.stream.synchronize();
+        const want_y = try rig.download(u8, y);
+        defer gpa.free(want_y);
+        // the start row: rows 4-7 from the state the first window left, `from` naming row f of its snapshots in place
+        var word = try t.upload(&[_]i32{f});
+        defer word.free();
+        try y.fill8(0);
+        try window(t, sh, bufs, state, y, snaps, rig.at(word), rows, rows);
+        try t.stream.synchronize();
+        const got_y = try rig.download(u8, y);
+        defer gpa.free(got_y);
+        try std.testing.expectEqualSlices(u8, want_y, got_y);
+        for ([_][2]DeviceBuffer{ .{ copied, state }, .{ copied_snaps, snaps } }) |pair| {
+            const want = try rig.download(u8, pair[0]);
+            defer gpa.free(want);
+            const got = try rig.download(u8, pair[1]);
+            defer gpa.free(got);
+            try std.testing.expectEqualSlices(u8, want, got);
+        }
+    }
+}
