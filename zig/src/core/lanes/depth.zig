@@ -59,6 +59,7 @@ pub const Rule = struct {
     plain_guard: bool,
     node_probabilities: bool,
     confidence_floor: ?f64 = null,
+    pinned: bool = false, // the most drafts every round: the head's own gate ends its chain (Model.pinned_depth)
     batch_rows: u32,
     batched_heads: bool = false, // one batch drafts every stream of a shared round (its steps: the deepest stream's)
     round_ms: Table = .{}, // a round's wall time by drafts, every stream's: what sampled streams price by
@@ -143,7 +144,7 @@ pub const Rule = struct {
     pub fn depth(r: *Rule, who: Who) !i64 {
         const most = @min(@as(i64, r.most_drafts), @max(1, who.draft_room - 1));
         if (most <= 0) return 0;
-        if (r.confidence_floor != null) return most;
+        if (r.confidence_floor != null or r.pinned) return most;
         const p = try r.rates(who);
         if (r.family_costs.empty()) {
             const want: i64 = if (p[0] < 0.8) 1 else if (p[0] < 0.9) 2 else 3;
@@ -204,7 +205,7 @@ pub const Rule = struct {
 
     /// Head drafts for the streams of a shared round, sized by allocation over their chain chances.
     pub fn budgets(r: *Rule, whos: []Who, probe: Probe, sampled: bool, out: []i64) !void {
-        if (r.confidence_floor != null) {
+        if (r.confidence_floor != null or r.pinned) {
             for (whos, out) |*w, *o| o.* = try r.headDepth(w, null, probe);
             return;
         }
@@ -350,6 +351,23 @@ test "depth picks the most tokens a ms and probes deeper" {
     defer if (st) |*s| s.deinit(gpa);
     const who: Who = .{ .state = &st, .draft_room = 100, .finished = false, .forced = false };
     try std.testing.expectEqual(@as(i64, 3), try rule.depth(who));
+}
+
+test "a pinned depth asks for the most drafts every round, where the rule would draft one" {
+    const gpa = std.testing.allocator;
+    var fc: Table = .{};
+    defer fc.deinit(gpa);
+    // rows past the first cost 20 ms each: the rule drafts one at a 0.5 estimate
+    for (1..9) |w| try fc.put(gpa, @intCast(w), 10.0 + 20.0 * @as(f64, @floatFromInt(w - 1)));
+    const shared: Table = .{};
+    for ([_]bool{ false, true }, [_]i64{ 1, 7 }) |pinned, want| {
+        var rule: Rule = .{ .gpa = gpa, .prior = &.{ 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5 }, .most_drafts = 7, .family_costs = &fc, .shared_costs = &shared, .mtp_step_ms = 0.5, .plain_guard = false, .node_probabilities = false, .pinned = pinned, .batch_rows = 8 };
+        defer rule.deinit();
+        var st: ?State = null;
+        defer if (st) |*s| s.deinit(gpa);
+        const who: Who = .{ .state = &st, .draft_room = 100, .finished = false, .forced = false };
+        for (0..7) |_| try std.testing.expectEqual(want, try rule.depth(who)); // before the 8th round's probe
+    }
 }
 
 test "a shared round's drafts come out the same whichever depths its overhead was measured at" {
