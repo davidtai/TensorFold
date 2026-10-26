@@ -572,10 +572,10 @@ const own_records = [_]Record{
     .{
         .launch = .{ .name = "Flash Next QSA decode prep", .symbol = "tf_fn_qsa_prep", .image = "flashnext", .threads = 256 },
         .usage = .{
-            .{ .vgprs = 64, .sgprs = 64, .lds = 16416, .private = 0, .bound = 256, .wave = 32 },
-            .{ .vgprs = 64, .sgprs = 64, .lds = 16416, .private = 0, .bound = 256, .wave = 32 },
-            .{ .vgprs = 64, .sgprs = 64, .lds = 16416, .private = 0, .bound = 256, .wave = 32 },
-            .{ .vgprs = 64, .sgprs = 64, .lds = 16416, .private = 0, .bound = 256, .wave = 32 },
+            .{ .vgprs = 36, .sgprs = 50, .lds = 17440, .private = 0, .bound = 256, .wave = 32 },
+            .{ .vgprs = 43, .sgprs = 50, .lds = 17440, .private = 0, .bound = 256, .wave = 32 },
+            .{ .vgprs = 34, .sgprs = 52, .lds = 17440, .private = 0, .bound = 256, .wave = 32 },
+            .{ .vgprs = 34, .sgprs = 51, .lds = 17440, .private = 0, .bound = 256, .wave = 32 },
         },
     },
     .{
