@@ -141,6 +141,8 @@ pub const Kernels = struct {
     moe_gu: ?Function,
     /// The same tile's routed down of a prompt, fp32 out.
     moe_down: ?Function,
+    /// A prompt's plain 4-bit group-32 products at each of dense_ks (tiles/dense_gemm.hpp); gfx11.
+    dense: [dense_ks.len]?Function,
     kp: [bit_widths.len][kp_tiles.len]Function,
     span: [2]Function,
     fold: Function,
@@ -173,6 +175,9 @@ pub const Kernels = struct {
         k.fill = try dot2_obj.function(r ++ "13fill_byte_lutEP6__half");
         k.moe_gu = if (k.matrix) try tiles_obj.function(r ++ "18affine_wmma_moe_guILi4EEEvNS0_6AffineEf") else null;
         k.moe_down = if (k.matrix) try tiles_obj.function(r ++ "20affine_wmma_moe_downILi4EEEvNS0_6AffineE") else null;
+        inline for (dense_ks, 0..) |dk, i| {
+            k.dense[i] = if (k.matrix) try tiles_obj.function(std.fmt.comptimePrint(r ++ "17affine_wmma_denseILi{d}EEEvNS0_6AffineE", .{dk})) else null;
+        }
         return k;
     }
 
@@ -499,6 +504,22 @@ pub const Kernels = struct {
         try args.add(a);
         try go(r, k.moe_down.?, .{ .x = moe_down_shape.blocks, .z = @intCast(items) }, .{ .x = 256 }, s, &args);
         return true;
+    }
+
+    /// The K tiles/dense_gemm.hpp compiles (affine_wmma_dense): Flash Next's trunk, 4-bit group 32, bf16 x and tables.
+    pub const dense_ks = [_]c_int{ 320, 2560, 6144, 10240 };
+
+    pub fn denseIndex(k: c_int) ?usize {
+        for (dense_ks, 0..) |d, i| if (d == k) return i;
+        return null;
+    }
+
+    /// A prompt's plain product on the dense tile of its K: the bytes of the matrix tile.
+    pub fn denseGo(k: *const Kernels, r: *const runtime.Runtime, a: Arg, s: abi.Stream) Error!void {
+        const f = k.dense[denseIndex(a.k) orelse return refuse("dense K")] orelse return refuse("dense tile");
+        var args: hl.Args = .{};
+        try args.add(a);
+        try go(r, f, .{ .x = cdiv(a.n, 128) * cdiv(a.m, 128) }, .{ .x = 256 }, s, &args);
     }
 
     /// K-parallel tile `tier` (an index of kp_tiles) of a short prompt.

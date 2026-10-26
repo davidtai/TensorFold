@@ -30,18 +30,6 @@
 namespace tf {
 namespace rocm {
 
-// A workgroup barrier over LDS only: the LDS ops done (lgkmcnt 0), then s_barrier. __syncthreads() also fences global
-// memory at workgroup scope, and on gfx11 that is s_waitcnt vmcnt(0) at every barrier: the next windows' global loads
-// in flight are drained there, so no load overlaps the matrix work past one barrier. The tile shares only LDS through
-// its barriers; its global loads go to registers whose uses the compiler waits for.
-__device__ __forceinline__ void lds_barrier() {
-#if TF_DEVICE_WMMA_GFX11
-    asm volatile("s_waitcnt lgkmcnt(0)\n\ts_barrier" ::: "memory");
-#else
-    __syncthreads();
-#endif
-}
-
 namespace moe_tile {
 constexpr int kBM = 64;       // rows a pass
 constexpr int kBN = 128;      // staged weight rows a block

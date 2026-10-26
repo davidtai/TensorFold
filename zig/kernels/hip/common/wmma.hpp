@@ -19,6 +19,18 @@ __device__ inline bf16x16 frag16(const uint32_t* p) {
     return __builtin_bit_cast(bf16x16, __builtin_shufflevector(lo, hi, 0, 1, 2, 3, 4, 5, 6, 7));
 }
 
+// A workgroup barrier over LDS only: the LDS ops done (lgkmcnt 0), then s_barrier. __syncthreads() also fences global
+// memory at workgroup scope, and on gfx11 that is s_waitcnt vmcnt(0) at every barrier: the next windows' global loads
+// in flight are drained there, so no load overlaps the matrix work past one barrier. The tile shares only LDS through
+// its barriers; its global loads go to registers whose uses the compiler waits for.
+__device__ __forceinline__ void lds_barrier() {
+#if TF_DEVICE_WMMA_GFX11
+    asm volatile("s_waitcnt lgkmcnt(0)\n\ts_barrier" ::: "memory");
+#else
+    __syncthreads();
+#endif
+}
+
 // The BF16 elements and sums of DotBF16, and the 16 x 16 x 16 product of two fragments added to an accumulator.
 struct WmmaBF16 : DotBF16 {
 #if TF_DEVICE_WMMA_GFX11
