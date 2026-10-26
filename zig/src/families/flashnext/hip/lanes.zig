@@ -368,7 +368,10 @@ pub const Fx = struct {
         while (f.slotBusy(slot, gop.key_ptr.*)) slot += 1;
         const caches = try e.lease(slot);
         errdefer e.unlease(caches);
-        var head: ?cache.Caches = if (m.mtp) |*h| try head_mod.caches(
+        // the head's caches only for a stream that drafts: without them its prompt pass and absorbs do not run
+        // (--no-drafts, a request's "draft": false, --mtp-drafts 0)
+        const drafts = s.drafts and f.drafts > 0;
+        var head: ?cache.Caches = if (m.mtp) |*h| if (!drafts) null else try head_mod.caches(
             f.gpa,
             &e.driver,
             h,
