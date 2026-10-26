@@ -287,6 +287,9 @@ test "a window started from the last window's snapshot row gives the bits of tha
             defer gpa.free(got);
             try std.testing.expectEqualSlices(u8, want, got);
         }
+    }
+}
+
 test "a prompt's recurrence a block a value head gives the bits of a wave a row (Flash Next: 16 key, 48 value heads)" {
     const t = try Rig.open(1 << 30);
     defer t.close();
