@@ -272,6 +272,124 @@ __device__ __forceinline__ void gated_delta_replay_body(const int* keep, int row
                                      value_heads, dv, nullptr, 0);
 }
 
+// A prompt's recurrence for DK = DV = 128: a block a value head, 8 waves of 16 Dv rows, 4 lanes a row and 2 rows a
+// lane. tf_gated_delta's wave a row holds Dk lane + 32 i in lane `lane`; here lane p of a row's 4 holds those of its
+// virtual lanes p + 4 j (j = 0-7), Dk p + 4 m with m = j + 8 i. A virtual lane's products add in its order (i = 0-3),
+// the butterfly's xor 16, 8 and 4 pair virtual lanes inside a lane (the same pairs, in registers) and xor 2 and 1 cross
+// lanes: every sum is lane0_sum's, the state, rows and their order the same bits. k and q of 16 steps stage in shared
+// memory transposed (lane p's 32 values in a row of 32), v, gate and beta beside them.
+constexpr int kPromptSteps = 16;
+
+__device__ __forceinline__ float quad_sum(const float (&part)[8]) {
+    // xor 16, 8, 4 of lane0_sum: virtual lanes j ^ 4, j ^ 2, j ^ 1 in registers (each pair's add commutes)
+    const float a0 = part[0] + part[4], a1 = part[1] + part[5], a2 = part[2] + part[6], a3 = part[3] + part[7];
+    const float b0 = a0 + a2, b1 = a1 + a3;
+    float c = b0 + b1;
+    // xor 2 and 1: the other lanes of the row
+    c = c + __shfl_xor(c, 2, 32);
+    c = c + __shfl_xor(c, 1, 32);
+    return c;
+}
+
+__device__ __forceinline__ void
+gated_delta_prompt_body(const float* __restrict__ q, const float* __restrict__ k, const float* __restrict__ v,
+                        const float* __restrict__ gate, const float* __restrict__ beta, float* __restrict__ state,
+                        float* __restrict__ y, int length, int key_heads, int value_heads) {
+    constexpr int DK = 128, DV = 128, T = kPromptSteps;
+    const int lane = threadIdx.x, wave = threadIdx.y;
+    const int tid = wave * 32 + lane;
+    const int p = lane & 3;
+    const int row0 = wave * 16 + 2 * (lane >> 2);  // this lane's rows: row0, row0 + 1
+    const int head = blockIdx.y, batch = blockIdx.z;
+    const int key_head = head / (value_heads / key_heads);
+
+    __shared__ __attribute__((aligned(16))) float ks[T][DK];  // transposed: [t][p * 32 + m] = k[t][p + 4 m]
+    __shared__ __attribute__((aligned(16))) float qs[T][DK];
+    __shared__ float vs[T][DV];
+    __shared__ float gs[T];
+    __shared__ float bs[T];
+
+    float s[2][32];
+    for (int r = 0; r < 2; ++r) {
+        const float* at = state + ((static_cast<size_t>(batch) * value_heads + head) * DV + row0 + r) * DK;
+#pragma unroll
+        for (int m = 0; m < 32; ++m) s[r][m] = at[p + 4 * m];
+    }
+
+    for (int t0 = 0; t0 < length; t0 += T) {
+        const int n = min(T, length - t0);
+        for (int i = tid; i < n * DK; i += 256) {
+            const int step = i / DK, e = i - step * DK;
+            const size_t at = ((static_cast<size_t>(batch) * length + (t0 + step)) * key_heads + key_head) * DK + e;
+            const int to = (e & 3) * 32 + (e >> 2);
+            ks[step][to] = k[at];
+            qs[step][to] = q[at];
+        }
+        for (int i = tid; i < n * DV; i += 256) {
+            const int step = i / DV, e = i - step * DV;
+            vs[step][e] = v[((static_cast<size_t>(batch) * length + (t0 + step)) * value_heads + head) * DV + e];
+        }
+        for (int i = tid; i < n; i += 256) {
+            const size_t at = (static_cast<size_t>(batch) * length + (t0 + i)) * value_heads + head;
+            gs[i] = gate[at];
+            bs[i] = beta[at];
+        }
+        __syncthreads();
+        for (int tt = 0; tt < n; ++tt) {
+            const float decay = gs[tt], step_beta = bs[tt];
+            float kv[32], qv[32];
+            const float4* k4 = reinterpret_cast<const float4*>(&ks[tt][p * 32]);
+            const float4* q4 = reinterpret_cast<const float4*>(&qs[tt][p * 32]);
+#pragma unroll
+            for (int c = 0; c < 8; ++c) {
+                const float4 a = k4[c], b = q4[c];
+                kv[4 * c] = a.x, kv[4 * c + 1] = a.y, kv[4 * c + 2] = a.z, kv[4 * c + 3] = a.w;
+                qv[4 * c] = b.x, qv[4 * c + 1] = b.y, qv[4 * c + 2] = b.z, qv[4 * c + 3] = b.w;
+            }
+            float out[2];
+#pragma unroll
+            for (int r = 0; r < 2; ++r) {
+                float part[8];
+#pragma unroll
+                for (int j = 0; j < 8; ++j) part[j] = 0.f;
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+#pragma unroll
+                    for (int j = 0; j < 8; ++j) {
+                        const int m = j + 8 * i;
+                        s[r][m] = s[r][m] * decay;
+                        part[j] = part[j] + s[r][m] * kv[m];
+                    }
+                }
+                const float delta = (vs[tt][row0 + r] - quad_sum(part)) * step_beta;
+#pragma unroll
+                for (int j = 0; j < 8; ++j) part[j] = 0.f;
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+#pragma unroll
+                    for (int j = 0; j < 8; ++j) {
+                        const int m = j + 8 * i;
+                        s[r][m] = s[r][m] + kv[m] * delta;
+                        part[j] = part[j] + s[r][m] * qv[m];
+                    }
+                }
+                out[r] = quad_sum(part);
+            }
+            if (p == 0) {
+                float* yo = y + ((static_cast<size_t>(batch) * length + (t0 + tt)) * value_heads + head) * DV + row0;
+                yo[0] = out[0];
+                yo[1] = out[1];
+            }
+        }
+        __syncthreads();
+    }
+    for (int r = 0; r < 2; ++r) {
+        float* at = state + ((static_cast<size_t>(batch) * value_heads + head) * DV + row0 + r) * DK;
+#pragma unroll
+        for (int m = 0; m < 32; ++m) at[p + 4 * m] = s[r][m];
+    }
+}
+
 }  // namespace rocm
 }  // namespace tf
 
@@ -314,3 +432,9 @@ template __global__ void tf::rocm::gated_delta_kernel<16>(const float* __restric
     const float* __restrict__ v, const float* __restrict__ gate, const float* __restrict__ beta,
     float* __restrict__ state, float* __restrict__ y, int length, int key_heads, int value_heads, int dv,
     float* __restrict__ states, const int* from);
+
+extern "C" __global__ void __launch_bounds__(256)
+tf_gdn_prompt_128(const float* q, const float* k, const float* v, const float* gate, const float* beta, float* state,
+                  float* y, int length, int key_heads, int value_heads) {
+    tf::rocm::gated_delta_prompt_body(q, k, v, gate, beta, state, y, length, key_heads, value_heads);
+}
