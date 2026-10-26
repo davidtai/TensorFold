@@ -54,6 +54,11 @@ pub const Ops = struct {
         return o.l.fuse;
     }
 
+    /// Whether the kernels that change a result's bits may run (policy numerics=inexact).
+    pub fn inexact(o: Ops) bool {
+        return o.l.inexact;
+    }
+
     pub const attnGate = attention.attnGate;
     pub const ropePrefill = attention.ropePrefill;
     pub const qkRope = attention.qkRope;

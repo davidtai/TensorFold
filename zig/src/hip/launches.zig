@@ -79,6 +79,8 @@ pub const Launcher = struct {
     plan: PlanFns,
     /// decode.hip's merged launches are on (off keeps the launches they replace).
     fuse: bool,
+    /// The kernels that change a result's bits may run (policy numerics=inexact); off keeps the exact path's.
+    inexact: bool,
     /// The 64-row prefill attention tile is on.
     wide: bool,
     /// The MLX affine products and the registry that picks their tiles.
@@ -151,8 +153,9 @@ pub const Launcher = struct {
         token_prob: Function,
     };
 
-    /// Which kernels a run takes where two give the same bits; every one defaults on.
-    pub const Choices = struct { fuse: bool = true, wide: bool = true, products: affine.Choices = .{} };
+    /// Which kernels a run takes where two give the same bits, each defaulting on; and whether the ones that change the
+    /// bits may run (`inexact`, default off: numerics=exact).
+    pub const Choices = struct { fuse: bool = true, inexact: bool = false, wide: bool = true, products: affine.Choices = .{} };
 
     /// Loads the code objects on the current device and resolves every kernel the launchers use.
     pub fn load(r: *const runtime.Runtime, choices: Choices, images: [kernels.group_count][]align(8) const u8) Error!Launcher {
@@ -172,6 +175,7 @@ pub const Launcher = struct {
         const dec = l.mods[@backingInt(kernels.Group.decode)];
         const pl = l.mods[@backingInt(kernels.Group.plan)];
         l.fuse = choices.fuse;
+        l.inexact = choices.inexact;
         l.wide = choices.wide;
         l.dec = .{ .router = .{ try dec.function("tf_router_decode_f16"), try dec.function("tf_router_decode_bf16") }, .router_select = .{ try dec.function("tf_router_select_f16"), try dec.function("tf_router_select_bf16") }, .tail = try dec.function("tf_tail"), .conv_split = try dec.function("tf_conv_split"), .rms2 = try dec.function("tf_rms2"), .gnorm_out = try dec.function("tf_gnorm_out"), .select = try dec.function("tf_select_decode") };
         l.plan = .{

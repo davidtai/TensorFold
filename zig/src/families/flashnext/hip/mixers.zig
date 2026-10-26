@@ -256,10 +256,11 @@ pub fn sparse(
     const iq = try o.arena.of(f32, rows * d.index_heads * di);
     try o.qkRope(idx, width, di, s.iq_norm, d.eps, rows, d.index_heads, di, d.rotary, d.theta, dev_pos, iq, null, 0);
     const graphed = o.window and staged != null;
-    // a prompt's rows attend in one pass on the matrix cores and write the gated rows themselves
-    // on the matrix cores a prompt's rows attend in one pass, a few rows in parts; both write the gated rows
-    const tile = promptFits(m, d);
-    const prompt = tile and !graphed and rows >= prompt_rows;
+    // numerics=inexact, on the matrix cores: a prompt's rows attend in one pass, a few rows in parts; both write the
+    // gated rows. numerics=exact: every row in parts on tf_fn_sparse_parts, then tf_attn_gate (3d219d21's bits)
+    const path = attention(o.inexact(), promptFits(m, d), graphed, rows);
+    const tile = path != .parts;
+    const prompt = path == .prompt;
     const gated = try take(o, m.act, rows * d.heads * hd);
     const att = if (tile) 0 else try o.arena.of(f32, rows * d.heads * hd);
     var off: usize = 0;
@@ -373,6 +374,31 @@ pub fn sparse(
 
 /// Rows from which a call's attention takes the prompt kernel: below, the tile runs in parts for a wider grid.
 const prompt_rows = 16;
+
+/// Which kernels a call's sparse attention takes: tf_fn_sparse_parts + tf_attn_gate (the exact path), the matrix-core
+/// tile in parts with the gate in the merge, or the prompt tile in one pass with the gate fused.
+pub const Attention = enum { parts, tile_parts, prompt };
+
+/// The attention of `rows` rows: the matrix-core tiles round otherwise than the parts kernel, so only under
+/// numerics=inexact (`inexact`), on a build and model they fit (`fits`); a graphed window keeps the tile in parts.
+pub fn attention(inexact: bool, fits: bool, graphed: bool, rows: usize) Attention {
+    if (!inexact or !fits) return .parts;
+    return if (!graphed and rows >= prompt_rows) .prompt else .tile_parts;
+}
+
+test "sparse attention: numerics=exact keeps the parts kernel at every row count; inexact takes the tiles where they fit" {
+    for ([_]usize{ 1, 4, 15, 16, 2048, 8192 }) |rows| {
+        for ([_]bool{ false, true }) |graphed| {
+            try std.testing.expectEqual(Attention.parts, attention(false, true, graphed, rows));
+            try std.testing.expectEqual(Attention.parts, attention(true, false, graphed, rows));
+        }
+    }
+    try std.testing.expectEqual(Attention.tile_parts, attention(true, true, false, 1));
+    try std.testing.expectEqual(Attention.tile_parts, attention(true, true, false, 15));
+    try std.testing.expectEqual(Attention.prompt, attention(true, true, false, 16));
+    try std.testing.expectEqual(Attention.prompt, attention(true, true, false, 8192));
+    try std.testing.expectEqual(Attention.tile_parts, attention(true, true, true, 16));
+}
 
 /// Parts of a decode or window row's keys on the matrix-core tile: 2,051 keys in 64-key parts, 66 blocks a row.
 const tile_parts = 32;

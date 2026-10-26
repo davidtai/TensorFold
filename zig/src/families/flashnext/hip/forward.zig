@@ -105,11 +105,12 @@ pub fn hcPre(o: Ops, m: *const model.Model, hc: model.Hc, x: Tensor, rows: usize
 }
 
 /// The up matrix when tf_fn_hc_up_mix takes the read: window rows (at most 16) of the compiled shape (4 x 2560 streams,
-/// low rank 320, MLX 4-bit g32 with bf16 tables, bf16 activations), one rank, merged launches on; else null.
+/// low rank 320, MLX 4-bit g32 with bf16 tables, bf16 activations), one rank, merged launches on, numerics=inexact (its
+/// up product sums in another order than the products' tile); else null.
 fn upMixOf(o: Ops, m: *const model.Model, hc: model.Hc, rows: usize, inject: bool) ?@import("core").quant.mlx.Matrix {
     const shape = hip.Launcher.fn_hc_up;
     const d = m.dims;
-    if (!o.window or o.prefill or !o.fused() or m.tp != null or m.act != .bf16 or rows == 0 or rows > shape.most_rows) return null;
+    if (!o.inexact() or !o.window or o.prefill or !o.fused() or m.tp != null or m.act != .bf16 or rows == 0 or rows > shape.most_rows) return null;
     if (d.streams != shape.streams or d.hidden != shape.hidden or d.low != shape.low) return null;
     if (hc.down.n != shape.low + if (inject) @as(u32, shape.streams) else 0) return null;
     const up = switch (hc.up.handle) {

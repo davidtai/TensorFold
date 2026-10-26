@@ -28,7 +28,8 @@ const Args = struct {
     margins: usize = 0,
 };
 
-fn parse(args: []const [:0]const u8) !Args {
+/// `--policy` may repeat: its values join as `key=value,key=value` (the server's rule).
+fn parse(arena: std.mem.Allocator, args: []const [:0]const u8) !Args {
     var a: Args = .{ .dir = args[0] };
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
@@ -49,7 +50,7 @@ fn parse(args: []const [:0]const u8) !Args {
         else if (std.mem.eql(u8, name, "--port"))
             a.port = try std.fmt.parseInt(u16, v, 10)
         else if (std.mem.eql(u8, name, "--policy"))
-            a.policy = v
+            a.policy = if (a.policy.len == 0) v else try std.fmt.allocPrint(arena, "{s},{s}", .{ a.policy, v })
         else if (std.mem.eql(u8, name, "--text"))
             a.text = v
         else if (std.mem.eql(u8, name, "--max"))
@@ -198,7 +199,7 @@ pub fn main(init: std.process.Init) !u8 {
         std.debug.print(usage, .{});
         return 2;
     }
-    const a = parse(args[2..]) catch {
+    const a = parse(init.arena.allocator(), args[2..]) catch {
         std.debug.print(usage, .{});
         return 2;
     };
