@@ -435,15 +435,10 @@ template __global__ void tf::rocm::gated_delta_kernel<16>(const float* __restric
     float* __restrict__ state, float* __restrict__ y, int length, int key_heads, int value_heads, int dv,
     float* __restrict__ states, const int* from);
 
-extern "C" __global__ void __launch_bounds__(256)
+// Half a value head a block (4 waves, 64 rows; grid 2 x value heads): on gfx1151 at 8,192 rows 14.6 ms a layer
+// against 17.4 for a value head a block (8 waves) and 20.8 for a quarter (2 waves; w4/bench/gdn_bench.cpp).
+extern "C" __global__ void __launch_bounds__(128)
 tf_gdn_prompt_128(const float* q, const float* k, const float* v, const float* gate, const float* beta, float* state,
                   float* y, int length, int key_heads, int value_heads) {
-    tf::rocm::gated_delta_prompt_body<8>(q, k, v, gate, beta, state, y, length, key_heads, value_heads);
-}
-
-// Half a value head a block (4 waves, 64 rows): twice the blocks, a more even spread over the WGPs.
-extern "C" __global__ void __launch_bounds__(128)
-tf_gdn_prompt_128_half(const float* q, const float* k, const float* v, const float* gate, const float* beta,
-                       float* state, float* y, int length, int key_heads, int value_heads) {
     tf::rocm::gated_delta_prompt_body<4>(q, k, v, gate, beta, state, y, length, key_heads, value_heads);
 }
