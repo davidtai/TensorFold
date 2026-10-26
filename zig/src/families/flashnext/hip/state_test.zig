@@ -131,9 +131,13 @@ const Saved = struct {
     }
 };
 
-/// Caches are a new stream's: every byte zero, no positions, eos before any row.
+/// Caches are a new stream's: every byte zero, no positions, eos before any row, the window starting from the states'
+/// own places (the start word -1, no pending snapshot row).
 fn expectFresh(c: *const cache.Caches) !void {
     for (bytes(c)) |b| try std.testing.expectEqual(@as(u8, 0), b);
+    const word = @as([*]const u8, @ptrCast(c.window.ptr.?))[c.layout.windowBytes()..][0..4];
+    try std.testing.expectEqualSlices(u8, &.{ 0xff, 0xff, 0xff, 0xff }, word);
+    try std.testing.expectEqual(@as(?usize, null), c.pending);
     try std.testing.expectEqual(@as(usize, 0), c.len);
     try std.testing.expectEqual(@as(usize, 0), c.pooled);
     try std.testing.expectEqual([2]i64{ eos, eos }, c.history);

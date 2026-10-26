@@ -148,7 +148,8 @@ pub const Caches = struct {
     /// The state of fresh caches again, the memory kept: zeros, no positions, eos before any row.
     pub fn reset(c: *Caches, eos: i64) !void {
         try c.mem.fill8(0);
-        try hip.runtime.check(c.window.r.api.hipMemsetD32Async(@ptrFromInt(c.start()), -1, 1, null));
+        // the start word -1 (no snapshot row): bytes 0xff by the same blocking fill as the memory's
+        try hip.runtime.check(c.window.r.api.hipMemset(@ptrFromInt(c.start()), 0xff, 4));
         try hip.runtime.check(c.window.r.api.hipStreamSynchronize(null));
         c.pending = null;
         c.len = 0;
