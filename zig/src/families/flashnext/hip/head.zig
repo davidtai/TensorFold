@@ -37,11 +37,13 @@ pub fn run(
     pos: usize,
     ones: hip.DeviceBuffer,
 ) !Out {
+    const rows = tokens.len;
+    // a window's rows (absorbs, chain steps) on the decode tiles; a prompt chunk's on the prefill tiles, as the trunk's
     var o = ops;
-    o.window = true;
+    o.window = rows <= cache.max_window;
+    o.prefill = !o.window;
     const w = &m.mtp.?;
     const d = w.dims;
-    const rows = tokens.len;
     if (rows * d.streams * m.act.size() > ones.len) return error.HeadRowsPastOnes;
     const ids = try host.gpa.alloc(i32, rows);
     defer host.gpa.free(ids);
