@@ -106,8 +106,14 @@ pub fn tf_gdn_prompt_prep(l: *const Launcher, x: C, kind: c_int, weight: CF, sta
     if (kernel < 1 or kernel > 8 or @rem(kwidth, 128) != 0 or len < 1) return invalid("gdn prompt prep");
     var args: Args = .{};
     inline for (.{ ad(x), kind, ad(weight), ad(state), ad(new_state), ad(q), ad(k), ad(v), ad(qw), ad(kw_w), eps, len, kwidth, vwidth, kernel, ad(a), ad(b), ad(a_log), ad(dt_bias), ad(gate), ad(beta), heads }) |val| try args.add(val);
-    const segs = cdiv(len, 16);
-    const qk_heads = @divExact(2 * kwidth, 128);
-    const blocks = cdiv(qk_heads * segs, 8) + cdiv(vwidth, 256) * segs + cdiv(len * heads, 256) + cdiv((kernel - 1) * (2 * kwidth + vwidth), 256);
+    const n: usize = @intCast(len);
+    const kwu: usize = @intCast(kwidth);
+    const vwu: usize = @intCast(vwidth);
+    const segs = (n + 15) / 16;
+    const qk_heads = 2 * kwu / 128;
+    const per_v = (vwu + 255) / 256;
+    const states = @as(usize, @intCast(kernel - 1)) * (2 * kwu + vwu);
+    const total = (qk_heads * segs + 7) / 8 + per_v * segs + (n * @as(usize, @intCast(heads)) + 255) / 256 + (states + 255) / 256;
+    const blocks: c_int = @intCast(total);
     try l.go(l.op.gdn_prompt_prep, dim(blocks, 1, 1), dim(256, 1, 1), 0, s, &args);
 }
