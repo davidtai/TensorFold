@@ -59,7 +59,7 @@ fn draftCap(comptime F: type) u32 {
 /// The widest draft cap of any HIP family: what every rank refuses past before it knows the family.
 const most_drafts: u32 = blk: {
     var most: u32 = 0;
-    inline for (registry) |F| most = @max(most, draftCap(F));
+    for (registry) |F| most = @max(most, draftCap(F));
     break :blk most;
 };
 

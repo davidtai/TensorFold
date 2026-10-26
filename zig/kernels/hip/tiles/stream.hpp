@@ -260,9 +260,11 @@ template <class Dec, class Act, class T, class Epi, int R, int CB, class Sides>
 __device__ inline void stream_tile(typename Dec::Args& a, const Sides& sides, int lpc_log2, int gshift) {
     // More rows than the tile's are row blocks: on the grid's y, or (row_blocks > 1) next to each other on x, so a
     // column block's row blocks run together and the second reads its codes from cache, not DRAM.
+    // Both stay wave-uniform (readfirstlane): a block index the compiler cannot prove uniform puts every row's
+    // addresses in vector registers.
     const int ny = sides.row_blocks > 1 ? sides.row_blocks : 1;
-    int bx = ny > 1 ? static_cast<int>(blockIdx.x) / ny : static_cast<int>(blockIdx.x);
-    const int by = ny > 1 ? static_cast<int>(blockIdx.x) % ny : static_cast<int>(blockIdx.y);
+    int bx = __builtin_amdgcn_readfirstlane(ny > 1 ? static_cast<int>(blockIdx.x) / ny : static_cast<int>(blockIdx.x));
+    const int by = __builtin_amdgcn_readfirstlane(ny > 1 ? static_cast<int>(blockIdx.x) % ny : static_cast<int>(blockIdx.y));
     if (sides.count > 0) {
         int s = 0;
         while (s + 1 < sides.count && bx >= sides.first[s + 1]) ++s;
