@@ -585,8 +585,8 @@ fn promptCase(t: *Rig, comptime exact: bool, comptime p_lo: bool) !void {
                 mag += w[j] * @abs(t.value(hv[(kvh * cap + key) * dims + d]));
             }
             const want = acc / total;
-            // p in bf16 once: each p v term carries p's rounding (at most 2^-9 of p), so up to 2^-9 of sum p |v| / sum p
-            const rounding: f64 = if (p_lo) 0 else std.math.pow(f64, 2, -9) * mag / total;
+            // p in bf16 once (7 stored bits, round to nearest): each p v term is off by at most 2^-8 of p
+            const rounding: f64 = if (p_lo) 0 else std.math.pow(f64, 2, -8) * mag / total;
             try rig.expect(
                 @abs(got[(r * heads + h) * dims + d] - want) <= 1e-4 * @max(@abs(want), 0.1) + rounding,
                 "prompt attention exact={} row {d} head {d} dim {d}: {d} against {d}",
