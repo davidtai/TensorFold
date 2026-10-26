@@ -480,7 +480,7 @@ test "prompt attention on matrix cores: listed, dense and short rows near fp64's
     try promptCase(t, false, true);
 }
 
-test "prompt attention with p in bf16 once (numerics=inexact): listed, dense and short rows within 4e-3 of fp64's softmax" {
+test "prompt attention with p in bf16 once (numerics=inexact): listed, dense and short rows near fp64's softmax plus p's rounding" {
     if (!@import("../launches/flashnext.zig").promptOnMatrix()) return error.SkipZigTest;
     const t = try Rig.open(1 << 22);
     defer t.close();
@@ -488,7 +488,6 @@ test "prompt attention with p in bf16 once (numerics=inexact): listed, dense and
 }
 
 fn promptCase(t: *Rig, comptime exact: bool, comptime p_lo: bool) !void {
-    const tol: f64 = if (p_lo) 1e-4 else 4e-3;
     var rng: rig.Rng = .{ .state = if (exact) 0xB0A7 else 0xB0A8 };
     const heads = 24;
     const kv_heads = 2;
@@ -579,13 +578,17 @@ fn promptCase(t: *Rig, comptime exact: bool, comptime p_lo: bool) !void {
         }
         for (0..dims) |d| {
             var acc: f64 = 0;
+            var mag: f64 = 0;
             for (0..n) |j| {
                 const key: usize = if (sparse[r] != 0) @intCast(ids[r * stride + j]) else j;
                 acc += w[j] * t.value(hv[(kvh * cap + key) * dims + d]);
+                mag += w[j] * @abs(t.value(hv[(kvh * cap + key) * dims + d]));
             }
             const want = acc / total;
+            // p in bf16 once: each p v term carries p's rounding (at most 2^-9 of p), so up to 2^-9 of sum p |v| / sum p
+            const rounding: f64 = if (p_lo) 0 else std.math.pow(f64, 2, -9) * mag / total;
             try rig.expect(
-                @abs(got[(r * heads + h) * dims + d] - want) <= tol * @max(@abs(want), 0.1),
+                @abs(got[(r * heads + h) * dims + d] - want) <= 1e-4 * @max(@abs(want), 0.1) + rounding,
                 "prompt attention exact={} row {d} head {d} dim {d}: {d} against {d}",
                 .{ exact, r, h, d, got[(r * heads + h) * dims + d], want },
             );
