@@ -127,7 +127,8 @@ test "hyper-connection norm, gates and mix: the reference's roundings, each row 
     defer mixed.free();
     try t.on.fn_hc_gates(ptr(?[*]const f32, z), ptr(?*anyopaque, act), ptr(?*anyopaque, inj), k, rows, low, s, st);
     try t.on.fn_hc_mix(
-        ptr(?[*]const f32, g),
+        ptr(?*const anyopaque, g),
+        0,
         ptr(?*const anyopaque, x_out),
         ptr(?*anyopaque, mixed),
         k,
@@ -576,7 +577,22 @@ test "hyper-connection gates, up and mix in one launch: the chain's values, each
         t.arena.reset();
         try t.on.fn_hc_gates(ptr(?[*]const f32, z), ptr(?*anyopaque, act), if (with_inject) ptr(?*anyopaque, inj[0]) else null, k, rows, low, s, st);
         const g = try t.ops(&t.on).affine(.{ .ptr = at(act), .kind = .bf16 }, up.affine(w, low), rows, true);
-        try t.on.fn_hc_mix(@ptrFromInt(g.ptr), ptr(?*const anyopaque, x), ptr(?*anyopaque, mixed[0]), k, rows, s, d, st);
+        try t.on.fn_hc_mix(@ptrFromInt(g.ptr), 0, ptr(?*const anyopaque, x), ptr(?*anyopaque, mixed[0]), k, rows, s, d, st);
+        // the mix of g rounded to the activation kind first (tf_cast; the dense prompt tile's bf16 output): the same bytes
+        {
+            var g16 = try t.alloc(rows * s * d * 2);
+            defer g16.free();
+            var mixed16 = try t.alloc(rows * d * 2);
+            defer mixed16.free();
+            try t.on.tf_cast(@ptrFromInt(g.ptr), 0, ptr(?*anyopaque, g16), k, @intCast(rows * s * d), st);
+            try t.on.fn_hc_mix(ptr(?*const anyopaque, g16), k, ptr(?*const anyopaque, x), ptr(?*anyopaque, mixed16), k, rows, s, d, st);
+            try t.stream.synchronize();
+            const want = try rig.download(u16, mixed[0]);
+            defer gpa.free(want);
+            const got16 = try rig.download(u16, mixed16);
+            defer gpa.free(got16);
+            try std.testing.expectEqualSlices(u16, want, got16);
+        }
         // one launch for all rows, then one a row
         const one = struct {
             fn go(tt: *Rig, nn: usize, zz: DeviceBuffer, u: Packed, xx: DeviceBuffer, mm: DeviceBuffer, ii: DeviceBuffer, r0: usize, m: usize, wi: bool) !void {
@@ -626,7 +642,7 @@ test "hyper-connection gates, up and mix in one launch: the chain's values, each
                     t.arena.reset();
                     try t.on.fn_hc_gates(ptr(?[*]const f32, z), ptr(?*anyopaque, act), if (with_inject) ptr(?*anyopaque, inj[0]) else null, k, 1, low, s, st);
                     const g1 = try t.ops(&t.on).affine(.{ .ptr = at(act), .kind = .bf16 }, up.affine(w, low), 1, true);
-                    try t.on.fn_hc_mix(@ptrFromInt(g1.ptr), ptr(?*const anyopaque, x), ptr(?*anyopaque, mixed[0]), k, 1, s, d, st);
+                    try t.on.fn_hc_mix(@ptrFromInt(g1.ptr), 0, ptr(?*const anyopaque, x), ptr(?*anyopaque, mixed[0]), k, 1, s, d, st);
                 }
             }
             try t.stream.synchronize();

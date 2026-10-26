@@ -4,7 +4,8 @@
 //
 // Each output's arithmetic is affine_wmma_gemm's (matrix_gemm.hpp): x as the A operand, two WMMA a 32-code group in
 // the same K order (the first from zero), the group folded as fma(dot, scale) then fma(sum x, bias), the sum of x in
-// the same order from zero. So the bytes equal the matrix tile's. The block is the same 128 x 128; what changes:
+// the same order from zero. So the bytes equal the matrix tile's (with out16 set, the matrix tile's then tf_cast's to
+// BF16). The block is the same 128 x 128; what changes:
 //   - K in 64-wide windows (2 groups a window) in one LDS buffer (40 KB: 3 blocks a WGP against 2), two barriers a
 //     window over LDS only (lds_barrier), AHEAD windows of loads held in registers across them;
 //   - the group is a K stage at compile time: no select of the first WMMA's addend, no runtime group arithmetic;
@@ -20,6 +21,7 @@
 
 #include "common/wmma.hpp"
 #include "quant/mlx_decoder.hpp"
+#include "tiles/epilogue.hpp"
 
 namespace tf {
 namespace rocm {
@@ -188,18 +190,27 @@ __device__ __forceinline__ void wmma_dense_tile(const Affine& a) {
         }(std::make_integer_sequence<int, AHEAD>{});
     }
 
+    // fp32 into out, or (out16 set) rounded to BF16 as tf_cast rounds the fp32 sums (nearest even, NaN 0x7fc0)
+    auto put = [&](auto store) {
 #pragma unroll
-    for (int mt = 0; mt < kMT; ++mt) {
+        for (int mt = 0; mt < kMT; ++mt) {
 #pragma unroll
-        for (int i = 0; i < 8; ++i) {
-            const int orow = m0 + wm * kWR + mt * 16 + 2 * i + rh;
-            if (orow >= a.m) continue;
+            for (int i = 0; i < 8; ++i) {
+                const int orow = m0 + wm * kWR + mt * 16 + 2 * i + rh;
+                if (orow >= a.m) continue;
 #pragma unroll
-            for (int nt = 0; nt < kNT; ++nt) {
-                const int ocol = n0 + wn * kWC + nt * 16 + rl;
-                if (ocol < a.n) a.out[static_cast<long long>(orow) * a.n + ocol] = acc[mt][nt][i];
+                for (int nt = 0; nt < kNT; ++nt) {
+                    const int ocol = n0 + wn * kWC + nt * 16 + rl;
+                    if (ocol < a.n) store(static_cast<long long>(orow) * a.n + ocol, acc[mt][nt][i]);
+                }
             }
         }
+    };
+    if (a.out16 != nullptr) {
+        auto* out = reinterpret_cast<typename T::elem*>(a.out16);
+        put([&](long long at, float v) { out[at] = narrow<T>(v); });
+    } else {
+        put([&](long long at, float v) { a.out[at] = v; });
     }
 #else
     (void)a;

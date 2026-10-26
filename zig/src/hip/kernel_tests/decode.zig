@@ -488,7 +488,8 @@ test "Flash Next's prompt expert down writes the bytes of the matrix tile" {
 }
 
 /// A prompt's plain product on the dense tile of its K (tiles/dense_gemm.hpp) against the 128-row matrix tile: the same
-/// bytes, and the registry's prefill choice for the shape. Rows and columns off the 128 multiples cover the edges.
+/// bytes, and the registry's prefill choice for the shape. Rows and columns off the 128 multiples cover the edges. Then
+/// the dense tile's BF16 output against the matrix tile's fp32 rounded by tf_cast: the same bytes.
 fn promptDense(t: *Rig, rng: *rig.Rng, rows: usize, n: usize, k: usize) !void {
     const kernels = &t.on.affine;
     var m = try Matrix.init(t, rng, n, k, 4, 32, 1);
@@ -518,6 +519,24 @@ fn promptDense(t: *Rig, rng: *rig.Rng, rows: usize, n: usize, k: usize) !void {
         differ += 1;
     };
     try std.testing.expectEqual(@as(usize, 0), differ);
+    // the BF16 output: the cast of the fp32 sums
+    var halves = [2]@import("../memory.zig").DeviceBuffer{ try t.alloc(rows * n * 2), try t.alloc(rows * n * 2) };
+    defer for (&halves) |*b| b.free();
+    try halves[1].fill8(0xA5);
+    try t.on.tf_cast(@ptrFromInt(at(outs[0])), 0, @ptrFromInt(at(halves[0])), t.kind(), @intCast(rows * n), t.stream.handle);
+    a.out = 0;
+    a.out16 = at(halves[1]);
+    try kernels.prefillLaunch(&t.r, a, t.stream.handle, 1);
+    try t.stream.synchronize();
+    const want16 = try rig.download(u8, halves[0]);
+    defer gpa.free(want16);
+    const got16 = try rig.download(u8, halves[1]);
+    defer gpa.free(got16);
+    for (0..want16.len / 2) |i| if (!std.mem.eql(u8, want16[i * 2 ..][0..2], got16[i * 2 ..][0..2])) {
+        if (differ < 4) std.debug.print("  prompt dense bf16 {d}x{d} rows {d}: row {d} column {d} differs\n", .{ n, k, rows, i / n, i % n });
+        differ += 1;
+    };
+    try std.testing.expectEqual(@as(usize, 0), differ);
     const prob = m.problem(t, hx);
     const sums = try rig.download(f32, outs[1]);
     defer gpa.free(sums);
@@ -529,7 +548,7 @@ fn promptDense(t: *Rig, rng: *rig.Rng, rows: usize, n: usize, k: usize) !void {
     }
 }
 
-test "a prompt's dense products at Flash Next's K write the bytes of the matrix tile" {
+test "a prompt's dense products at Flash Next's K write the bytes of the matrix tile, and of tf_cast's rounding in bf16" {
     const t = try Rig.open(1 << 20);
     defer t.close();
     if (t.on.affine.dense[0] == null) return error.SkipZigTest;

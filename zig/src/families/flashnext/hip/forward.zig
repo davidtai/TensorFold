@@ -89,10 +89,12 @@ pub fn hcPre(o: Ops, m: *const model.Model, hc: model.Hc, x: Tensor, rows: usize
         @intCast(d.streams),
         o.stream,
     );
-    const g = try o.project(act, hc.up, rows, true);
+    // g in the activation kind: the mix rounds it there first (the dense prompt tile writes it so, without a cast)
+    const g = try o.project(act, hc.up, rows, false);
     const mixed = try take(o, m.act, rows * d.hidden);
     try o.l.fn_hc_mix(
         @ptrFromInt(g.ptr),
+        @intCast(@backingInt(g.kind)),
         @ptrFromInt(x.ptr),
         @ptrFromInt(mixed.ptr),
         kind,

@@ -328,7 +328,7 @@ fn prefill(comptime op: Op) [7]Entry {
 }
 
 const project_prefill = [_]Entry{
-    entry(.project, .prefill, "dense", .{ .family = .gemm, .fits = &fitsPrefillDense, .launch = &launchDense, .caps = &matrixCores, .policy = &matrixOn }),
+    entry(.project, .prefill, "dense", .{ .family = .gemm, .fits = &fitsPrefillDense, .launch = &launchDense, .caps = &matrixCores, .policy = &matrixOn, .rounds = .always }),
 };
 
 pub const all = project_decode ++ routed_decode ++ other_decode ++ project_prefill ++ prefill(.project) ++ prefill(.routed);

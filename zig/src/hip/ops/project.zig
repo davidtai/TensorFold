@@ -236,7 +236,8 @@ pub fn affine(o: Ops, x: Tensor, w: Affine, m: usize, f32_out: bool) Error!Tenso
     const z = o.l;
     const shape = shapeOf(o, x, w, m);
     const tile = z.affine.choose(.project, if (o.prefill) .prefill else .decode, shape) orelse return error.BadShape;
-    half = !f32_out and !o.prefill and tile.roundsAct(shape);
+    // a prompt's tiles write fp32 and o.cast rounds it, except the dense tile, which rounds as the cast does
+    half = !f32_out and tile.roundsAct(shape);
     const out = try o.arena.take(m * n * @as(usize, if (half) 2 else 4));
     {
         const arg: affine_launch.Arg = .{

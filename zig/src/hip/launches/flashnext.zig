@@ -159,7 +159,8 @@ pub fn rmsWide(
 /// The block input: the mean over the streams of sigmoid(g) times the normed stream.
 pub fn hcMix(
     l: *const Launcher,
-    g: CF,
+    g: C,
+    gkind: c_int,
     x: C,
     mixed: P,
     kind: c_int,
@@ -169,7 +170,7 @@ pub fn hcMix(
     s: S,
 ) Error!void {
     var a: Args = .{};
-    inline for (.{ ad(g), ad(x), ad(mixed), kind, rows, streams, dims }) |v| try a.add(v);
+    inline for (.{ ad(g), gkind, ad(x), ad(mixed), kind, rows, streams, dims }) |v| try a.add(v);
     try l.flat(l.fnx.hc_mix, @as(i64, rows) * dims, s, &a);
 }
 
