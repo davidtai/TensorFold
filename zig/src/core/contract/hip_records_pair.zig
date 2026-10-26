@@ -19,6 +19,15 @@ fn pairTile(comptime rows: u32, comptime cb: u32) limits.HipLaunch {
 
 pub const records = [_]Record{
     .{
+        .launch = pairTile(1, 1),
+        .usage = .{
+            .{ .vgprs = 81, .sgprs = 62, .lds = 0, .private = 0, .bound = 128, .wave = 32 },
+            .{ .vgprs = 83, .sgprs = 61, .lds = 0, .private = 0, .bound = 128, .wave = 32 },
+            .{ .vgprs = 83, .sgprs = 61, .lds = 0, .private = 0, .bound = 128, .wave = 32 },
+            .{ .vgprs = 83, .sgprs = 61, .lds = 0, .private = 0, .bound = 128, .wave = 32 },
+        },
+    },
+    .{
         .launch = pairTile(1, 2),
         .usage = .{
             .{ .vgprs = 81, .sgprs = 62, .lds = 0, .private = 0, .bound = 128, .wave = 32 },
@@ -46,6 +55,15 @@ pub const records = [_]Record{
         },
     },
     .{
+        .launch = pairTile(2, 1),
+        .usage = .{
+            .{ .vgprs = 125, .sgprs = 68, .lds = 0, .private = 0, .bound = 128, .wave = 32 },
+            .{ .vgprs = 154, .sgprs = 69, .lds = 0, .private = 0, .bound = 128, .wave = 32 },
+            .{ .vgprs = 154, .sgprs = 69, .lds = 0, .private = 0, .bound = 128, .wave = 32 },
+            .{ .vgprs = 154, .sgprs = 68, .lds = 0, .private = 0, .bound = 128, .wave = 32 },
+        },
+    },
+    .{
         .launch = pairTile(2, 2),
         .usage = .{
             .{ .vgprs = 125, .sgprs = 68, .lds = 0, .private = 0, .bound = 128, .wave = 32 },
@@ -70,6 +88,15 @@ pub const records = [_]Record{
             .{ .vgprs = 161, .sgprs = 75, .lds = 0, .private = 0, .bound = 128, .wave = 32 },
             .{ .vgprs = 161, .sgprs = 75, .lds = 0, .private = 0, .bound = 128, .wave = 32 },
             .{ .vgprs = 161, .sgprs = 74, .lds = 0, .private = 0, .bound = 128, .wave = 32 },
+        },
+    },
+    .{
+        .launch = pairTile(4, 1),
+        .usage = .{
+            .{ .vgprs = 196, .sgprs = 76, .lds = 0, .private = 0, .bound = 128, .wave = 32 },
+            .{ .vgprs = 187, .sgprs = 77, .lds = 0, .private = 0, .bound = 128, .wave = 32 },
+            .{ .vgprs = 187, .sgprs = 77, .lds = 0, .private = 0, .bound = 128, .wave = 32 },
+            .{ .vgprs = 187, .sgprs = 76, .lds = 0, .private = 0, .bound = 128, .wave = 32 },
         },
     },
     .{
