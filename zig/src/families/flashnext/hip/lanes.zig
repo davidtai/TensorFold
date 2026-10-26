@@ -207,13 +207,14 @@ pub const Fx = struct {
         } };
     }
 
-    /// The window forwards of one stream (1 to 4 rows) and one head step, timed at load on slot 0's caches: the depth
-    /// rule then verifies a draft only where its row pays (Model.window_costs, mtp_step_ms, plain_guard).
+    /// The window forwards of one stream (1 row to the draft cap's window, at most 8) and one head step, timed at load
+    /// on slot 0's caches: the depth rule then verifies a draft only where its row pays (Model.window_costs,
+    /// mtp_step_ms, plain_guard). Widths past the cap are never verified, so they are not timed.
     pub fn measure(f: *Fx) !void {
         const e = f.e;
         var rig: Rig = .{ .f = f, .c = try e.lease(0) };
         defer e.unlease(rig.c);
-        try serve.costs.forwards(&rig, cache.max_window, 1, cache.max_window, &f.costs);
+        try serve.costs.forwards(&rig, @min(cache.max_window, f.drafts + 1), 1, cache.max_window, &f.costs);
         if (e.weights.model.mtp != null) f.costs.step_ms = try rig.step();
     }
 

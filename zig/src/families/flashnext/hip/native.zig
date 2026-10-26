@@ -22,6 +22,8 @@ pub const prefill_step: u32 = 0;
 /// gfx1151 with the MLX 4-bit MTP checkpoint (2026-10-25, a 17,755-token prompt): 8,192 rows against 2,048 gave
 /// prefill +11.3 % in a two-seed ABBA, the same tokens and logits at every step, 9.2 GiB more scratch on the device.
 pub const policy_prefill_step: u32 = 8192;
+/// Drafts a verify window holds at most past its pending token (`--mtp-drafts` above it is refused before the load).
+pub const max_drafts: u32 = lanes_mod.max_depth;
 /// Device bytes a rank keeps for the forward's scratch until the engine counts its own.
 pub const scratch_bytes: u64 = 2 << 30;
 
