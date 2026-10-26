@@ -1,6 +1,7 @@
 #pragma once
 
 #include "streams.hpp"
+#include "../ops/qk_rope_wave.hpp"
 
 // The sparse attention's indexer: pooled block keys, each row's block scores, and the blocks a row attends.
 
@@ -9,17 +10,12 @@ namespace {
 constexpr int kSelectThreads = 1024;
 constexpr int kSelectWaves = kSelectThreads / 32;
 
-// Block b: the mean of its ratio raw keys, RMS-normed with scale and rotated at its first position, as tf_qk_rope.
-extern "C" __global__ void __launch_bounds__(kFnThreads)
-tf_fn_idx_pool(const void* raw, void* pooled, const float* scale, int kind, int first, const int* pos, int dims,
-               int ratio, int rotary, float theta, float eps) {
-    __shared__ float scratch[kFnWaves];
-    __shared__ float normed[kFnThreads];
-    // With `pos`, launch x is a row whose completed block (if any) fills slot b; else block first + x fills slot x.
-    const int end = pos ? pos[blockIdx.x] + 1 : 0;
-    if (pos && end % ratio != 0) return;
-    const int b = pos ? end / ratio - 1 : first + blockIdx.x, d = threadIdx.x;
-    const long long slot = pos ? b : blockIdx.x;
+// Block b: the mean of its ratio raw keys, RMS-normed with scale and rotated at its first position, as tf_qk_rope,
+// into slot `slot` of pooled; a block of kFnThreads threads (scratch kFnWaves floats, normed kFnThreads).
+__device__ __forceinline__ void fn_idx_pool_block(const void* raw, void* pooled, const float* scale, int kind, int b,
+                                                  long long slot, int dims, int ratio, int rotary, float theta, float eps,
+                                                  float* scratch, float* normed) {
+    const int d = threadIdx.x;
     float x = 0.f;
     if (d < dims) {
         float m = 0.f;
@@ -40,6 +36,113 @@ tf_fn_idx_pool(const void* raw, void* pooled, const float* scale, int kind, int 
         y = d < half ? normed[f] * c - normed[f + half] * s : normed[f] * s + normed[f + half] * c;
     }
     store(pooled, kind, slot * dims + d, rounded(y, kind));
+}
+
+// Block b: the mean of its ratio raw keys, RMS-normed with scale and rotated at its first position, as tf_qk_rope.
+extern "C" __global__ void __launch_bounds__(kFnThreads)
+tf_fn_idx_pool(const void* raw, void* pooled, const float* scale, int kind, int first, const int* pos, int dims,
+               int ratio, int rotary, float theta, float eps) {
+    __shared__ float scratch[kFnWaves];
+    __shared__ float normed[kFnThreads];
+    // With `pos`, launch x is a row whose completed block (if any) fills slot b; else block first + x fills slot x.
+    const int end = pos ? pos[blockIdx.x] + 1 : 0;
+    if (pos && end % ratio != 0) return;
+    const int b = pos ? end / ratio - 1 : first + blockIdx.x;
+    fn_idx_pool_block(raw, pooled, scale, kind, b, pos ? b : blockIdx.x, dims, ratio, rotary, theta, eps, scratch, normed);
+}
+
+// A QSA layer's decode prep at device positions in one launch (a window's rows, one cache segment): q and the index q
+// RMS-normed and rotated into fp32 rows, k into the K cache (tf_qk_rope's waves, 8 a block, q and index q only where
+// `q.src` is set), then a last block that writes v into the V cache and the raw index key into its cache (tf_kv_write_at,
+// tf_copy_cols) and pools each row's completed block (tf_fn_idx_pool at pos): each output by its kernel's arithmetic.
+struct QsaRope {
+    const void* src;
+    long long s_row;
+    int s_head;
+    int heads;
+    int width;
+    const float* weight;
+    float* wide;   // fp32 rows (heads x width a row), or null
+    void* cache;   // the cache's heads of `total` slots of width, or null
+};
+struct QsaPrep {
+    QsaRope q, iq, k;
+    const void* v;          // the segment's v rows (k.heads x v_width)
+    void* v_cache;
+    int v_width;
+    const void* raw;        // the index projection rows; the raw key at raw_offset, rows raw_stride apart
+    long long raw_stride;
+    int raw_offset;
+    void* raw_cache;        // one head of `total` slots of raw_width
+    int raw_width;
+    void* pooled;
+    const float* pool_scale;
+    int ratio;
+    const int* pos;         // q and index q rows' positions (rows)
+    const int* seg_pos;     // the segment's rows' positions (n)
+    int rows;
+    int n;
+    int total;
+    int kind;
+    float eps;
+    int rotary;
+    float theta;
+};
+
+extern "C" __global__ void __launch_bounds__(kFnThreads) tf_fn_qsa_prep(QsaPrep a) {
+    const int tq = a.q.src ? a.rows * a.q.heads : 0;
+    const int tiq = a.q.src ? a.rows * a.iq.heads : 0;
+    const int tasks = tq + tiq + a.n * a.k.heads;
+    const int rope_blocks = (tasks + kFnWaves - 1) / kFnWaves;
+    if (static_cast<int>(blockIdx.x) < rope_blocks) {
+        __shared__ float row_v[kFnWaves][512];
+        const int wave = threadIdx.x >> 5;
+        const int g = blockIdx.x * kFnWaves + wave;
+        const bool live = g < tasks;
+        const int which = !live || g < tq ? 0 : g < tq + tiq ? 1 : 2;
+        const QsaRope& t = which == 0 ? a.q : which == 1 ? a.iq : a.k;
+        const int gi = !live ? 0 : which == 0 ? g : which == 1 ? g - tq : g - tq - tiq;
+        const int r = gi / t.heads, h = gi % t.heads;
+        qk_rope_norm(t.src, a.kind, r * t.s_row + static_cast<long long>(h) * t.s_head, t.weight, a.eps, t.width, live,
+                     row_v[wave]);
+        __syncthreads();
+        if (!live) return;
+        const int p = (which == 2 ? a.seg_pos : a.pos)[r];
+        qk_rope_put(a.kind, t.width, a.rotary, a.theta, p, row_v[wave],
+                    t.wide ? t.wide + static_cast<long long>(gi) * t.width : nullptr, t.cache,
+                    (static_cast<long long>(h) * a.total + p) * t.width);
+        return;
+    }
+    // the last block: v and the raw index key into their caches (16-bit or fp32 values copied), then the pools
+    const int first = a.seg_pos[0];
+    const long long nv = static_cast<long long>(a.n) * a.k.heads * a.v_width;
+    for (long long i = threadIdx.x; i < nv; i += kFnThreads) {
+        const int j = static_cast<int>(i % a.v_width);
+        const int h = static_cast<int>((i / a.v_width) % a.k.heads);
+        const int r = static_cast<int>(i / (static_cast<long long>(a.v_width) * a.k.heads));
+        const long long to = (static_cast<long long>(h) * a.total + first + r) * a.v_width + j;
+        if (a.kind == 0) static_cast<float*>(a.v_cache)[to] = static_cast<const float*>(a.v)[i];
+        else static_cast<uint16_t*>(a.v_cache)[to] = static_cast<const uint16_t*>(a.v)[i];
+    }
+    const long long nr = static_cast<long long>(a.n) * a.raw_width;
+    for (long long i = threadIdx.x; i < nr; i += kFnThreads) {
+        const long long r = i / a.raw_width;
+        const int c = static_cast<int>(i % a.raw_width);
+        const long long from = r * a.raw_stride + a.raw_offset + c;
+        const long long to = (first + r) * a.raw_width + c;
+        if (a.kind == 0) static_cast<float*>(a.raw_cache)[to] = static_cast<const float*>(a.raw)[from];
+        else static_cast<uint16_t*>(a.raw_cache)[to] = static_cast<const uint16_t*>(a.raw)[from];
+    }
+    __shared__ float scratch[kFnWaves];
+    __shared__ float normed[kFnThreads];
+    for (int r = 0; r < a.n; ++r) {
+        __syncthreads();
+        const int end = a.seg_pos[r] + 1;
+        if (end % a.ratio != 0) continue;
+        const int b = end / a.ratio - 1;
+        fn_idx_pool_block(a.raw_cache, a.pooled, a.pool_scale, a.kind, b, b, a.raw_width, a.ratio, a.rotary, a.theta,
+                          a.eps, scratch, normed);
+    }
 }
 
 // Wave w of block (x, y) scores block 8 x + w for rows 8 y ..: the sum over heads of relu(q . key) / sqrt(dims).

@@ -1,5 +1,6 @@
 //! Flash Next's launches: stream norms, gates and mixes, the n-gram gate, conv and hashes, indexer, sparse attention.
 
+const std = @import("std");
 const Launcher = @import("../launches.zig").Launcher;
 const Module = @import("../module.zig").Module;
 const Function = @import("../module.zig").Function;
@@ -29,6 +30,7 @@ pub const Fns = struct {
     ple_conv: Function,
     ngram_ids: Function,
     idx_pool: Function,
+    qsa_prep: Function,
     idx_scores: Function,
     idx_scores_quad: Function,
     idx_select: Function,
@@ -49,6 +51,7 @@ pub const Fns = struct {
             .ple_conv = try m.function("tf_fn_ple_conv"),
             .ngram_ids = try m.function("tf_fn_ngram_ids"),
             .idx_pool = try m.function("tf_fn_idx_pool"),
+            .qsa_prep = try m.function("tf_fn_qsa_prep"),
             .idx_scores = try m.function("tf_fn_idx_scores"),
             .idx_scores_quad = try m.function("tf_fn_idx_scores_quad"),
             .idx_select = try m.function("tf_fn_idx_select"),
@@ -346,6 +349,49 @@ pub fn idxPoolAt(
         eps,
     }) |v| try a.add(v);
     try l.go(l.fnx.idx_pool, dim(rows, 1, 1), dim(threads, 1, 1), 0, s, &a);
+}
+
+/// flashnext/indexer.hpp's QsaRope and QsaPrep: a QSA layer's decode prep at device positions in one launch.
+pub const QsaRope = extern struct { src: u64 = 0, s_row: c_longlong = 0, s_head: c_int = 0, heads: c_int = 0, width: c_int = 0, weight: u64 = 0, wide: u64 = 0, cache: u64 = 0 };
+pub const QsaPrep = extern struct {
+    q: QsaRope = .{},
+    iq: QsaRope = .{},
+    k: QsaRope,
+    v: u64,
+    v_cache: u64,
+    v_width: c_int,
+    raw: u64,
+    raw_stride: c_longlong,
+    raw_offset: c_int,
+    raw_cache: u64,
+    raw_width: c_int,
+    pooled: u64,
+    pool_scale: u64,
+    ratio: c_int,
+    pos: u64,
+    seg_pos: u64,
+    rows: c_int,
+    n: c_int,
+    total: c_int,
+    kind: c_int,
+    eps: f32,
+    rotary: c_int,
+    theta: f32,
+};
+
+comptime {
+    std.debug.assert(@sizeOf(QsaRope) == 56 and @sizeOf(QsaPrep) == 304);
+}
+
+/// tf_fn_qsa_prep: q and the index q (where `q.src` is set) and k as tf_qk_rope, v and the raw index key into their
+/// caches as tf_kv_write_at, and each row's completed block pooled as tf_fn_idx_pool at pos, in one launch.
+pub fn qsaPrep(l: *const Launcher, a: QsaPrep, s: S) Error!void {
+    if (a.n < 1 or a.k.width > 512 or a.q.width > 512 or a.iq.width > 512 or a.raw_width > threads or a.kind == 0) return util.invalid("qsaPrep");
+    const qt: c_int = if (a.q.src != 0) a.rows * (a.q.heads + a.iq.heads) else 0;
+    const tasks: c_int = qt + a.n * a.k.heads;
+    var args: Args = .{};
+    try args.add(a);
+    try l.go(l.fnx.qsa_prep, dim(cdiv(tasks, threads / 32) + 1, 1, 1), dim(threads, 1, 1), 0, s, &args);
 }
 
 /// Every row's score of each of `blocks` pooled blocks it has complete, for rows past `top` complete blocks.

@@ -266,7 +266,10 @@ pub fn sparse(
     }
     const qg, const keys, const values, const idx = outs;
     const q32 = try o.arena.of(f32, rows * d.heads * hd);
-    try o.qkRope(
+    const iq = try o.arena.of(f32, rows * d.index_heads * di);
+    const graphed = o.window and staged != null;
+    // at device positions the first segment's prep launch also takes q and the index q (tf_fn_qsa_prep)
+    if (!graphed) try o.qkRope(
         qg,
         d.heads * 2 * hd,
         2 * hd,
@@ -282,9 +285,7 @@ pub fn sparse(
         null,
         0,
     );
-    const iq = try o.arena.of(f32, rows * d.index_heads * di);
-    try o.qkRope(idx, width, di, s.iq_norm, d.eps, rows, d.index_heads, di, d.rotary, d.theta, dev_pos, iq, null, 0);
-    const graphed = o.window and staged != null;
+    if (!graphed) try o.qkRope(idx, width, di, s.iq_norm, d.eps, rows, d.index_heads, di, d.rotary, d.theta, dev_pos, iq, null, 0);
     // numerics=inexact, on the matrix cores: a prompt's rows attend in one pass, a few rows in parts; both write the
     // gated rows. numerics=exact: every row in parts on tf_fn_sparse_parts, then tf_attn_gate (3d219d21's bits)
     const path = attention(o.inexact(), promptFits(m, d), graphed, rows);
@@ -299,7 +300,36 @@ pub fn sparse(
         const cap = g.c.layout.cap;
         const pos = g.pos;
         const at_pos = dev_pos + off * 4;
-        try o.qkRope(
+        if (graphed) {
+            // q and the index q (the first segment's launch), k, v, the raw index key and the pools in one launch
+            const first = off == 0;
+            const rope = hip.launches.flashnext.QsaRope;
+            try o.l.fn_qsa_prep(.{
+                .q = if (first) rope{ .src = qg.ptr, .s_row = @intCast(d.heads * 2 * hd), .s_head = @intCast(2 * hd), .heads = @intCast(d.heads), .width = @intCast(hd), .weight = s.q_norm, .wide = q32 } else .{},
+                .iq = if (first) rope{ .src = idx.ptr, .s_row = @intCast(width), .s_head = @intCast(di), .heads = @intCast(d.index_heads), .width = @intCast(di), .weight = s.iq_norm, .wide = iq } else .{},
+                .k = .{ .src = forward.at(keys, off * d.kv_heads * hd).ptr, .s_row = @intCast(d.kv_heads * hd), .s_head = @intCast(hd), .heads = @intCast(d.kv_heads), .width = @intCast(hd), .weight = s.k_norm, .cache = kv.k },
+                .v = forward.at(values, off * d.kv_heads * hd).ptr,
+                .v_cache = kv.v,
+                .v_width = @intCast(hd),
+                .raw = forward.at(idx, off * width).ptr,
+                .raw_stride = @intCast(width),
+                .raw_offset = @intCast(d.index_heads * di),
+                .raw_cache = kv.raw,
+                .raw_width = @intCast(di),
+                .pooled = kv.pooled,
+                .pool_scale = s.ik_norm,
+                .ratio = @intCast(d.index_ratio),
+                .pos = dev_pos,
+                .seg_pos = at_pos,
+                .rows = @intCast(rows),
+                .n = @intCast(n),
+                .total = @intCast(cap),
+                .kind = kind,
+                .eps = d.eps,
+                .rotary = @intCast(d.rotary),
+                .theta = d.theta,
+            }, o.stream);
+        } else try o.qkRope(
             forward.at(keys, off * d.kv_heads * hd),
             d.kv_heads * hd,
             hd,
@@ -315,26 +345,7 @@ pub fn sparse(
             kv.k,
             cap,
         );
-        if (graphed) {
-            try o.kvWriteAt(forward.at(values, off * d.kv_heads * hd), kv.v, n, d.kv_heads, hd, cap, at_pos);
-            const raw = try take(o, m.act, n * di);
-            try o.copyCols(forward.at(idx, off * width), width, d.index_heads * di, raw.ptr, n, di);
-            try o.kvWriteAt(raw, kv.raw, n, 1, di, cap, at_pos);
-            try o.l.fn_idx_pool_at(
-                @ptrFromInt(kv.raw),
-                @ptrFromInt(kv.pooled),
-                @ptrFromInt(s.ik_norm),
-                kind,
-                @ptrFromInt(at_pos),
-                @intCast(n),
-                @intCast(di),
-                @intCast(d.index_ratio),
-                @intCast(d.rotary),
-                d.theta,
-                d.eps,
-                o.stream,
-            );
-        } else {
+        if (!graphed) {
             try o.kvWrite(forward.at(values, off * d.kv_heads * hd), kv.v, n, d.kv_heads, hd, cap, pos);
             try o.copyCols(
                 forward.at(idx, off * width),

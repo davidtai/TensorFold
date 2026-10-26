@@ -570,6 +570,15 @@ const own_records = [_]Record{
         },
     },
     .{
+        .launch = .{ .name = "Flash Next QSA decode prep", .symbol = "tf_fn_qsa_prep", .image = "flashnext", .threads = 256 },
+        .usage = .{
+            .{ .vgprs = 64, .sgprs = 64, .lds = 16416, .private = 0, .bound = 256, .wave = 32 },
+            .{ .vgprs = 64, .sgprs = 64, .lds = 16416, .private = 0, .bound = 256, .wave = 32 },
+            .{ .vgprs = 64, .sgprs = 64, .lds = 16416, .private = 0, .bound = 256, .wave = 32 },
+            .{ .vgprs = 64, .sgprs = 64, .lds = 16416, .private = 0, .bound = 256, .wave = 32 },
+        },
+    },
+    .{
         .launch = .{ .name = "Flash Next prompt sparse attention tile", .symbol = "tf_fn_sparse_prompt", .image = "flashnext", .threads = 128, .served = limits.gfx11_only },
         .usage = .{
             .{ .vgprs = 0, .sgprs = 0, .lds = 0, .private = 0, .bound = 128, .wave = 32 },
