@@ -272,8 +272,8 @@ __device__ __forceinline__ void gated_delta_replay_body(const int* keep, int row
                                      value_heads, dv, nullptr, 0);
 }
 
-// A prompt's recurrence for DK = DV = 128: a block a value head, 8 waves of 16 Dv rows, 4 lanes a row and 2 rows a
-// lane. tf_gated_delta's wave a row holds Dk lane + 32 i in lane `lane`; here lane p of a row's 4 holds those of its
+// A prompt's recurrence for DK = DV = 128: WAVES waves of 16 Dv rows a block (128 / (16 WAVES) blocks a value head),
+// 4 lanes a row and 2 rows a lane. tf_gated_delta's wave a row holds Dk lane + 32 i in lane `lane`; here lane p of a row's 4 holds those of its
 // virtual lanes p + 4 j (j = 0-7), Dk p + 4 m with m = j + 8 i. A virtual lane's products add in its order (i = 0-3),
 // the butterfly's xor 16, 8 and 4 pair virtual lanes inside a lane (the same pairs, in registers) and xor 2 and 1 cross
 // lanes: every sum is lane0_sum's, the state, rows and their order the same bits. k and q of 16 steps stage in shared
@@ -291,21 +291,23 @@ __device__ __forceinline__ float quad_sum(const float (&part)[8]) {
     return c;
 }
 
+template <int WAVES>
 __device__ __forceinline__ void
 gated_delta_prompt_body(const float* __restrict__ q, const float* __restrict__ k, const float* __restrict__ v,
                         const float* __restrict__ gate, const float* __restrict__ beta, float* __restrict__ state,
                         float* __restrict__ y, int length, int key_heads, int value_heads) {
-    constexpr int DK = 128, DV = 128, T = kPromptSteps;
+    constexpr int DK = 128, DV = 128, T = kPromptSteps, THREADS = 32 * WAVES, ROWS = 16 * WAVES;
     const int lane = threadIdx.x, wave = threadIdx.y;
     const int tid = wave * 32 + lane;
     const int p = lane & 3;
-    const int row0 = wave * 16 + 2 * (lane >> 2);  // this lane's rows: row0, row0 + 1
+    const int first = blockIdx.x * ROWS;  // the block's first Dv row
+    const int row0 = first + wave * 16 + 2 * (lane >> 2);  // this lane's rows: row0, row0 + 1
     const int head = blockIdx.y, batch = blockIdx.z;
     const int key_head = head / (value_heads / key_heads);
 
     __shared__ __attribute__((aligned(16))) float ks[T][DK];  // transposed: [t][p * 32 + m] = k[t][p + 4 m]
     __shared__ __attribute__((aligned(16))) float qs[T][DK];
-    __shared__ float vs[T][DV];
+    __shared__ float vs[T][ROWS];
     __shared__ float gs[T];
     __shared__ float bs[T];
 
@@ -318,18 +320,18 @@ gated_delta_prompt_body(const float* __restrict__ q, const float* __restrict__ k
 
     for (int t0 = 0; t0 < length; t0 += T) {
         const int n = min(T, length - t0);
-        for (int i = tid; i < n * DK; i += 256) {
+        for (int i = tid; i < n * DK; i += THREADS) {
             const int step = i / DK, e = i - step * DK;
             const size_t at = ((static_cast<size_t>(batch) * length + (t0 + step)) * key_heads + key_head) * DK + e;
             const int to = (e & 3) * 32 + (e >> 2);
             ks[step][to] = k[at];
             qs[step][to] = q[at];
         }
-        for (int i = tid; i < n * DV; i += 256) {
-            const int step = i / DV, e = i - step * DV;
-            vs[step][e] = v[((static_cast<size_t>(batch) * length + (t0 + step)) * value_heads + head) * DV + e];
+        for (int i = tid; i < n * ROWS; i += THREADS) {
+            const int step = i / ROWS, e = i - step * ROWS;
+            vs[step][e] = v[((static_cast<size_t>(batch) * length + (t0 + step)) * value_heads + head) * DV + first + e];
         }
-        for (int i = tid; i < n; i += 256) {
+        for (int i = tid; i < n; i += THREADS) {
             const size_t at = (static_cast<size_t>(batch) * length + (t0 + i)) * value_heads + head;
             gs[i] = gate[at];
             bs[i] = beta[at];
@@ -361,7 +363,7 @@ gated_delta_prompt_body(const float* __restrict__ q, const float* __restrict__ k
                         part[j] = part[j] + s[r][m] * kv[m];
                     }
                 }
-                const float delta = (vs[tt][row0 + r] - quad_sum(part)) * step_beta;
+                const float delta = (vs[tt][row0 - first + r] - quad_sum(part)) * step_beta;
 #pragma unroll
                 for (int j = 0; j < 8; ++j) part[j] = 0.f;
 #pragma unroll
@@ -436,5 +438,12 @@ template __global__ void tf::rocm::gated_delta_kernel<16>(const float* __restric
 extern "C" __global__ void __launch_bounds__(256)
 tf_gdn_prompt_128(const float* q, const float* k, const float* v, const float* gate, const float* beta, float* state,
                   float* y, int length, int key_heads, int value_heads) {
-    tf::rocm::gated_delta_prompt_body(q, k, v, gate, beta, state, y, length, key_heads, value_heads);
+    tf::rocm::gated_delta_prompt_body<8>(q, k, v, gate, beta, state, y, length, key_heads, value_heads);
+}
+
+// Half a value head a block (4 waves, 64 rows): twice the blocks, a more even spread over the WGPs.
+extern "C" __global__ void __launch_bounds__(128)
+tf_gdn_prompt_128_half(const float* q, const float* k, const float* v, const float* gate, const float* beta,
+                       float* state, float* y, int length, int key_heads, int value_heads) {
+    tf::rocm::gated_delta_prompt_body<4>(q, k, v, gate, beta, state, y, length, key_heads, value_heads);
 }

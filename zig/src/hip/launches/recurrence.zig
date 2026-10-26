@@ -30,6 +30,8 @@ pub fn tf_gdn_gate(l: *const Launcher, av: C, bv: C, kind: c_int, a_log: CF, dt_
 
 /// Rows from which a prompt's recurrence takes tf_gdn_prompt_128 (fewer: a wave a row reads the state faster).
 pub const prompt_rows = 64;
+/// Half a value head a block (96 blocks for Flash Next's 48 value heads) rather than a value head a block (48).
+const prompt_half = true;
 
 /// `from`: a device i32 naming the snapshot row (of `states`) a lone stream's window starts from, -1 for `state`; 0: none.
 pub fn tf_gated_delta(l: *const Launcher, q: CF, k: CF, v: CF, gate: CF, beta: CF, state: F, y: F, batch: c_int, length: c_int, key_heads: c_int, value_heads: c_int, dk: c_int, dv: c_int, s: S, states: F, from: u64) Error!void {
@@ -64,7 +66,8 @@ pub fn tf_gated_delta(l: *const Launcher, q: CF, k: CF, v: CF, gate: CF, beta: C
         try b.add(length);
         try b.add(key_heads);
         try b.add(value_heads);
-        return l.go(l.gdn_prompt, dim(1, value_heads, batch), dim(32, 8, 1), 0, s, &b);
+        const half = prompt_half;
+        return l.go(l.gdn_prompt[@intFromBool(half)], dim(if (half) 2 else 1, value_heads, batch), dim(32, if (half) 4 else 8, 1), 0, s, &b);
     }
     const wide: usize = if (dk == 128) 0 else 1;
     // Eight rows share one k/q tile; a short dv stays on the one-row wave, which is the same scan.
