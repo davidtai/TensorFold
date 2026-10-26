@@ -347,6 +347,11 @@ using Dot = DotF16;
     template __global__ void affine_dot2_stream<Dot, BITS, R, CB, true>(Affine, StreamSides, int, int);  \
     template __global__ void affine_dot2_stream_relu2<Dot, BITS, R, CB>(Affine, StreamSides, int, int);      \
     template __global__ void affine_dot2_stream_relu2_pair<Dot, BITS, R, CB>(Affine, Affine, int, int, int);
+// one column a lane (narrow launches): no pair specialization, its gate and up columns need two
+#define TF_STREAM1(BITS, R)                                                                          \
+    template __global__ void affine_dot2_stream<Dot, BITS, R, 1, false>(Affine, StreamSides, int, int); \
+    template __global__ void affine_dot2_stream_relu2<Dot, BITS, R, 1>(Affine, StreamSides, int, int);   \
+    template __global__ void affine_dot2_stream_relu2_pair<Dot, BITS, R, 1>(Affine, Affine, int, int, int);
 #if TF_MATRIX
 #define TF_WMMA(BITS) template __global__ void affine_wmma_gemm<BITS>(Affine);
 template __global__ void affine_wmma_moe_gu<4>(Affine, float);
@@ -365,6 +370,7 @@ template __global__ void affine_wmma_moe_down<4>(Affine);
     template __global__ void affine_dot2_row<Dot, BITS, 2>(Affine, int);                     \
     template __global__ void affine_dot2_row<Dot, BITS, 4>(Affine, int);                     \
     TF_LANES(BITS, 1) TF_LANES(BITS, 2) TF_LANES(BITS, 4) TF_LANES(BITS, kLaneRows)          \
+    TF_STREAM1(BITS, 1) TF_STREAM1(BITS, 2) TF_STREAM1(BITS, 4)                              \
     TF_STREAM(BITS, 1, 2) TF_STREAM(BITS, 1, 4) TF_STREAM(BITS, 1, 8)                        \
     TF_STREAM(BITS, 2, 2) TF_STREAM(BITS, 2, 4) TF_STREAM(BITS, 2, 8)                        \
     TF_STREAM(BITS, 4, 2) TF_STREAM(BITS, 4, 4)                                               \
