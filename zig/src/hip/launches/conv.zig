@@ -97,3 +97,17 @@ pub fn tf_conv_prefill(l: *const Launcher, x: C, kind: c_int, weight: CF, state:
     if (kernel > 8) return invalid("conv_prefill");
     try l.go(l.op.conv_prefill, dim(cdiv(channels, 256), @max(1, cdiv(len, 16)), 1), dim(256, 1, 1), 0, s, &a);
 }
+
+/// A DeltaNet layer's prompt prework in one launch (linear.hpp tf_gdn_prompt_prep): the conv of `len` rows of x
+/// (channels 2 kwidth + vwidth), q and k RMS-normed a 128-channel head (weights qw, kw_w), v, the conv's new state, and
+/// gate and beta from a and b (`heads` a row). The values of tf_conv_prefill, two column copies, two tf_rms and
+/// tf_gdn_gate_prefill.
+pub fn tf_gdn_prompt_prep(l: *const Launcher, x: C, kind: c_int, weight: CF, state: CF, new_state: F, q: F, k: F, v: F, qw: CF, kw_w: CF, eps: f32, len: c_int, kwidth: c_int, vwidth: c_int, kernel: c_int, a: C, b: C, a_log: CF, dt_bias: CF, gate: F, beta: F, heads: c_int, s: S) Error!void {
+    if (kernel < 1 or kernel > 8 or @rem(kwidth, 128) != 0 or len < 1) return invalid("gdn prompt prep");
+    var args: Args = .{};
+    inline for (.{ ad(x), kind, ad(weight), ad(state), ad(new_state), ad(q), ad(k), ad(v), ad(qw), ad(kw_w), eps, len, kwidth, vwidth, kernel, ad(a), ad(b), ad(a_log), ad(dt_bias), ad(gate), ad(beta), heads }) |val| try args.add(val);
+    const segs = cdiv(len, 16);
+    const qk_heads = @divExact(2 * kwidth, 128);
+    const blocks = cdiv(qk_heads * segs, 8) + cdiv(vwidth, 256) * segs + cdiv(len * heads, 256) + cdiv((kernel - 1) * (2 * kwidth + vwidth), 256);
+    try l.go(l.op.gdn_prompt_prep, dim(blocks, 1, 1), dim(256, 1, 1), 0, s, &args);
+}
