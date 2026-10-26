@@ -95,6 +95,9 @@ pub const stream_rows = [_]u8{ 1, 2, 4 }; // its row counts: columns * rows <= 1
 pub const stream_waves = 4; // kStreamWaves
 pub const streams_wanted = 3000; // kStreamWavesWanted
 pub const stream_code_words = 32; // kStreamCodeWords
+/// A SwiGLU pair's lane carries at most this many code words (at least 2 columns): on gfx1151 the 4-bit routed gate+up
+/// at 2 columns beats 4 and 8 at 1 to 8 rows (more waves in flight; the column's sums are the same)
+pub const stream_pair_code_words = 8;
 
 /// The K-parallel tiles of a short prompt: cb columns a lane set, r rows a pass over up to rb row blocks.
 pub const KpTile = struct { cb: c_int, r: c_int, waves: c_int, rb: c_int, loop: bool = true };
@@ -365,6 +368,7 @@ pub const Kernels = struct {
             c -= 1;
             // one column a lane is the plain product's only (a pair's gate and up need two; relu^2 keeps its tiles)
             if (stream_cbs[c] * stream_rows[ri] > 16 or stream_cbs[c] * a.bits > stream_code_words or (stream_cbs[c] < 2 and (pair_div == 2 or relu2))) continue;
+            if (pair_div == 2 and stream_cbs[c] > 2 and stream_cbs[c] * a.bits > stream_pair_code_words) continue;
             pick = c;
             const per_block: c_int = stream_waves * (@as(c_int, 32) >> lpc_log2) * @divExact(stream_cbs[c], pair_div);
             if (@as(u64, cdiv(total_n, per_block)) * stream_waves * @as(u64, @intCast(items)) * cdiv(a.m, stream_rows[ri]) >= streams_wanted) break;
