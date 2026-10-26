@@ -54,7 +54,7 @@ pub const StreamSides = extern struct {
     out_half: c_int = 0,
     pair_cols: c_int = 0,
     limit: f32 = 0,
-    /// > 1: the launch's row blocks next to each other on the grid's x, column block-major (stream.hpp stream_tile)
+    /// > 1: the launch's row blocks are the grid's x and its column blocks its y (stream.hpp stream_tile)
     row_blocks: c_int = 0,
 };
 
@@ -379,8 +379,10 @@ pub const Kernels = struct {
             }
             sides.first[@intCast(sides.count)] = @intCast(blocks);
         }
-        // rows past the tile's are row blocks next to each other on x: a column block's passes read its codes once
-        sides.row_blocks = @intCast(cdiv(a.m, stream_rows[ri]));
+        // rows past the tile's: the row blocks on x and the column blocks on y, so a column block's passes are
+        // dispatched together and read its codes once from DRAM (y holds at most 65,535 blocks, else rows stay on y)
+        const row_blocks = cdiv(a.m, stream_rows[ri]);
+        sides.row_blocks = if (row_blocks > 1 and blocks <= 65535) @intCast(row_blocks) else 0;
         var args: hl.Args = .{};
         try args.add(a);
         try args.add(sides);
@@ -392,7 +394,11 @@ pub const Kernels = struct {
         }));
         const table = if (sides.pair_cols > 0) &k.pairs else if (relu2) &k.relu2 else &k.stream;
         const f = table[b][ri][pick].?;
-        try go(r, f, .{ .x = blocks * @as(c_uint, @intCast(sides.row_blocks)), .z = @intCast(items) }, .{ .x = 32 * stream_waves }, s, &args);
+        const grid: hl.Dim3 = if (sides.row_blocks > 1)
+            .{ .x = row_blocks, .y = blocks, .z = @intCast(items) }
+        else
+            .{ .x = blocks, .y = row_blocks, .z = @intCast(items) };
+        try go(r, f, grid, .{ .x = 32 * stream_waves }, s, &args);
     }
 
     /// One row on the row tile: a lane owns a group, a wave reads a column's row in one run.

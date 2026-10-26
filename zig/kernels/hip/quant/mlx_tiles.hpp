@@ -80,7 +80,7 @@ struct StreamSides {
     int out_half;
     int pair_cols;  // > 0: the (gate | up) rows of a stacked product with this many columns each, out is its activation
     float limit;    // the activation's clamp when above 0
-    int row_blocks;  // > 1: the launch's row blocks sit next to each other on the grid's x (column block-major)
+    int row_blocks;  // > 1: the launch's row blocks are the grid's x and its column blocks its y
 };
 
 // Item z of the plan (or the plain product, or a group's side) at CB columns a lane, R rows; PAIR fuses the activation.

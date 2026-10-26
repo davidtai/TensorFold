@@ -258,13 +258,12 @@ __device__ inline void stream_body(const typename Dec::Args& a, int lpc_log2, in
 // Item z of the plan (or plain product, or a group's side) at CB columns a lane, R rows; chunk group is q >> gshift.
 template <class Dec, class Act, class T, class Epi, int R, int CB, class Sides>
 __device__ inline void stream_tile(typename Dec::Args& a, const Sides& sides, int lpc_log2, int gshift) {
-    // More rows than the tile's are row blocks: on the grid's y, or (row_blocks > 1) next to each other on x, so a
-    // column block's row blocks run together and the second reads its codes from cache, not DRAM.
-    // Both stay wave-uniform (readfirstlane): a block index the compiler cannot prove uniform puts every row's
-    // addresses in vector registers.
-    const int ny = sides.row_blocks > 1 ? sides.row_blocks : 1;
-    int bx = __builtin_amdgcn_readfirstlane(ny > 1 ? static_cast<int>(blockIdx.x) / ny : static_cast<int>(blockIdx.x));
-    const int by = __builtin_amdgcn_readfirstlane(ny > 1 ? static_cast<int>(blockIdx.x) % ny : static_cast<int>(blockIdx.y));
+    // More rows than the tile's are row blocks: on the grid's y, or (row_blocks > 1) on the grid's x with the column
+    // blocks on y, so a column block's row blocks are dispatched together and the second reads its codes from cache,
+    // not DRAM. Both indexes are grid builtins: a divided block index cost up to 2x the VGPRs (gfx1151 2x2 71 -> 154).
+    const bool rows_on_x = sides.row_blocks > 1;
+    int bx = rows_on_x ? static_cast<int>(blockIdx.y) : static_cast<int>(blockIdx.x);
+    const int by = rows_on_x ? static_cast<int>(blockIdx.x) : static_cast<int>(blockIdx.y);
     if (sides.count > 0) {
         int s = 0;
         while (s + 1 < sides.count && bx >= sides.first[s + 1]) ++s;
