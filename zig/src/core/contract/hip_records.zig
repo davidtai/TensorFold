@@ -633,6 +633,15 @@ const own_records = [_]Record{
         },
     },
     .{
+        .launch = .{ .name = "Flash Next prompt sparse attention tile, p in bf16 once", .symbol = "tf_fn_sparse_prompt_hi", .image = "flashnext", .threads = 128, .served = limits.gfx11_only },
+        .usage = .{
+            .{ .vgprs = 0, .sgprs = 0, .lds = 0, .private = 0, .bound = 128, .wave = 32 },
+            .{ .vgprs = 251, .sgprs = 42, .lds = 31424, .private = 0, .bound = 128, .wave = 32 },
+            .{ .vgprs = 251, .sgprs = 31, .lds = 31424, .private = 0, .bound = 128, .wave = 32 },
+            .{ .vgprs = 0, .sgprs = 0, .lds = 0, .private = 0, .bound = 128, .wave = 32 },
+        },
+    },
+    .{
         .launch = .{ .name = "Flash Next prompt sparse attention tile, split", .symbol = "tf_fn_sparse_prompt_split", .image = "flashnext", .threads = 128, .served = limits.gfx11_only },
         .usage = .{
             .{ .vgprs = 0, .sgprs = 0, .lds = 0, .private = 0, .bound = 128, .wave = 32 },

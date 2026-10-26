@@ -571,6 +571,8 @@ fn attendPrompt(
         @intCast(cap),
         scale,
         true,
+        // the tile runs under numerics=inexact only (attention()): p in bf16 once
+        false,
         o.stream,
     );
 }

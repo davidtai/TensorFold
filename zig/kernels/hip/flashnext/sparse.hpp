@@ -154,7 +154,8 @@ __device__ __forceinline__ uint32_t prompt_pack(uint16_t lo, uint16_t hi) {
 
 // PARTS: block (r, g, p) takes part p of gridDim.z of the row's keys (lo = p n / parts, as tf_fn_sparse_parts) and
 // writes its unnormalized o, running max and sum in tf_fn_sparse_parts' layout for tf_fn_sparse_merge(_gate).
-template <bool SPLIT, bool PARTS>
+// LO: p v also over p's bf16 rounding remainder (p = hi + lo, near fp32's p v); off: p in bf16 once (inexact).
+template <bool SPLIT, bool PARTS, bool LO = true>
 __device__ void sparse_prompt(const float* __restrict__ q, const uint16_t* __restrict__ k,
                               const uint16_t* __restrict__ v, const int* __restrict__ ids, long long id_stride,
                               const int* __restrict__ count, const int* __restrict__ sparse, const uint16_t* qg,
@@ -304,7 +305,7 @@ __device__ void sparse_prompt(const float* __restrict__ q, const uint16_t* __res
                 const float p0 = pr[2 * i], p1 = pr[2 * i + 1];
                 const uint16_t h0 = float_to_bf16(p0), h1 = float_to_bf16(p1);
                 hw[i] = prompt_pack(h0, h1);
-                lw[i] = prompt_pack(float_to_bf16(p0 - bf16_to_float(h0)), float_to_bf16(p1 - bf16_to_float(h1)));
+                if constexpr (LO) lw[i] = prompt_pack(float_to_bf16(p0 - bf16_to_float(h0)), float_to_bf16(p1 - bf16_to_float(h1)));
             }
             const bf16x16 ph = __builtin_bit_cast(bf16x16, hw), pl = __builtin_bit_cast(bf16x16, lw);
 #pragma unroll
@@ -314,7 +315,7 @@ __device__ void sparse_prompt(const float* __restrict__ q, const uint16_t* __res
                 const u32x8 w = {lo.x, lo.y, lo.z, lo.w, hi.x, hi.y, hi.z, hi.w};
                 const bf16x16 b = __builtin_bit_cast(bf16x16, w);
                 acc[j] = Mma::mma(ph, b, acc[j]);
-                acc[j] = Mma::mma(pl, b, acc[j]);
+                if constexpr (LO) acc[j] = Mma::mma(pl, b, acc[j]);
             }
         }
         // no barrier: part and vt are rewritten before the next first barrier only by their own wave, p and alpha
@@ -359,6 +360,14 @@ tf_fn_sparse_prompt(const float* q, const void* k, const void* v, const int* ids
                     const int* count, const int* sparse, const void* qg, void* out, long long cap, float scale) {
     sparse_prompt<false, false>(q, static_cast<const uint16_t*>(k), static_cast<const uint16_t*>(v), ids, id_stride,
                                 count, sparse, static_cast<const uint16_t*>(qg), out, nullptr, cap, scale);
+}
+
+// The same with p in bf16 once (no lo pass over its rounding remainder): numerics=inexact's prompt tile.
+extern "C" __global__ void __launch_bounds__(kPromptThreads)
+tf_fn_sparse_prompt_hi(const float* q, const void* k, const void* v, const int* ids, long long id_stride,
+                       const int* count, const int* sparse, const void* qg, void* out, long long cap, float scale) {
+    sparse_prompt<false, false, false>(q, static_cast<const uint16_t*>(k), static_cast<const uint16_t*>(v), ids, id_stride,
+                                       count, sparse, static_cast<const uint16_t*>(qg), out, nullptr, cap, scale);
 }
 
 // The same over an fp32 q that need not be bf16-exact: q as bf16 hi + lo.

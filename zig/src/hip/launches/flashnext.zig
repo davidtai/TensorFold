@@ -39,7 +39,7 @@ pub const Fns = struct {
     idx_select: Function,
     sparse_parts: [2]Function, // groups of up to 6 and up to 12 query heads
     sparse_merge: Function,
-    sparse_prompt: [2]Function, // q bf16-exact, q any fp32 (hi + lo)
+    sparse_prompt: [3]Function, // q bf16-exact, q any fp32 (hi + lo), q bf16-exact with p in bf16 once
     sparse_tile_parts: [2]Function, // the same tile over parts of each row's keys
     sparse_merge_gate: Function,
 
@@ -63,7 +63,7 @@ pub const Fns = struct {
             .idx_select = try m.function("tf_fn_idx_select"),
             .sparse_parts = .{ try m.function("tf_fn_sparse_parts6"), try m.function("tf_fn_sparse_parts12") },
             .sparse_merge = try m.function("tf_fn_sparse_merge"),
-            .sparse_prompt = .{ try m.function("tf_fn_sparse_prompt"), try m.function("tf_fn_sparse_prompt_split") },
+            .sparse_prompt = .{ try m.function("tf_fn_sparse_prompt"), try m.function("tf_fn_sparse_prompt_split"), try m.function("tf_fn_sparse_prompt_hi") },
             .sparse_tile_parts = .{ try m.function("tf_fn_sparse_tile_parts"), try m.function("tf_fn_sparse_tile_parts_split") },
             .sparse_merge_gate = try m.function("tf_fn_sparse_merge_gate"),
         };
@@ -580,7 +580,8 @@ pub fn promptOnMatrix() bool {
 
 /// A prompt's attention of each row's 12 heads a kv head over its listed keys (or its first count[r] keys) in one pass
 /// on the matrix cores; with `qg` the gated bf16 rows (tf_attn_gate's), else fp32 (rows, 24, 256). `exact_q`: q holds
-/// bf16 values and `scale` is a power of two (one product), else q is carried as bf16 hi + lo.
+/// bf16 values and `scale` is a power of two (one product), else q is carried as bf16 hi + lo. `p_lo`: p v also over
+/// p's bf16 remainder (near fp32's p v); off (exact_q only): p in bf16 once, a third fewer matrix products.
 pub fn sparsePrompt(
     l: *const Launcher,
     q: CF,
@@ -596,14 +597,15 @@ pub fn sparsePrompt(
     cap: i64,
     scale: f32,
     exact_q: bool,
+    p_lo: bool,
     s: S,
 ) Error!void {
-    if (!promptOnMatrix()) return util.invalid("sparsePrompt");
+    if (!promptOnMatrix() or (!p_lo and !exact_q)) return util.invalid("sparsePrompt");
     if (rows == 0) return;
     var a: Args = .{};
     inline for (.{ ad(q), ad(k), ad(v), ad(ids), id_stride, ad(count), ad(sparse), ad(qg), ad(out), cap, scale }) |x|
         try a.add(x);
-    const f = l.fnx.sparse_prompt[if (exact_q) 0 else 1];
+    const f = l.fnx.sparse_prompt[if (!p_lo) 2 else if (exact_q) 0 else 1];
     try l.go(f, dim(rows, prompt_kv_heads, 1), dim(128, 1, 1), 0, s, &a);
 }
 

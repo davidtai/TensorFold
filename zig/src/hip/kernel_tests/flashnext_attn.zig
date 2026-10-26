@@ -476,11 +476,19 @@ test "prompt attention on matrix cores: listed, dense and short rows near fp64's
     const t = try Rig.open(1 << 22);
     defer t.close();
     // q exact in bf16 (the model's: one product), then any fp32 q (hi + lo)
-    try promptCase(t, true);
-    try promptCase(t, false);
+    try promptCase(t, true, true);
+    try promptCase(t, false, true);
 }
 
-fn promptCase(t: *Rig, comptime exact: bool) !void {
+test "prompt attention with p in bf16 once (numerics=inexact): listed, dense and short rows within 4e-3 of fp64's softmax" {
+    if (!@import("../launches/flashnext.zig").promptOnMatrix()) return error.SkipZigTest;
+    const t = try Rig.open(1 << 22);
+    defer t.close();
+    try promptCase(t, true, false);
+}
+
+fn promptCase(t: *Rig, comptime exact: bool, comptime p_lo: bool) !void {
+    const tol: f64 = if (p_lo) 1e-4 else 4e-3;
     var rng: rig.Rng = .{ .state = if (exact) 0xB0A7 else 0xB0A8 };
     const heads = 24;
     const kv_heads = 2;
@@ -540,6 +548,7 @@ fn promptCase(t: *Rig, comptime exact: bool) !void {
         cap,
         scale,
         exact,
+        p_lo,
         st,
     );
     try t.on.tf_attn_gate(ptr(?[*]const f32, out), ptr(?*const anyopaque, dg), ptr(?*anyopaque, want_gated), t.kind(), rows, heads, dims, 1, st);
@@ -576,7 +585,7 @@ fn promptCase(t: *Rig, comptime exact: bool) !void {
             }
             const want = acc / total;
             try rig.expect(
-                @abs(got[(r * heads + h) * dims + d] - want) <= 1e-4 * @max(@abs(want), 0.1),
+                @abs(got[(r * heads + h) * dims + d] - want) <= tol * @max(@abs(want), 0.1),
                 "prompt attention exact={} row {d} head {d} dim {d}: {d} against {d}",
                 .{ exact, r, h, d, got[(r * heads + h) * dims + d], want },
             );
