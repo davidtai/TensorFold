@@ -88,7 +88,7 @@ const piece_counts = [_]u8{ 1, 2, 4 };
 pub const lane_rows = 8; // kLaneRows
 pub const lane_group_max = 128;
 const fast_n = 256;
-pub const stream_cbs = [_]c_int{ 1, 2, 4, 8 }; // columns a lane carries in the stream tile (a pair's: 2 and up)
+pub const stream_cbs = [_]c_int{ 1, 2, 4, 8 }; // columns a lane carries in the stream tile (1: plain products only)
 pub const stream_rows = [_]u8{ 1, 2, 4 }; // its row counts: columns * rows <= 16
 pub const stream_waves = 4; // kStreamWaves
 pub const streams_wanted = 3000; // kStreamWavesWanted
@@ -201,14 +201,14 @@ pub const Kernels = struct {
                         try m.function(std.fmt.comptimePrint("_ZN2tf4rocm18affine_dot2_streamINS0_{s}ELi{d}ELi{d}ELi{d}ELb1EEEvNS0_6AffineENS0_11StreamSidesEii", .{ dot, bits, rows, cb }))
                     else
                         null;
-                    k.relu2[b][r][c] = if (cb * rows <= 16)
+                    k.relu2[b][r][c] = if (cb * rows <= 16 and cb >= 2)
                         try m.function(
                             std.fmt.comptimePrint("_ZN2tf4rocm24affine_dot2_stream_relu2INS0_{s}" ++
                                 "ELi{d}ELi{d}ELi{d}EEEvNS0_6AffineENS0_11StreamSidesEii", .{ dot, bits, rows, cb }),
                         )
                     else
                         null;
-                    k.relu2_pair[b][r][c] = if (cb * rows <= 16)
+                    k.relu2_pair[b][r][c] = if (cb * rows <= 16 and cb >= 2)
                         try m.function(
                             std.fmt.comptimePrint("_ZN2tf4rocm29affine_dot2_stream_relu2_pairINS0_{s}" ++
                                 "ELi{d}ELi{d}ELi{d}EEEvNS0_6AffineES3_iii", .{ dot, bits, rows, cb }),
@@ -356,7 +356,8 @@ pub const Kernels = struct {
         var c: usize = stream_cbs.len;
         while (c > 0) {
             c -= 1;
-            if (stream_cbs[c] * stream_rows[ri] > 16 or stream_cbs[c] * a.bits > stream_code_words or stream_cbs[c] < pair_div) continue;
+            // one column a lane is the plain product's only (a pair's gate and up need two; relu^2 keeps its tiles)
+            if (stream_cbs[c] * stream_rows[ri] > 16 or stream_cbs[c] * a.bits > stream_code_words or (stream_cbs[c] < 2 and (pair_div == 2 or relu2))) continue;
             pick = c;
             const per_block: c_int = stream_waves * (@as(c_int, 32) >> lpc_log2) * @divExact(stream_cbs[c], pair_div);
             if (@as(u64, cdiv(total_n, per_block)) * stream_waves * @as(u64, @intCast(items)) * cdiv(a.m, stream_rows[ri]) >= streams_wanted) break;

@@ -347,11 +347,9 @@ using Dot = DotF16;
     template __global__ void affine_dot2_stream<Dot, BITS, R, CB, true>(Affine, StreamSides, int, int);  \
     template __global__ void affine_dot2_stream_relu2<Dot, BITS, R, CB>(Affine, StreamSides, int, int);      \
     template __global__ void affine_dot2_stream_relu2_pair<Dot, BITS, R, CB>(Affine, Affine, int, int, int);
-// one column a lane (narrow launches): no pair specialization, its gate and up columns need two
-#define TF_STREAM1(BITS, R)                                                                          \
-    template __global__ void affine_dot2_stream<Dot, BITS, R, 1, false>(Affine, StreamSides, int, int); \
-    template __global__ void affine_dot2_stream_relu2<Dot, BITS, R, 1>(Affine, StreamSides, int, int);   \
-    template __global__ void affine_dot2_stream_relu2_pair<Dot, BITS, R, 1>(Affine, Affine, int, int, int);
+// one column a lane (narrow launches): the plain product only
+#define TF_STREAM1(BITS, R) \
+    template __global__ void affine_dot2_stream<Dot, BITS, R, 1, false>(Affine, StreamSides, int, int);
 #if TF_MATRIX
 #define TF_WMMA(BITS) template __global__ void affine_wmma_gemm<BITS>(Affine);
 template __global__ void affine_wmma_moe_gu<4>(Affine, float);

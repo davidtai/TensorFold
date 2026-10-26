@@ -286,15 +286,6 @@ const own_records = [_]Record{
         },
     },
     .{
-        .launch = relu2Tile(1, 1),
-        .usage = .{
-            .{ .vgprs = 60, .sgprs = 53, .lds = 0, .private = 0, .bound = 128, .wave = 32 },
-            .{ .vgprs = 60, .sgprs = 52, .lds = 0, .private = 0, .bound = 128, .wave = 32 },
-            .{ .vgprs = 60, .sgprs = 52, .lds = 0, .private = 0, .bound = 128, .wave = 32 },
-            .{ .vgprs = 60, .sgprs = 54, .lds = 0, .private = 0, .bound = 128, .wave = 32 },
-        },
-    },
-    .{
         .launch = relu2Tile(1, 2),
         .usage = .{
             .{ .vgprs = 79, .sgprs = 54, .lds = 0, .private = 0, .bound = 128, .wave = 32 },
@@ -322,15 +313,6 @@ const own_records = [_]Record{
         },
     },
     .{
-        .launch = relu2Tile(2, 1),
-        .usage = .{
-            .{ .vgprs = 80, .sgprs = 60, .lds = 0, .private = 0, .bound = 128, .wave = 32 },
-            .{ .vgprs = 80, .sgprs = 62, .lds = 0, .private = 0, .bound = 128, .wave = 32 },
-            .{ .vgprs = 80, .sgprs = 62, .lds = 0, .private = 0, .bound = 128, .wave = 32 },
-            .{ .vgprs = 80, .sgprs = 64, .lds = 0, .private = 0, .bound = 128, .wave = 32 },
-        },
-    },
-    .{
         .launch = relu2Tile(2, 2),
         .usage = .{
             .{ .vgprs = 78, .sgprs = 60, .lds = 0, .private = 0, .bound = 128, .wave = 32 },
@@ -355,15 +337,6 @@ const own_records = [_]Record{
             .{ .vgprs = 161, .sgprs = 67, .lds = 0, .private = 0, .bound = 128, .wave = 32 },
             .{ .vgprs = 161, .sgprs = 67, .lds = 0, .private = 0, .bound = 128, .wave = 32 },
             .{ .vgprs = 161, .sgprs = 69, .lds = 0, .private = 0, .bound = 128, .wave = 32 },
-        },
-    },
-    .{
-        .launch = relu2Tile(4, 1),
-        .usage = .{
-            .{ .vgprs = 107, .sgprs = 68, .lds = 0, .private = 0, .bound = 128, .wave = 32 },
-            .{ .vgprs = 97, .sgprs = 70, .lds = 0, .private = 0, .bound = 128, .wave = 32 },
-            .{ .vgprs = 97, .sgprs = 70, .lds = 0, .private = 0, .bound = 128, .wave = 32 },
-            .{ .vgprs = 97, .sgprs = 72, .lds = 0, .private = 0, .bound = 128, .wave = 32 },
         },
     },
     .{
