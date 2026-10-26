@@ -75,6 +75,66 @@ pub fn tf_gated_delta(l: *const Launcher, q: CF, k: CF, v: CF, gate: CF, beta: C
     }
 }
 
+/// Tokens a chunk of tf_gdn_wy and its packed operands (gated_delta_wy.hpp).
+const wy_chunk = 32;
+const wy_pack = 128 * wy_chunk * 2;
+const wy_square = wy_chunk * wy_chunk * 2;
+
+fn wyAlign(n: usize) usize {
+    return (n + 255) & ~@as(usize, 255);
+}
+
+/// The scratch bytes of tf_gdn_wy over `length` rows: k^T, q (a key head) and v^T (a value head) in f16 a chunk,
+/// T diag(beta e^G), T diag(beta) and P in f16, G in fp32.
+pub fn wyScratch(length: usize, key_heads: usize, value_heads: usize) usize {
+    const chunks = (length + wy_chunk - 1) / wy_chunk;
+    return 2 * wyAlign(chunks * key_heads * wy_pack) + wyAlign(chunks * value_heads * wy_pack) +
+        3 * wyAlign(chunks * value_heads * wy_square) + wyAlign(chunks * value_heads * wy_chunk * 4);
+}
+
+/// Whether this build's kernels have the gfx11 matrix-core path of tf_gdn_wy.
+pub fn wyOnMatrix() bool {
+    const c = @import("../caps.zig").Caps.of(@import("../kernels.zig").arch) orelse return false;
+    return c.matrix == .wmma11;
+}
+
+/// A prompt's DeltaNet over `length` rows (dk = dv = 128, batch 1, state in place) in 32-token chunks on the gfx11
+/// matrix cores: f16 operands, fp32 accumulators, another order than tf_gated_delta (numerics=inexact only).
+/// `scratch`: wyScratch(length, key_heads, value_heads) bytes.
+pub fn tf_gdn_wy(l: *const Launcher, q: CF, k: CF, v: CF, gate: CF, beta: CF, state: F, y: F, length: c_int, key_heads: c_int, value_heads: c_int, scratch: u64, s: S) Error!void {
+    if (key_heads < 1 or value_heads < 1 or @rem(value_heads, key_heads) != 0 or length < 1) return invalid("gated delta wy");
+    const n: usize = @intCast(length);
+    const kh: usize = @intCast(key_heads);
+    const vh: usize = @intCast(value_heads);
+    const chunks = (n + wy_chunk - 1) / wy_chunk;
+    const kT = scratch;
+    const q16 = kT + wyAlign(chunks * kh * wy_pack);
+    const vT = q16 + wyAlign(chunks * kh * wy_pack);
+    const t1 = vT + wyAlign(chunks * vh * wy_pack);
+    const t2 = t1 + wyAlign(chunks * vh * wy_square);
+    const p = t2 + wyAlign(chunks * vh * wy_square);
+    const g = p + wyAlign(chunks * vh * wy_square);
+    var a: Args = .{};
+    try a.add(ad(q));
+    try a.add(ad(k));
+    try a.add(ad(v));
+    try a.add(ad(gate));
+    try a.add(ad(beta));
+    inline for (.{ kT, q16, vT, t1, t2, p, g }) |x| try a.add(x);
+    try a.add(length);
+    try a.add(key_heads);
+    try a.add(value_heads);
+    try l.go(l.gdn_wy[0], dim(vh, chunks, 1), dim(128, 1, 1), 0, s, &a);
+    var b: Args = .{};
+    inline for (.{ kT, q16, vT, t1, t2, p, g }) |x| try b.add(x);
+    try b.add(ad(state));
+    try b.add(ad(y));
+    try b.add(length);
+    try b.add(key_heads);
+    try b.add(value_heads);
+    try l.go(l.gdn_wy[1], dim(vh, 1, 1), dim(256, 1, 1), 0, s, &b);
+}
+
 pub fn tf_gdn_gate_prefill(l: *const Launcher, av: C, bv: C, kind: c_int, a_log: CF, dt_bias: CF, gate: F, beta: F, count: c_int, heads: c_int, s: S) Error!void {
     var a: Args = .{};
     try a.add(ad(av));

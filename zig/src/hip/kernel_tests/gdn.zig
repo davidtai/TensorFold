@@ -182,6 +182,64 @@ test "the DeltaNet stays within 5e-3 of the float64 recurrence at four lengths" 
     }
 }
 
+test "the chunked matrix-core DeltaNet (numerics=inexact) stays within 5e-3 of the float64 recurrence" {
+    if (!@import("../launches.zig").Launcher.gdn_wy_on()) return error.SkipZigTest;
+    const t = try Rig.open(1 << 30);
+    defer t.close();
+    for ([_]Shape{
+        .{ .length = 1, .key_heads = 1, .value_heads = 3 },
+        .{ .length = 33, .key_heads = 1, .value_heads = 3 },
+        .{ .length = 64, .key_heads = 2, .value_heads = 4 },
+        .{ .length = 200, .key_heads = 1, .value_heads = 3 },
+        .{ .length = 1000, .key_heads = 2, .value_heads = 4 },
+        .{ .length = 4170, .key_heads = 2, .value_heads = 6 },
+    }) |sh| {
+        const in = try Inputs.make(sh, 0x77aa + sh.length);
+        defer in.free();
+        const ry = try gpa.alloc(f64, sh.length * sh.value_heads * d);
+        defer gpa.free(ry);
+        const rs = try gpa.alloc(f64, sh.value_heads * d * d);
+        defer gpa.free(rs);
+        try reference(sh, in, ry, rs);
+        var q = try t.upload(in.q);
+        defer q.free();
+        var k = try t.upload(in.k);
+        defer k.free();
+        var v = try t.upload(in.v);
+        defer v.free();
+        var gate = try t.upload(in.gate);
+        defer gate.free();
+        var beta = try t.upload(in.beta);
+        defer beta.free();
+        var y = try t.alloc(ry.len * 4);
+        defer y.free();
+        var state = try t.upload(in.state);
+        defer state.free();
+        var scratch = try t.alloc(@import("../launches.zig").Launcher.gdn_wy_scratch(sh.length, sh.key_heads, sh.value_heads));
+        defer scratch.free();
+        try t.on.tf_gdn_wy(
+            @ptrFromInt(rig.at(q)),
+            @ptrFromInt(rig.at(k)),
+            @ptrFromInt(rig.at(v)),
+            @ptrFromInt(rig.at(gate)),
+            @ptrFromInt(rig.at(beta)),
+            @ptrFromInt(rig.at(state)),
+            @ptrFromInt(rig.at(y)),
+            @intCast(sh.length),
+            @intCast(sh.key_heads),
+            @intCast(sh.value_heads),
+            rig.at(scratch),
+            t.stream.handle,
+        );
+        try t.stream.synchronize();
+        const gy = try rig.download(f32, y);
+        defer gpa.free(gy);
+        const gs = try rig.download(f32, state);
+        defer gpa.free(gs);
+        try rig.expect(relative(gy, ry) < 5e-3 and relative(gs, rs) < 5e-3, "wy length {d}: y {e}, state {e}", .{ sh.length, relative(gy, ry), relative(gs, rs) });
+    }
+}
+
 test "a prompt cut on either side of 64 rows gives the same rows and state as one call" {
     const t = try Rig.open(1 << 30);
     defer t.close();

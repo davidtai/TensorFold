@@ -64,6 +64,7 @@ pub const Launcher = struct {
     gated_delta_tile: [2]Function, // dk 128, 16
     gated_delta_wave: [2]Function,
     gdn_prompt: Function, // dk = dv = 128, a prompt's rows, half a value head a block
+    gdn_wy: [2]Function, // dk = dv = 128, a prompt's rows in chunks on the gfx11 matrix cores: prep, scan (inexact)
     score_keys: Triple, // by cache kind
     apply_values: Triple,
     causal: Triple,
@@ -263,6 +264,7 @@ pub const Launcher = struct {
             try gd.function(ns ++ "16gated_delta_tileILi16ELi8ELi16EEEvPKfS3_S3_S3_S3_PfS4_iiiiS4_PKi"),
         };
         l.gdn_prompt = try gd.function("tf_gdn_prompt_128");
+        l.gdn_wy = .{ try gd.function("tf_gdn_wy_prep"), try gd.function("tf_gdn_wy_scan") };
         l.gated_delta_wave = .{
             try gd.function(ns ++ "18gated_delta_kernelILi128EEEvPKfS3_S3_S3_S3_PfS4_iiiiS4_PKi"),
             try gd.function(ns ++ "18gated_delta_kernelILi16EEEvPKfS3_S3_S3_S3_PfS4_iiiiS4_PKi"),
@@ -341,6 +343,10 @@ pub const Launcher = struct {
     pub const pagedCausal = attention.pagedCausal;
     pub const tf_gdn_gate = recurrence.tf_gdn_gate;
     pub const tf_gated_delta = recurrence.tf_gated_delta;
+    pub const tf_gdn_wy = recurrence.tf_gdn_wy;
+    pub const gdn_wy_scratch = recurrence.wyScratch;
+    pub const gdn_wy_on = recurrence.wyOnMatrix;
+    pub const gdn_prompt_rows = recurrence.prompt_rows;
     pub const planKvWrite = plan.planKvWrite;
     pub const planCausal = plan.planCausal;
     pub const planCausalAs = plan.planCausalAs;

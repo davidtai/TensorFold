@@ -442,3 +442,5 @@ tf_gdn_prompt_128(const float* q, const float* k, const float* v, const float* g
                   float* y, int length, int key_heads, int value_heads) {
     tf::rocm::gated_delta_prompt_body<4>(q, k, v, gate, beta, state, y, length, key_heads, value_heads);
 }
+
+#include "recurrence/gated_delta_wy.hpp"

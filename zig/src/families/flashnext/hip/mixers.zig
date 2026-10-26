@@ -183,6 +183,28 @@ fn recur(
     for (segs) |g| {
         const n = g.tokens.len;
         const snaps: ?u64 = if (window) g.c.snapshot(index, 0).state else null;
+        if (wyFits(o, d, window, n)) {
+            // numerics=inexact: the prompt's rows in 32-token chunks on the matrix cores
+            const mark = o.arena.mark();
+            defer o.arena.release(mark);
+            const scratch = try o.arena.take(hip.Launcher.gdn_wy_scratch(n, d.key_heads, d.value_heads));
+            try o.l.tf_gdn_wy(
+                @ptrFromInt(q + off * kw * 4),
+                @ptrFromInt(k + off * kw * 4),
+                @ptrFromInt(v + off * vw * 4),
+                @ptrFromInt(gate + off * d.value_heads * 4),
+                @ptrFromInt(beta + off * d.value_heads * 4),
+                @ptrFromInt(g.c.linearAt(index).state),
+                @ptrFromInt(y + off * vw * 4),
+                @intCast(n),
+                @intCast(d.key_heads),
+                @intCast(d.value_heads),
+                scratch,
+                o.stream,
+            );
+            off += n;
+            continue;
+        }
         try o.gatedDelta(
             q + off * kw * 4,
             k + off * kw * 4,
@@ -204,6 +226,13 @@ fn recur(
     const out = try take(o, m.act, rows * vw);
     try o.gnormOut(y, l.norm, z, out, rows * d.value_heads, d.value_dim, d.eps, d.gate);
     return o.project(out, l.out, rows, l.out.partial);
+}
+
+/// Whether a stream's `rows` DeltaNet rows take the chunked matrix-core walk (tf_gdn_wy): numerics=inexact, a prompt
+/// (no window snapshots), Dk = Dv = 128, a gfx11 build, and as many rows as the scan's prompt kernel takes.
+fn wyFits(o: Ops, d: model.Dims, window: bool, rows: usize) bool {
+    return o.inexact() and !window and d.key_dim == 128 and d.value_dim == 128 and
+        rows >= hip.Launcher.gdn_prompt_rows and hip.Launcher.gdn_wy_on();
 }
 
 /// Rows of a prompt's attention a slice: the indexer's scores and the attention's parts stay bounded.
