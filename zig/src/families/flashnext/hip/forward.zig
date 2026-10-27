@@ -89,6 +89,8 @@ pub fn hcPre(o: Ops, m: *const model.Model, hc: model.Hc, x: Tensor, rows: usize
         @intCast(d.streams),
         o.stream,
     );
+    // a prompt's up product with the mix in the dense tile's epilogue (no g in memory): the same bytes
+    if (try o.hcUpMix(act, hc.up, x, rows)) |mixed| return mixed;
     // g in the activation kind: the mix rounds it there first (the dense prompt tile writes it so, without a cast)
     const g = try o.project(act, hc.up, rows, false);
     const mixed = try take(o, m.act, rows * d.hidden);

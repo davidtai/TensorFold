@@ -159,6 +159,8 @@ pub const Kernels = struct {
     moe_down_inexact: ?Function,
     /// A prompt's plain 4-bit group-32 products at each of dense_ks (tiles/dense_gemm.hpp); gfx11.
     dense: [dense_ks.len]?Function,
+    /// hc up (K 320) on the dense tile with tf_fn_hc_mix in its epilogue (tf_affine_dense_hcmix); gfx11.
+    dense_hcmix: ?Function,
     /// The same at each of inexact_ks with the codes dequantized to bf16 (tiles/dense_inexact.hpp); numerics=inexact.
     dense_inexact: [inexact_ks.len]?Function,
     kp: [bit_widths.len][kp_tiles.len]Function,
@@ -197,6 +199,7 @@ pub const Kernels = struct {
         k.moe_down = if (k.matrix) try tiles_obj.function(r ++ "20affine_wmma_moe_downILi4EEEvNS0_6AffineE") else null;
         k.moe_gu_inexact = if (k.matrix) try tiles_obj.function(r ++ "26affine_wmma_moe_gu_inexactILi4EEEvNS0_6AffineEf") else null;
         k.moe_down_inexact = if (k.matrix) try tiles_obj.function(r ++ "28affine_wmma_moe_down_inexactILi4EEEvNS0_6AffineE") else null;
+        k.dense_hcmix = if (k.matrix) try tiles_obj.function("tf_affine_dense_hcmix") else null;
         inline for (dense_ks, 0..) |dk, i| {
             k.dense[i] = if (k.matrix) try tiles_obj.function(std.fmt.comptimePrint(r ++ "17affine_wmma_denseILi{d}EEEvNS0_6AffineE", .{dk})) else null;
         }
@@ -561,6 +564,18 @@ pub const Kernels = struct {
         const f = k.dense[denseIndex(a.k) orelse return refuse("dense K")] orelse return refuse("dense tile");
         var args: hl.Args = .{};
         try args.add(a);
+        try go(r, f, .{ .x = cdiv(a.n, 128) * cdiv(a.m, 128) }, .{ .x = 256 }, s, &args);
+    }
+
+    /// hc up's product (K 320, n = 4 streams of dims) on the dense tile, mixed in its epilogue as tf_fn_hc_mix mixes:
+    /// `x` the normed streams [m, n] bf16, `mixed` [m, n / 4] bf16. The bytes of denseGo with out16, then hcMix.
+    pub fn denseHcMixGo(k: *const Kernels, r: *const runtime.Runtime, a: Arg, x: u64, mixed: u64, s: abi.Stream) Error!void {
+        const f = k.dense_hcmix orelse return refuse("hc mix tile");
+        if (a.k != 320 or @rem(a.n, 4 * 32) != 0 or a.fp16 != 0) return refuse("hc mix shape");
+        var args: hl.Args = .{};
+        try args.add(a);
+        try args.add(x);
+        try args.add(mixed);
         try go(r, f, .{ .x = cdiv(a.n, 128) * cdiv(a.m, 128) }, .{ .x = 256 }, s, &args);
     }
 

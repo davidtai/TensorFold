@@ -78,6 +78,11 @@ __global__ void __launch_bounds__(dense_tile::kThreads) affine_wmma_dense(Affine
     wmma_dense_tile<K, DenseTune<K>::kAhead>(a);
 }
 
+// hc up (K 320) with tf_fn_hc_mix in the epilogue: the dense tile's products, mixed per hidden column (dense_gemm.hpp)
+extern "C" __global__ void __launch_bounds__(dense_tile::kThreads) tf_affine_dense_hcmix(Affine a, HcMix mix) {
+    wmma_dense_tile<320, DenseTune<320>::kAhead, true>(a, mix);
+}
+
 // numerics=inexact: the same products with the codes dequantized to bf16 in the tile, one WMMA accumulation over K
 // (K 2560 and 6144; at hc_down's K 10240 the exact tile is faster, at hc_up's K 320 equal)
 template <int K>

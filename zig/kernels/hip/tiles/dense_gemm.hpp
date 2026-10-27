@@ -26,6 +26,13 @@
 namespace tf {
 namespace rocm {
 
+// HC_MIX (hc up, K 320): the 4 streams' columns of 32 neighbouring hidden columns d a block, mixed in the epilogue as
+// tf_fn_hc_mix mixes them (x the normed streams [m, 4 dims] bf16, mixed [m, dims] bf16, dims = n / 4).
+struct HcMix {
+    const uint16_t* x = nullptr;
+    uint16_t* mixed = nullptr;
+};
+
 namespace dense_tile {
 constexpr int kBM = 128;
 constexpr int kBN = 128;
@@ -36,8 +43,8 @@ constexpr int kThreads = 256;
 // K: the product's K (a multiple of 64). AHEAD: windows of loads a thread holds (K / 64 a multiple of it). bf16 x and
 // tables, plain products only. Blocks in row-major order of 128 x 128 tiles (Strata's grouped order, 8 row tiles a
 // group, measured slower: dn_qkv 14.3 ms against 13.8).
-template <int K, int AHEAD = 1>
-__device__ __forceinline__ void wmma_dense_tile(const Affine& a) {
+template <int K, int AHEAD = 1, bool HC_MIX = false>
+__device__ __forceinline__ void wmma_dense_tile(const Affine& a, HcMix mix = {}) {
 #if TF_DEVICE_WMMA_GFX11
     using namespace dense_tile;
     using Dec = MlxDecoder<4>;
@@ -67,13 +74,16 @@ __device__ __forceinline__ void wmma_dense_tile(const Affine& a) {
     // (t < 128) or biases of column n0 + t % 128
     const int r = tid >> 1;
     const int q = tid & 1;
-    const int col = n0 + r < a.n ? n0 + r : a.n - 1;
+    // HC_MIX: local column c is stream c / 32's hidden column bn * 32 + c % 32 (the weights' row of that output)
+    const int dims = a.n / 4;
+    auto column = [&](int c) { return HC_MIX ? (c / 32) * dims + bn * 32 + c % 32 : n0 + c; };
+    const int col = HC_MIX ? column(r) : (n0 + r < a.n ? n0 + r : a.n - 1);
     const int row = r < rows_left ? m0 + r : a.m - 1;
     const uint32_t* wsrc = a.words + static_cast<long long>(col) * kWordsRow + q * 4;
     const u32x4* xsrc = reinterpret_cast<const u32x4*>(static_cast<const __bf16*>(a.x) + static_cast<long long>(row) * K) + q * 4;
     const int trow = tid & (kBN - 1);
     const bool thigh = tid >= kBN;
-    const int tcol = n0 + trow < a.n ? n0 + trow : a.n - 1;
+    const int tcol = HC_MIX ? column(trow) : (n0 + trow < a.n ? n0 + trow : a.n - 1);
     const uint16_t* tsrc = static_cast<const uint16_t*>(thigh ? a.bias.p : a.scale.p) + static_cast<long long>(tcol) * kGroups;
 
     // wave (wm, wn): rows kWR wm.., columns kWC wn.. (kMT x kNT tiles); a lane: column lane % 16, rows 2 i + lane / 16
@@ -206,7 +216,51 @@ __device__ __forceinline__ void wmma_dense_tile(const Affine& a) {
             }
         }
     };
-    if (a.out16 != nullptr) {
+    if constexpr (HC_MIX) {
+        // wave wn holds stream wn (kWC = 32 columns: the block's d's); a term is tf_fn_hc_mix's, rounded to bf16 in LDS,
+        // 64 rows a pass (the stash's xs past the last window); then each (row, d) sums its 4 terms in stream order
+        uint16_t* terms = reinterpret_cast<uint16_t*>(xs);  // [64 rows][4 streams][32 d]
+        // the activation's bf16 (narrow: tf_cast's and float_to_bf16's nearest even), its value, torch's sigmoid
+        auto bits = [](float v) { return __builtin_bit_cast(uint16_t, narrow<T>(v)); };
+        auto wide = [](uint16_t h) { return __uint_as_float(static_cast<uint32_t>(h) << 16); };
+        auto rnd = [&](float v) { return wide(bits(v)); };
+#pragma unroll
+        for (int pass = 0; pass < 2; ++pass) {
+            __syncthreads();
+            if (wm == pass) {
+#pragma unroll
+                for (int mt = 0; mt < kMT; ++mt) {
+#pragma unroll
+                    for (int i = 0; i < 8; ++i) {
+                        const int lrow = mt * 16 + 2 * i + rh;
+                        const int orow = m0 + wm * kWR + lrow;
+#pragma unroll
+                        for (int nt = 0; nt < kNT; ++nt) {
+                            const int j = nt * 16 + rl;
+                            float term = 0.f;
+                            if (orow < a.m) {
+                                const float g = rnd(acc[mt][nt][i]);
+                                const float gate = rnd(1.0f / (1.0f + expf(-g)));
+                                const float xv = wide(mix.x[(static_cast<long long>(orow) * 4 + wn) * dims + bn * 32 + j]);
+                                term = rnd(gate * xv);
+                            }
+                            terms[(lrow * 4 + wn) * 32 + j] = bits(term);
+                        }
+                    }
+                }
+            }
+            __syncthreads();
+            for (int e = tid; e < kWR * 32; e += kThreads) {
+                const int lrow = e / 32, j = e % 32;
+                const int orow = m0 + pass * kWR + lrow;
+                if (orow >= a.m) continue;
+                float total = 0.f;
+#pragma unroll
+                for (int s = 0; s < 4; ++s) total += wide(terms[(lrow * 4 + s) * 32 + j]);
+                mix.mixed[static_cast<long long>(orow) * dims + bn * 32 + j] = bits(total / 4.f);
+            }
+        }
+    } else if (a.out16 != nullptr) {
         auto* out = reinterpret_cast<typename T::elem*>(a.out16);
         put([&](long long at, float v) { out[at] = narrow<T>(v); });
     } else {
@@ -214,6 +268,7 @@ __device__ __forceinline__ void wmma_dense_tile(const Affine& a) {
     }
 #else
     (void)a;
+    (void)mix;
     __builtin_trap();
 #endif
 }
