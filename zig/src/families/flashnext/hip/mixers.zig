@@ -314,6 +314,10 @@ pub fn sparseKeys(o: Ops, m: *const model.Model, d: model.Dims, s: model.Sparse,
 
 /// Rows of a prompt's attention a slice: the indexer's scores and the attention's parts stay bounded.
 const slice_rows = 64;
+/// Rows of a prompt's indexer slice: the scores of 1,024 rows (18 MB at a 17.7K prompt) and launches that fill the GPU;
+/// 64-row slices left the scores' and the select's launches at 138 and 64 blocks (W7 Q-3; each row's scores and picks
+/// are the same however the rows are cut).
+const prompt_slice_rows = 1024;
 const parts = 16;
 
 /// The rows' ends and complete blocks on the device, and the blocks a window's scores walk (see forward.Staged).
@@ -509,12 +513,12 @@ fn attendPrompt(
     const counts = try o.arena.of(i32, rows);
     const flags = try o.arena.of(i32, rows);
     var r0: usize = 0;
-    while (r0 < rows) : (r0 += slice_rows) {
-        const n = @min(slice_rows, rows - r0);
+    while (r0 < rows) : (r0 += prompt_slice_rows) {
+        const n = @min(prompt_slice_rows, rows - r0);
         const mark = o.arena.mark();
         defer o.arena.release(mark);
-        var complete: [slice_rows]i32 = undefined;
-        var ends: [slice_rows]i32 = undefined;
+        var complete: [prompt_slice_rows]i32 = undefined;
+        var ends: [prompt_slice_rows]i32 = undefined;
         var sparse_rows = false;
         for (0..n) |r| {
             ends[r] = @intCast(pos + r0 + r + 1);
