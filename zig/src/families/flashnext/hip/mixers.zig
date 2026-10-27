@@ -235,6 +235,83 @@ fn wyFits(o: Ops, d: model.Dims, window: bool, rows: usize) bool {
         rows >= hip.Launcher.gdn_prompt_rows and hip.Launcher.gdn_wy_on();
 }
 
+/// A segment's keys, values and index keys into its sparse layer's caches (rope and k norm, the raw index keys,
+/// the pools of the blocks it completes): the eager writes of `sparse` (a graphed window's are tf_fn_qsa_prep's).
+fn writeKeys(
+    o: Ops,
+    m: *const model.Model,
+    d: model.Dims,
+    s: model.Sparse,
+    g: forward.Seg,
+    layer: usize,
+    keys: Tensor,
+    values: Tensor,
+    idx: Tensor,
+    off: usize,
+    at_pos: u64,
+) !void {
+    const hd = d.head_dim;
+    const di = d.index_dim;
+    const width = (d.index_heads + 1) * di;
+    const n = g.tokens.len;
+    const kv = g.c.sparse(layer);
+    const cap = g.c.layout.cap;
+    const pos = g.pos;
+    try o.qkRope(
+        forward.at(keys, off * d.kv_heads * hd),
+        d.kv_heads * hd,
+        hd,
+        s.k_norm,
+        d.eps,
+        n,
+        d.kv_heads,
+        hd,
+        d.rotary,
+        d.theta,
+        at_pos,
+        null,
+        kv.k,
+        cap,
+    );
+    try o.kvWrite(forward.at(values, off * d.kv_heads * hd), kv.v, n, d.kv_heads, hd, cap, pos);
+    try o.copyCols(
+        forward.at(idx, off * width),
+        width,
+        d.index_heads * di,
+        kv.raw + pos * di * m.act.size(),
+        n,
+        di,
+    );
+    const blocks = (pos + n) / d.index_ratio;
+    const pooled = g.c.pooled;
+    if (blocks > pooled) try o.l.fn_idx_pool(
+        @ptrFromInt(kv.raw),
+        @ptrFromInt(kv.pooled + pooled * di * m.act.size()),
+        @ptrFromInt(s.ik_norm),
+        @backingInt(m.act),
+        @intCast(pooled),
+        @intCast(blocks - pooled),
+        @intCast(di),
+        @intCast(d.index_ratio),
+        @intCast(d.rotary),
+        d.theta,
+        d.eps,
+        o.stream,
+    );
+}
+
+/// A prompt's rows into a sparse layer's caches only: the same projections (one group, q included, so k, v and the
+/// index keys are sparse()'s bytes) and writes, no attention. For rows whose outputs nothing reads (the MTP head's
+/// prompt rows: its caches are all a draft uses).
+pub fn sparseKeys(o: Ops, m: *const model.Model, d: model.Dims, s: model.Sparse, g: forward.Seg, layer: usize, x: Tensor, dev_pos: u64) !void {
+    const rows = g.tokens.len;
+    var outs: [4]Tensor = undefined;
+    if (!try o.projectGroup(x, &.{ s.q, s.k, s.v, s.index }, rows, &outs)) {
+        for (&outs, [_]model.Projection{ s.q, s.k, s.v, s.index }) |*t, p| t.* = try o.project(x, p, rows, false);
+    }
+    try writeKeys(o, m, d, s, g, layer, outs[1], outs[2], outs[3], 0, dev_pos);
+}
+
 /// Rows of a prompt's attention a slice: the indexer's scores and the attention's parts stay bounded.
 const slice_rows = 64;
 const parts = 16;
@@ -329,49 +406,7 @@ pub fn sparse(
                 .rotary = @intCast(d.rotary),
                 .theta = d.theta,
             }, o.stream);
-        } else try o.qkRope(
-            forward.at(keys, off * d.kv_heads * hd),
-            d.kv_heads * hd,
-            hd,
-            s.k_norm,
-            d.eps,
-            n,
-            d.kv_heads,
-            hd,
-            d.rotary,
-            d.theta,
-            at_pos,
-            null,
-            kv.k,
-            cap,
-        );
-        if (!graphed) {
-            try o.kvWrite(forward.at(values, off * d.kv_heads * hd), kv.v, n, d.kv_heads, hd, cap, pos);
-            try o.copyCols(
-                forward.at(idx, off * width),
-                width,
-                d.index_heads * di,
-                kv.raw + pos * di * m.act.size(),
-                n,
-                di,
-            );
-            const blocks = (pos + n) / d.index_ratio;
-            const pooled = g.c.pooled;
-            if (blocks > pooled) try o.l.fn_idx_pool(
-                @ptrFromInt(kv.raw),
-                @ptrFromInt(kv.pooled + pooled * di * m.act.size()),
-                @ptrFromInt(s.ik_norm),
-                kind,
-                @intCast(pooled),
-                @intCast(blocks - pooled),
-                @intCast(di),
-                @intCast(d.index_ratio),
-                @intCast(d.rotary),
-                d.theta,
-                d.eps,
-                o.stream,
-            );
-        }
+        } else try writeKeys(o, m, d, s, g, layer, keys, values, idx, off, at_pos);
         const r: ?Rows = if (staged) |st| .{
             .ends = st.ends + off * 4,
             .complete = st.complete + off * 4,

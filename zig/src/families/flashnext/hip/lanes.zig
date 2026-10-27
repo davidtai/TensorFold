@@ -438,9 +438,10 @@ pub const Fx = struct {
         const rows = to - at;
         const row_bytes = m.dims.wide() * m.act.size();
         if (lane.head) |*hc| {
-            // the head's keys for every prompt row with a next token (the last waits for the first draw)
+            // the head's keys for every prompt row with a next token (the last waits for the first draw); nothing reads
+            // these rows' head outputs, so only its caches are written
             const n = if (last) rows - 1 else rows;
-            if (n > 0) _ = try head_mod.run(
+            if (n > 0) try head_mod.keys(
                 e.ops(&e.arena),
                 m,
                 &e.host,
