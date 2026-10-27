@@ -371,65 +371,77 @@ test "the routed gate and up with its activation in one launch is no further fro
     try pair(t, &rng, 1, 512, 2048, 4, 128);
 }
 
-test "the routed gate and up with its activation writes the same bytes at 2, 4 and 8 columns a lane (Flash Next, 1 to 8 rows)" {
-    const t = try Rig.open(1 << 20);
-    defer t.close();
-    var rng: rig.Rng = .{ .state = 0x9E3779B97F4A7C15 };
-    const width = 640;
-    const k = 2560;
+/// A verify window's routed experts at every columns-a-lane count against the launcher's own pick: the same bytes.
+/// Flash Next's gate+up with its activation (`down` false: 640 x 2 columns, K 2560) or its down (`down` true: 2560
+/// columns, K 640, x a row a pair), 4-bit group 32; rows x 11 (row, slot) pairs over 11 + 5.5 (rows - 1) experts,
+/// round-robin, or over `unique` experts when given (4 rows an expert at unique 11 x rows / 4).
+fn windowBytes(t: *Rig, rng: *rig.Rng, down: bool, rows: usize, unique_in: ?usize) !void {
+    const n: usize = if (down) 2560 else 2 * 640;
+    const k: usize = if (down) 640 else 2560;
     const experts = 64;
     const slots = 11;
-    var m = try Matrix.init(t, &rng, 2 * width, k, 4, 32, experts);
+    var m = try Matrix.init(t, rng, n, k, 4, 32, experts);
     defer m.deinit();
     const kernels = &t.on.affine;
     defer kernels.stream_cb_force = 0;
-    for ([_]usize{ 1, 2, 4, 8 }) |rows| {
-        // a verify window: rows x 11 (row, slot) pairs over 11 + 5.5 (rows - 1) experts, round-robin
-        const pairs = rows * slots;
-        const unique = slots + (slots * (rows - 1)) / 2;
-        const hx = try gpa.alloc(u16, rows * k);
-        defer gpa.free(hx);
-        for (hx) |*v| v.* = t.bits(rng.unit());
-        var x = try t.upload(hx);
-        defer x.free();
-        const items = try gpa.alloc(i32, unique * 3);
-        defer gpa.free(items);
-        const members = try gpa.alloc(i32, pairs);
-        defer gpa.free(members);
-        var first: usize = 0;
-        var most: usize = 0;
-        for (0..unique) |i| {
-            var n: usize = 0;
-            var j = i;
-            while (j < pairs) : (j += unique) {
-                members[first + n] = @intCast(j);
-                n += 1;
-            }
-            items[3 * i ..][0..3].* = .{ @intCast((i * 7) % experts), @intCast(first), @intCast(n) };
-            first += n;
-            most = @max(most, n);
+    const pairs = rows * slots;
+    const unique = unique_in orelse slots + (slots * (rows - 1)) / 2;
+    const x_rows = if (down) pairs else rows;
+    const hx = try gpa.alloc(u16, x_rows * k);
+    defer gpa.free(hx);
+    for (hx) |*v| v.* = t.bits(rng.unit());
+    var x = try t.upload(hx);
+    defer x.free();
+    const items = try gpa.alloc(i32, unique * 3);
+    defer gpa.free(items);
+    const members = try gpa.alloc(i32, pairs);
+    defer gpa.free(members);
+    var first: usize = 0;
+    var most: usize = 0;
+    for (0..unique) |i| {
+        var count: usize = 0;
+        var j = i;
+        while (j < pairs) : (j += unique) {
+            members[first + count] = @intCast(j);
+            count += 1;
         }
-        var dev_items = try t.upload(items);
-        defer dev_items.free();
-        var dev_members = try t.upload(members);
-        defer dev_members.free();
-        var want: ?[]u16 = null;
-        defer if (want) |w| gpa.free(w);
-        for ([_]c_int{ 2, 0, 4, 8 }) |cb| {
-            var out = try t.alloc(pairs * width * 2);
-            defer out.free();
-            var a = m.arg(t, at(x), most, 0);
-            a.out16 = at(out);
-            a.route = .{ .items = at(dev_items), .members = at(dev_members), .x_div = slots };
-            kernels.stream_cb_force = cb;
-            try std.testing.expect(try kernels.pairRun(&t.r, a, 0, @intCast(unique), t.stream.handle));
-            try t.stream.synchronize();
-            const got = try rig.download(u16, out);
-            if (want) |w| {
-                defer gpa.free(got);
-                try std.testing.expectEqualSlices(u16, w, got);
-            } else want = got;
-        }
+        items[3 * i ..][0..3].* = .{ @intCast((i * 7) % experts), @intCast(first), @intCast(count) };
+        first += count;
+        most = @max(most, count);
+    }
+    var dev_items = try t.upload(items);
+    defer dev_items.free();
+    var dev_members = try t.upload(members);
+    defer dev_members.free();
+    const out_bytes = if (down) pairs * n * 4 else pairs * (n / 2) * 2;
+    var want: ?[]u8 = null;
+    defer if (want) |w| gpa.free(w);
+    for ([_]c_int{ 0, 1, 2, 4, 8 }) |cb| {
+        var out = try t.alloc(out_bytes);
+        defer out.free();
+        var a = m.arg(t, at(x), most, if (down) at(out) else 0);
+        if (!down) a.out16 = at(out);
+        a.route = .{ .items = at(dev_items), .members = at(dev_members), .x_div = if (down) 1 else slots };
+        kernels.stream_cb_force = cb;
+        if (down) try kernels.routed(&t.r, a, @intCast(unique), t.stream.handle) else try std.testing.expect(try kernels.pairRun(&t.r, a, 0, @intCast(unique), t.stream.handle));
+        try t.stream.synchronize();
+        const got = try rig.download(u8, out);
+        if (want) |w| {
+            defer gpa.free(got);
+            try std.testing.expectEqualSlices(u8, w, got);
+        } else want = got;
+    }
+}
+
+test "the routed gate+up and down write the same bytes at every columns a lane (Flash Next, 1 to 8 rows)" {
+    const t = try Rig.open(1 << 20);
+    defer t.close();
+    var rng: rig.Rng = .{ .state = 0x9E3779B97F4A7C15 };
+    for ([_]bool{ false, true }) |down| {
+        for ([_]usize{ 1, 2, 4, 8 }) |rows| try windowBytes(t, &rng, down, rows, null);
+        // 4 rows an expert: the 4-row tile
+        try windowBytes(t, &rng, down, 4, 11);
+        try windowBytes(t, &rng, down, 8, 22);
     }
 }
 
