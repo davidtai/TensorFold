@@ -217,48 +217,74 @@ __device__ __forceinline__ void wmma_dense_tile(const Affine& a, HcMix mix = {})
         }
     };
     if constexpr (HC_MIX) {
-        // wave wn holds stream wn (kWC = 32 columns: the block's d's); a term is tf_fn_hc_mix's, rounded to bf16 in LDS,
-        // 64 rows a pass (the stash's xs past the last window); then each (row, d) sums its 4 terms in stream order
-        uint16_t* terms = reinterpret_cast<uint16_t*>(xs);  // [64 rows][4 streams][32 d]
-        // the activation's bf16 (narrow: tf_cast's and float_to_bf16's nearest even), its value, torch's sigmoid
+        // wave wn holds stream wn (kWC = 32 columns: the block's d's). The block's x tile [128 rows][4 streams][32 d] goes
+        // to LDS in 16-byte loads (rows 0..63 over xs, 64..127 over ws: the stash's, past the last window); each thread
+        // turns its x into tf_fn_hc_mix's term in place; then 16 d a thread sum their 4 terms in stream order.
         auto bits = [](float v) { return __builtin_bit_cast(uint16_t, narrow<T>(v)); };
         auto wide = [](uint16_t h) { return __uint_as_float(static_cast<uint32_t>(h) << 16); };
         auto rnd = [&](float v) { return wide(bits(v)); };
+        constexpr int kRow = 4 * 32 + 8;  // a row's 4 x 32 d, padded 16 bytes against bank conflicts
+        static_assert(kWR * kRow * 2 <= kBM * kLdw * 4, "64 rows a stash buffer");
+        auto slot = [&](int lrow) { return reinterpret_cast<uint16_t*>(lrow < kWR ? xs : ws) + (lrow % kWR) * kRow; };
+        constexpr int kLoads = kBM * 4 * 4 / kThreads;  // 16-byte pieces a thread: 4 a (row, stream)
+        u32x4 xv[kLoads];
 #pragma unroll
-        for (int pass = 0; pass < 2; ++pass) {
-            __syncthreads();
-            if (wm == pass) {
+        for (int l = 0; l < kLoads; ++l) {
+            const int e = tid + l * kThreads, lrow = e / 16, st = (e / 4) % 4, v = e % 4;
+            const int orow = m0 + lrow < a.m ? m0 + lrow : a.m - 1;
+            xv[l] = *reinterpret_cast<const u32x4*>(mix.x + (static_cast<long long>(orow) * 4 + st) * dims + bn * 32 + v * 8);
+        }
+        __syncthreads();
 #pragma unroll
-                for (int mt = 0; mt < kMT; ++mt) {
+        for (int l = 0; l < kLoads; ++l) {
+            const int e = tid + l * kThreads, lrow = e / 16, st = (e / 4) % 4, v = e % 4;
+            *reinterpret_cast<u32x4*>(slot(lrow) + st * 32 + v * 8) = xv[l];
+        }
+        __syncthreads();
+        uint16_t* mine = slot(wm * kWR) + wn * 32;
 #pragma unroll
-                    for (int i = 0; i < 8; ++i) {
-                        const int lrow = mt * 16 + 2 * i + rh;
-                        const int orow = m0 + wm * kWR + lrow;
+        for (int mt = 0; mt < kMT; ++mt) {
 #pragma unroll
-                        for (int nt = 0; nt < kNT; ++nt) {
-                            const int j = nt * 16 + rl;
-                            float term = 0.f;
-                            if (orow < a.m) {
-                                const float g = rnd(acc[mt][nt][i]);
-                                const float gate = rnd(1.0f / (1.0f + expf(-g)));
-                                const float xv = wide(mix.x[(static_cast<long long>(orow) * 4 + wn) * dims + bn * 32 + j]);
-                                term = rnd(gate * xv);
-                            }
-                            terms[(lrow * 4 + wn) * 32 + j] = bits(term);
-                        }
-                    }
+            for (int i = 0; i < 8; ++i) {
+                uint16_t* at = mine + (mt * 16 + 2 * i + rh) * kRow;
+#pragma unroll
+                for (int nt = 0; nt < kNT; ++nt) {
+                    const int j = nt * 16 + rl;
+                    const float g = rnd(acc[mt][nt][i]);
+                    const float gate = rnd(1.0f / (1.0f + expf(-g)));
+                    at[j] = bits(rnd(gate * wide(at[j])));
                 }
             }
-            __syncthreads();
-            for (int e = tid; e < kWR * 32; e += kThreads) {
-                const int lrow = e / 32, j = e % 32;
-                const int orow = m0 + pass * kWR + lrow;
-                if (orow >= a.m) continue;
-                float total = 0.f;
+        }
+        __syncthreads();
+        static_assert(kBM * 2 == kThreads, "a thread: one row's 16 d");
+        const int lrow = tid / 2, d0 = (tid % 2) * 16;
+        if (m0 + lrow < a.m) {
+            const uint16_t* t = slot(lrow) + d0;
+            uint32_t w[4][8];
 #pragma unroll
-                for (int s = 0; s < 4; ++s) total += wide(terms[(lrow * 4 + s) * 32 + j]);
-                mix.mixed[static_cast<long long>(orow) * dims + bn * 32 + j] = bits(total / 4.f);
+            for (int st = 0; st < 4; ++st) {
+                const u32x4 lo = *reinterpret_cast<const u32x4*>(t + st * 32);
+                const u32x4 hi = *reinterpret_cast<const u32x4*>(t + st * 32 + 8);
+                w[st][0] = lo.x, w[st][1] = lo.y, w[st][2] = lo.z, w[st][3] = lo.w;
+                w[st][4] = hi.x, w[st][5] = hi.y, w[st][6] = hi.z, w[st][7] = hi.w;
             }
+            uint32_t out[8];
+#pragma unroll
+            for (int k = 0; k < 8; ++k) {
+                uint16_t h[2];
+#pragma unroll
+                for (int e = 0; e < 2; ++e) {
+                    float total = 0.f;
+#pragma unroll
+                    for (int st = 0; st < 4; ++st) total += wide(static_cast<uint16_t>(w[st][k] >> (16 * e)));
+                    h[e] = bits(total / 4.f);
+                }
+                out[k] = static_cast<uint32_t>(h[0]) | (static_cast<uint32_t>(h[1]) << 16);
+            }
+            u32x4* dst = reinterpret_cast<u32x4*>(mix.mixed + static_cast<long long>(m0 + lrow) * dims + bn * 32 + d0);
+            dst[0] = u32x4{out[0], out[1], out[2], out[3]};
+            dst[1] = u32x4{out[4], out[5], out[6], out[7]};
         }
     } else if (a.out16 != nullptr) {
         auto* out = reinterpret_cast<typename T::elem*>(a.out16);
