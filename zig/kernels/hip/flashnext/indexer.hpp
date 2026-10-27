@@ -2,6 +2,8 @@
 
 #include "streams.hpp"
 #include "../ops/qk_rope_wave.hpp"
+#include "../ops/common.hpp"
+#include "common/wmma.hpp"
 
 // The sparse attention's indexer: pooled block keys, each row's block scores, and the blocks a row attends.
 
@@ -246,6 +248,79 @@ tf_fn_idx_scores_quad(const float* q, const void* pooled, const int* complete, f
         }
         if (p == 0 && b0 + blk < lim) scores[r * stride + b0 + blk] = total / norm;
     }
+}
+
+// A prompt slice's scores of Flash Next's 4 index heads of 128 on the gfx11 matrix cores (numerics=inexact, bf16 pooled
+// keys): a block of 4 waves scores 64 rows x 64 blocks, a wave 16 rows (fragment rows) x 4 tiles of 16 blocks (fragment
+// columns); per head q (rounded to bf16) . key over 8 steps of 16 dims, then the heads' relu sum and the division as
+// tf_fn_idx_scores. The sums run in the matrix cores' order, so a score can differ in its last bits (the picks at
+// near-ties); rows that score no block of the tile skip it.
+constexpr int kMmaRows = 64, kMmaBlocks = 64;
+
+extern "C" __global__ void __launch_bounds__(128)
+tf_fn_idx_scores_mma(const float* q, const void* pooled, const int* complete, float* scores, int rows, int blocks,
+                     long long stride, int top) {
+#if TF_DEVICE_WMMA_GFX11
+    using tf::rocm::bf16x16;
+    using tf::rocm::f32x8;
+    using tf::rocm::u32x8;
+    using Mma = tf::rocm::WmmaBF16;
+    constexpr int D = kQuadDims, H = kQuadHeads;
+    const int lane = threadIdx.x & 31, wave = threadIdx.x >> 5, col = lane & 15, half = lane >> 4;
+    const int tile_r0 = blockIdx.y * kMmaRows;
+    const int b0 = blockIdx.x * kMmaBlocks;
+    // a row scores its first complete blocks (past the budget), and complete grows with the row: the tile's last row
+    // scores the most
+    const int last = min(rows, tile_r0 + kMmaRows) - 1;
+    if (last < tile_r0 || complete[last] <= top || b0 >= complete[last]) return;
+    const int rb = tile_r0 + wave * 16;
+    const int qr = rb + col;
+    const bool qlive = qr < rows;
+    const uint16_t* kp = static_cast<const uint16_t*>(pooled);
+    f32x8 total[4];
+#pragma unroll
+    for (int t = 0; t < 4; ++t) total[t] = f32x8{0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+    for (int h = 0; h < H; ++h) {
+        f32x8 acc[4];
+#pragma unroll
+        for (int t = 0; t < 4; ++t) acc[t] = f32x8{0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+#pragma unroll 2
+        for (int kk = 0; kk < D / 16; ++kk) {
+            u32x8 aw;
+            const float* src = q + (static_cast<long long>(qlive ? qr : 0) * H + h) * D + kk * 16;
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const float x0 = qlive ? src[2 * i] : 0.f, x1 = qlive ? src[2 * i + 1] : 0.f;
+                aw[i] = static_cast<uint32_t>(float_to_bf16(x0)) | (static_cast<uint32_t>(float_to_bf16(x1)) << 16);
+            }
+            const bf16x16 a = __builtin_bit_cast(bf16x16, aw);
+#pragma unroll
+            for (int t = 0; t < 4; ++t) {
+                const int kb = min(b0 + 16 * t + col, blocks - 1);
+                const uint4* ks = reinterpret_cast<const uint4*>(kp + static_cast<long long>(kb) * D + kk * 16);
+                const uint4 k0 = ks[0], k1 = ks[1];
+                const u32x8 bw = {k0.x, k0.y, k0.z, k0.w, k1.x, k1.y, k1.z, k1.w};
+                acc[t] = Mma::mma(a, __builtin_bit_cast(bf16x16, bw), acc[t]);
+            }
+        }
+#pragma unroll
+        for (int t = 0; t < 4; ++t)
+#pragma unroll
+            for (int i = 0; i < 8; ++i) total[t][i] += fmaxf(acc[t][i], 0.f);
+    }
+    const float norm = sqrtf(static_cast<float>(D));
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const int r = rb + 2 * i + half;
+        if (r >= rows) continue;
+        const int lim = complete[r] > top ? complete[r] : 0;
+#pragma unroll
+        for (int t = 0; t < 4; ++t) {
+            const int blk = b0 + 16 * t + col;
+            if (blk < lim) scores[r * stride + blk] = total[t][i] / norm;
+        }
+    }
+#endif
 }
 
 // An order-keeping unsigned key of a float: larger floats, larger keys.

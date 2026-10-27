@@ -384,6 +384,7 @@ pub const Launcher = struct {
     pub const fn_idx_pool_at = flashnext.idxPoolAt;
     pub const fn_qsa_prep = flashnext.qsaPrep;
     pub const fn_idx_scores = flashnext.idxScores;
+    pub const fn_idx_scores_mma = flashnext.idxScoresMma;
     pub const fn_idx_select = flashnext.idxSelect;
     pub const fn_sparse_attention = flashnext.sparseAttention;
     pub const fn_sparse_prompt = flashnext.sparsePrompt;

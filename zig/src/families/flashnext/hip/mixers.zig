@@ -529,7 +529,19 @@ fn attendPrompt(
         const dev_ends = try host.put(o, std.mem.sliceAsBytes(ends[0..n]));
         const nb: usize = if (sparse_rows) @intCast(complete[n - 1]) else 0;
         const scores = try o.arena.of(f32, @max(n * nb, 1));
-        if (sparse_rows) try o.l.fn_idx_scores(
+        // the prompt path runs under numerics=inexact on bf16 matrix-core builds (attention()): Flash Next's 4 x 128
+        // index heads take the matrix-core scores
+        if (sparse_rows and d.index_heads == 4 and di == 128) try o.l.fn_idx_scores_mma(
+            @ptrFromInt(iq + r0 * d.index_heads * di * 4),
+            @ptrFromInt(kv.pooled),
+            @ptrFromInt(dev_complete),
+            @ptrFromInt(scores),
+            @intCast(n),
+            @intCast(nb),
+            @intCast(nb),
+            @intCast(d.index_top),
+            o.stream,
+        ) else if (sparse_rows) try o.l.fn_idx_scores(
             @ptrFromInt(iq + r0 * d.index_heads * di * 4),
             @ptrFromInt(kv.pooled),
             @ptrFromInt(dev_complete),

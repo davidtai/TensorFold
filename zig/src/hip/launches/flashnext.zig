@@ -36,6 +36,7 @@ pub const Fns = struct {
     qsa_prep: Function,
     idx_scores: Function,
     idx_scores_quad: Function,
+    idx_scores_mma: Function, // a prompt slice's scores on the gfx11 matrix cores (numerics=inexact)
     idx_select: Function,
     sparse_parts: [2]Function, // groups of up to 6 and up to 12 query heads
     sparse_merge: Function,
@@ -60,6 +61,7 @@ pub const Fns = struct {
             .qsa_prep = try m.function("tf_fn_qsa_prep"),
             .idx_scores = try m.function("tf_fn_idx_scores"),
             .idx_scores_quad = try m.function("tf_fn_idx_scores_quad"),
+            .idx_scores_mma = try m.function("tf_fn_idx_scores_mma"),
             .idx_select = try m.function("tf_fn_idx_select"),
             .sparse_parts = .{ try m.function("tf_fn_sparse_parts6"), try m.function("tf_fn_sparse_parts12") },
             .sparse_merge = try m.function("tf_fn_sparse_merge"),
@@ -485,6 +487,15 @@ pub fn idxScores(
 }
 
 /// Each row's keys: its `top` best blocks and its tail past `top` complete blocks, else its first ends[r] keys.
+/// A prompt slice's scores of Flash Next's 4 x 128 index heads on the gfx11 matrix cores, bf16 pooled keys (indexer.hpp
+/// tf_fn_idx_scores_mma): numerics=inexact's prompt path only (the sums run in the matrix cores' order).
+pub fn idxScoresMma(l: *const Launcher, q: CF, pooled: C, complete: CI, scores: F, rows: c_int, blocks: c_int, stride: i64, top: c_int, s: S) Error!void {
+    if (blocks == 0 or rows == 0) return;
+    var a: Args = .{};
+    inline for (.{ ad(q), ad(pooled), ad(complete), ad(scores), rows, blocks, stride, top }) |v| try a.add(v);
+    return l.go(l.fnx.idx_scores_mma, dim(cdiv(blocks, 64), cdiv(rows, 64), 1), dim(128, 1, 1), 0, s, &a);
+}
+
 pub fn idxSelect(
     l: *const Launcher,
     scores: CF,
