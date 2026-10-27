@@ -703,3 +703,79 @@ test "the MoE combine inside the HC norm: moe_combine_kernel's then tf_fn_hc_nor
         }
     }
 }
+
+test "hyper-connection norm and mix, 16-byte kernels: the per-element kernels' bytes at 1 to 300 rows" {
+    const t = try Rig.open(64 << 20);
+    defer t.close();
+    if (!t.bf16) return; // the 16-byte kernels are bf16 only
+    var rng: rig.Rng = .{ .state = 0x4CA };
+    const s = 4;
+    const d = 2560;
+    const w = s * d;
+    const k = t.kind();
+    const st = t.stream.handle;
+    const scale = try gpa.alloc(f32, w);
+    defer gpa.free(scale);
+    for (scale) |*x| x.* = 1.0 + rng.unit() * 0.5;
+    var sc = try t.upload(scale);
+    defer sc.free();
+    for ([_]usize{ 1, 3, 4, 8, 300 }) |rows| {
+        const hh = try acts(t, &rng, rows * w, 2.0);
+        defer gpa.free(hh);
+        const hb = try acts(t, &rng, rows * d, 1.0);
+        defer gpa.free(hb);
+        const hi = try acts(t, &rng, rows * s, 1.0);
+        defer gpa.free(hi);
+        // the branch as one fp32 share holds the same values: the shares path is the old 1,024-thread kernel
+        const fb = try gpa.alloc(f32, rows * d);
+        defer gpa.free(fb);
+        for (fb, hb) |*f, b| f.* = value(t, b);
+        var h = try t.upload(hh);
+        defer h.free();
+        var branch = try t.upload(hb);
+        defer branch.free();
+        var share = try t.upload(fb);
+        defer share.free();
+        var inject = try t.upload(hi);
+        defer inject.free();
+        for ([_]bool{ true, false }) |with_branch| {
+            var outs = [_]DeviceBuffer{ try t.alloc(rows * w * 2), try t.alloc(rows * w * 2), try t.alloc(rows * w * 2), try t.alloc(rows * w * 2) };
+            defer for (&outs) |*b| b.free();
+            try t.on.fn_hc_norm(ptr(?*const anyopaque, h), if (with_branch) ptr(?*const anyopaque, branch) else null, ptr(?*const anyopaque, inject), ptr(?*anyopaque, outs[0]), ptr(?*anyopaque, outs[1]), ptr(?[*]const f32, sc), k, @intCast(rows), s, d, 1e-6, st);
+            try t.on.fn_hc_norm_shares(ptr(?*const anyopaque, h), if (with_branch) ptr(?*const anyopaque, share) else null, ptr(?*const anyopaque, inject), ptr(?*anyopaque, outs[2]), ptr(?*anyopaque, outs[3]), ptr(?[*]const f32, sc), k, @intCast(rows), s, d, 1e-6, 1, 0, st);
+            try t.stream.synchronize();
+            for ([_][2]usize{ .{ 0, 2 }, .{ 1, 3 } }) |pair| {
+                const a = try rig.download(u16, outs[pair[0]]);
+                defer gpa.free(a);
+                const b = try rig.download(u16, outs[pair[1]]);
+                defer gpa.free(b);
+                try std.testing.expectEqualSlices(u16, b, a);
+            }
+        }
+        // the mix over fp32 and bf16 g against the per-element kernel
+        const gh = try gpa.alloc(f32, rows * w);
+        defer gpa.free(gh);
+        for (gh) |*x| x.* = rng.unit() * 6.0;
+        const g16 = try acts(t, &rng, rows * w, 6.0);
+        defer gpa.free(g16);
+        var g32 = try t.upload(gh);
+        defer g32.free();
+        var gb = try t.upload(g16);
+        defer gb.free();
+        var x = try t.upload(hh);
+        defer x.free();
+        for ([_]c_int{ 0, k }) |gkind| {
+            var mixed = [_]DeviceBuffer{ try t.alloc(rows * d * 2), try t.alloc(rows * d * 2) };
+            defer for (&mixed) |*b| b.free();
+            const gp = if (gkind == 0) ptr(?*const anyopaque, g32) else ptr(?*const anyopaque, gb);
+            try t.on.fn_hc_mix(gp, gkind, ptr(?*const anyopaque, x), ptr(?*anyopaque, mixed[0]), k, @intCast(rows), s, d, st);
+            try t.on.fn_hc_mix_scalar(gp, gkind, ptr(?*const anyopaque, x), ptr(?*anyopaque, mixed[1]), k, @intCast(rows), s, d, st);
+            try t.stream.synchronize();
+            const a = try rig.download(u16, mixed[0]);
+            defer gpa.free(a);
+            const b = try rig.download(u16, mixed[1]);
+            defer gpa.free(b);
+            try std.testing.expectEqualSlices(u16, b, a);
+        }
+    }
+}

@@ -23,9 +23,11 @@ const kernels = @import("../kernels.zig");
 pub const Fns = struct {
     hc_norm: Function,
     hc_norm_moe: Function,
+    hc_norm_v: Function, // bf16 streams of 2,560, one rank: 128 threads a block, 16-byte accesses, the same bits
     hc_gates: Function,
     rms_wide: Function,
     hc_mix: Function,
+    hc_mix8: Function, // bf16 activations, g bf16 or fp32: 8 outputs a thread, the same bits
     hc_up_mix: Function,
     ple_gate: Function,
     ple_conv: Function,
@@ -45,9 +47,11 @@ pub const Fns = struct {
         return .{
             .hc_norm = try m.function("tf_fn_hc_norm"),
             .hc_norm_moe = try m.function("tf_fn_hc_norm_moe"),
+            .hc_norm_v = try m.function("tf_fn_hc_norm_v"),
             .hc_gates = try m.function("tf_fn_hc_gates"),
             .rms_wide = try m.function("tf_fn_rms_wide"),
             .hc_mix = try m.function("tf_fn_hc_mix"),
+            .hc_mix8 = try m.function("tf_fn_hc_mix8"),
             .hc_up_mix = try m.function("tf_fn_hc_up_mix"),
             .ple_gate = try m.function("tf_fn_ple_gate"),
             .ple_conv = try m.function("tf_fn_ple_conv"),
@@ -133,6 +137,11 @@ pub fn hcNormShares(
     s: S,
 ) Error!void {
     if (dims > most_dims) return util.invalid("hcNorm");
+    if (world == 0 and kind == 2 and dims == 2560) {
+        var v: Args = .{};
+        inline for (.{ ad(h), ad(branch), ad(inject), ad(h_out), ad(x_out), ad(scale), streams, eps }) |x| try v.add(x);
+        return l.go(l.fnx.hc_norm_v, dim(streams, rows, 1), dim(128, 1, 1), 0, s, &v);
+    }
     var a: Args = .{};
     inline for (.{
         ad(h),
@@ -199,6 +208,16 @@ pub fn hcMix(
     dims: c_int,
     s: S,
 ) Error!void {
+    if (kind == 2 and (gkind == 0 or gkind == 2) and @rem(dims, 8) == 0) {
+        var v: Args = .{};
+        inline for (.{ ad(g), gkind, ad(x), ad(mixed), rows, streams, dims }) |w| try v.add(w);
+        return l.flat(l.fnx.hc_mix8, @divExact(@as(i64, rows) * dims, 8), s, &v);
+    }
+    return hcMixScalar(l, g, gkind, x, mixed, kind, rows, streams, dims, s);
+}
+
+/// hcMix on the per-element kernel (any kinds): the reference the bf16 path's bytes are tested against.
+pub fn hcMixScalar(l: *const Launcher, g: C, gkind: c_int, x: C, mixed: P, kind: c_int, rows: c_int, streams: c_int, dims: c_int, s: S) Error!void {
     var a: Args = .{};
     inline for (.{ ad(g), gkind, ad(x), ad(mixed), kind, rows, streams, dims }) |v| try a.add(v);
     try l.flat(l.fnx.hc_mix, @as(i64, rows) * dims, s, &a);

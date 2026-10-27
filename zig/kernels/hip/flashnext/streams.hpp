@@ -93,6 +93,120 @@ tf_fn_hc_norm_moe(const void* h, const float* y, const float* wts, const void* i
         inject, h_out, x_out, scale, kind, streams, dims, eps);
 }
 
+// tf_fn_hc_norm over bf16 streams of 2,560 in a 128-thread block (s, r), 16-byte accesses, the same bits: lane L holds
+// the old 1,024-thread block's threads 8 L .. 8 L + 7 (each thread's values at d, d + 1,024, d + 2,048 in that order;
+// the xor 16 and 8 of its wave across lanes L ^ 2 and L ^ 1, xor 4, 2, 1 in registers; then its 32 waves in order).
+constexpr int kNormVThreads = 128;
+constexpr int kNormVDims = 2560;
+extern "C" __global__ void __launch_bounds__(kNormVThreads)
+tf_fn_hc_norm_v(const uint16_t* h, const uint16_t* branch, const uint16_t* inject, uint16_t* h_out, uint16_t* x_out,
+                const float* scale, int streams, float eps) {
+    __shared__ float scratch[kNormThreads / 32];
+    const int s = blockIdx.x, r = blockIdx.y, lane = threadIdx.x;
+    const long long base = (static_cast<long long>(r) * streams + s) * kNormVDims;
+    const float inj = branch != nullptr ? bf16_to_float(inject[static_cast<long long>(r) * streams + s]) : 0.f;
+    float v[3][8];
+    float part[8];
+#pragma unroll
+    for (int e = 0; e < 8; ++e) part[e] = 0.f;
+#pragma unroll
+    for (int j = 0; j < 3; ++j) {
+        const int d0 = 8 * lane + j * kNormThreads;
+        if (d0 >= kNormVDims) break;
+        const uint4 hv = *reinterpret_cast<const uint4*>(h + base + d0);
+        const uint32_t hw[4] = {hv.x, hv.y, hv.z, hv.w};
+        uint32_t bw[4] = {0, 0, 0, 0};
+        if (branch != nullptr) {
+            const uint4 bv = *reinterpret_cast<const uint4*>(branch + static_cast<long long>(r) * kNormVDims + d0);
+            bw[0] = bv.x, bw[1] = bv.y, bw[2] = bv.z, bw[3] = bv.w;
+        }
+#pragma unroll
+        for (int e = 0; e < 8; ++e) {
+            float x = bf16_to_float(static_cast<uint16_t>(hw[e >> 1] >> ((e & 1) * 16)));
+            if (branch != nullptr) {
+                const float b = bf16_to_float(static_cast<uint16_t>(bw[e >> 1] >> ((e & 1) * 16)));
+                const float add = rounded(b * inj, 2);
+                x = rounded(x + add, 2);
+            }
+            v[j][e] = x;
+            part[e] += x * x;
+        }
+    }
+    // the old wave tree: xor 16 (lane ^ 2), xor 8 (lane ^ 1), then xor 4, 2, 1 inside the lane's 8
+#pragma unroll
+    for (int e = 0; e < 8; ++e) part[e] = part[e] + __shfl_xor(part[e], 2, 32);
+#pragma unroll
+    for (int e = 0; e < 8; ++e) part[e] = part[e] + __shfl_xor(part[e], 1, 32);
+#pragma unroll
+    for (int m = 4; m > 0; m >>= 1) {
+        float next[8];
+#pragma unroll
+        for (int e = 0; e < 8; ++e) next[e] = part[e] + part[e ^ m];
+#pragma unroll
+        for (int e = 0; e < 8; ++e) part[e] = next[e];
+    }
+    if ((lane & 3) == 0) scratch[lane >> 2] = part[0];
+    __syncthreads();
+    float total = 0.f;
+    for (int w = 0; w < kNormThreads / 32; ++w) total += scratch[w];
+    const float rinv = rsqrtf(total / static_cast<float>(kNormVDims) + eps);
+#pragma unroll
+    for (int j = 0; j < 3; ++j) {
+        const int d0 = 8 * lane + j * kNormThreads;
+        if (d0 >= kNormVDims) break;
+        uint32_t ho[4], xo[4];
+#pragma unroll
+        for (int q = 0; q < 4; ++q) {
+            const float a0 = v[j][2 * q], a1 = v[j][2 * q + 1];
+            ho[q] = static_cast<uint32_t>(float_to_bf16(a0)) | (static_cast<uint32_t>(float_to_bf16(a1)) << 16);
+            const float x0 = (a0 * rinv) * scale[s * kNormVDims + d0 + 2 * q];
+            const float x1 = (a1 * rinv) * scale[s * kNormVDims + d0 + 2 * q + 1];
+            xo[q] = static_cast<uint32_t>(float_to_bf16(x0)) | (static_cast<uint32_t>(float_to_bf16(x1)) << 16);
+        }
+        if (h_out != nullptr) *reinterpret_cast<uint4*>(h_out + base + d0) = uint4{ho[0], ho[1], ho[2], ho[3]};
+        *reinterpret_cast<uint4*>(x_out + base + d0) = uint4{xo[0], xo[1], xo[2], xo[3]};
+    }
+}
+
+// tf_fn_hc_mix over bf16 activations, 8 neighbouring outputs a thread (16-byte loads of g and x), the same bits.
+extern "C" __global__ void tf_fn_hc_mix8(const void* g, int gkind, const uint16_t* x, uint16_t* mixed, int rows,
+                                         int streams, int dims) {
+    const long long i = gid() * 8;
+    if (i >= static_cast<long long>(rows) * dims) return;
+    const long long r = i / dims;
+    const int d = static_cast<int>(i % dims);
+    float total[8];
+#pragma unroll
+    for (int e = 0; e < 8; ++e) total[e] = 0.f;
+    for (int s = 0; s < streams; ++s) {
+        const long long at = (r * streams + s) * dims + d;
+        float gv[8];
+        if (gkind == 2) {
+            const uint4 u = *reinterpret_cast<const uint4*>(static_cast<const uint16_t*>(g) + at);
+            const uint32_t w[4] = {u.x, u.y, u.z, u.w};
+#pragma unroll
+            for (int e = 0; e < 8; ++e) gv[e] = bf16_to_float(static_cast<uint16_t>(w[e >> 1] >> ((e & 1) * 16)));
+        } else {
+            const float4 a = *reinterpret_cast<const float4*>(static_cast<const float*>(g) + at);
+            const float4 b = *reinterpret_cast<const float4*>(static_cast<const float*>(g) + at + 4);
+            gv[0] = a.x, gv[1] = a.y, gv[2] = a.z, gv[3] = a.w, gv[4] = b.x, gv[5] = b.y, gv[6] = b.z, gv[7] = b.w;
+        }
+        const uint4 xu = *reinterpret_cast<const uint4*>(x + at);
+        const uint32_t xw[4] = {xu.x, xu.y, xu.z, xu.w};
+#pragma unroll
+        for (int e = 0; e < 8; ++e) {
+            const float gate = rounded(sigmoid(rounded(gv[e], 2)), 2);
+            total[e] += rounded(gate * bf16_to_float(static_cast<uint16_t>(xw[e >> 1] >> ((e & 1) * 16))), 2);
+        }
+    }
+    uint32_t o[4];
+#pragma unroll
+    for (int q = 0; q < 4; ++q)
+        o[q] = static_cast<uint32_t>(float_to_bf16(total[2 * q] / static_cast<float>(streams))) |
+               (static_cast<uint32_t>(float_to_bf16(total[2 * q + 1] / static_cast<float>(streams))) << 16);
+    *reinterpret_cast<uint4*>(mixed + i) = uint4{o[0], o[1], o[2], o[3]};
+}
+
 // From z [rows, low (+ streams with inject)] / streams: silu for the up projection, 2 sigmoid for the inject gates.
 extern "C" __global__ void tf_fn_hc_gates(const float* z, void* act, void* inject, int kind, int rows, int low,
                                           int streams) {

@@ -372,6 +372,7 @@ pub const Launcher = struct {
     pub const fn_hc_norm_moe = flashnext.hcNormMoe;
     pub const fn_hc_gates = flashnext.hcGates;
     pub const fn_hc_mix = flashnext.hcMix;
+    pub const fn_hc_mix_scalar = flashnext.hcMixScalar;
     pub const fn_hc_up_mix = flashnext.hcUpMix;
     pub const fn_hc_up = flashnext.hc_up;
     pub const fn_rms_wide = flashnext.rmsWide;
