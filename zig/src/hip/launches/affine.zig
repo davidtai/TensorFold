@@ -590,7 +590,7 @@ pub const Kernels = struct {
         try go(r, f, .{ .x = cdiv(a.n, 128) * cdiv(a.m, 128) }, .{ .x = 256 }, s, &args);
     }
 
-    /// The K tiles/dense_inexact.hpp compiles (affine_wmma_dense_inexact): 128 x 256 blocks.
+    /// The K tiles/dense_inexact.hpp compiles (affine_wmma_dense_inexact): 256 x 128 blocks.
     pub const inexact_ks = [_]c_int{ 2560, 6144 };
 
     pub fn inexactIndex(k: c_int) ?usize {
@@ -603,7 +603,7 @@ pub const Kernels = struct {
         const f = k.dense_inexact[inexactIndex(a.k) orelse return refuse("inexact dense K")] orelse return refuse("inexact dense tile");
         var args: hl.Args = .{};
         try args.add(a);
-        try go(r, f, .{ .x = cdiv(a.n, 256) * cdiv(a.m, 128) }, .{ .x = 256 }, s, &args);
+        try go(r, f, .{ .x = cdiv(a.n, 128) * cdiv(a.m, 256) }, .{ .x = 256 }, s, &args);
     }
 
     /// K-parallel tile `tier` (an index of kp_tiles) of a short prompt.

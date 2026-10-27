@@ -5,9 +5,12 @@
 // w = bf16(fma(scale, q, bias)) is staged in LDS, and one WMMA accumulation runs over all K: no per-group dot and
 // fold, so a wave holds a 64 x 64 tile (16 accumulators) and reads half a fragment a WMMA where dense_gemm.hpp reads
 // three quarters. The sums differ from the exact tiles' by the BF16 rounding of w (relative RMS about 1.7e-3).
-// Block 128 rows x 256 columns, 8 waves, K in 64-wide windows in one LDS buffer with the next window in registers:
-// Strata's kernel_bk64 layout (github.com/Niko1221/Strata, MIT, src/prefill/wmma_gemm.cu@4b9e05a2:396-482).
-// gfx1151 at 8,192 rows: dn_z 6.58 ms (39.2 TFLOPS) against 7.66 exact, out 6.88 against 7.90 (w2/dense_inexact.hip).
+// Block 256 rows x 128 columns, 8 waves of 64 x 64 (4 down, 2 across), K in 64-wide windows in one LDS buffer with the
+// next window in registers: Strata's kernel_bk64 layout (github.com/Niko1221/Strata, MIT,
+// src/prefill/wmma_gemm.cu@4b9e05a2:396-482). A thread stages 2 x groups and 1 weight group a window; a wave reads its
+// 4 weight fragments, then one x fragment a row tile. Each output's WMMA chain over K is the one of any block shape.
+// gfx1151 at 8,192 rows (w2/dense_inexact.hip, against 128 x 256 blocks): dn_qkv 10.43 ms (41.2 TFLOPS) against 11.47,
+// dn_z 6.33 against 6.77, attn_q 12.49 against 13.82, index 0.708 against 0.835, out 6.80 against 6.80.
 
 #include "common/wmma.hpp"
 #include "quant/mlx.hpp"
@@ -17,8 +20,9 @@ namespace tf {
 namespace rocm {
 
 namespace dense_inexact {
-constexpr int kBM = 128;
-constexpr int kBN = 256;
+constexpr int kBM = 256;
+constexpr int kBN = 128;
+constexpr int kXPer = kBM * 2 / 256;  // a thread's 64-byte x groups a window
 constexpr int kKW = 64;
 constexpr int kLd = kKW + 8;  // bf16 a staged row
 constexpr int kThreads = 256;
@@ -61,48 +65,56 @@ __device__ __forceinline__ void wmma_dense_inexact_tile(const Affine& a) {
     const int wave = __builtin_amdgcn_readfirstlane(tid >> 5);
     const int rl = lane & 15;
     const int rh = lane >> 4;
-    // a thread's loads: group q of x row r (64 bytes); column n0 + tid's two groups of codes (2 x 16 bytes) and terms
-    const int xr = tid >> 1;
+    // a thread's loads: group q of x rows r and r + 128 (64 bytes each); group g of column n0 + tid / 2's codes
+    // (16 bytes) and its scale and bias
+    const u32x4* xsrc[kXPer];
+    int xr[kXPer];
     const int xq = tid & 1;
-    const int xrow = m0 + xr < a.m ? m0 + xr : a.m - 1;
-    const u32x4* xsrc = reinterpret_cast<const u32x4*>(static_cast<const __bf16*>(a.x) + static_cast<long long>(xrow) * K) + xq * 4;
-    const int col = n0 + tid < a.n ? n0 + tid : a.n - 1;
-    const uint4* wsrc = reinterpret_cast<const uint4*>(a.words + static_cast<long long>(col) * kWordsRow);
-    const uint16_t* ssrc = static_cast<const uint16_t*>(a.scale.p) + static_cast<long long>(col) * kGroups;
-    const uint16_t* bsrc = static_cast<const uint16_t*>(a.bias.p) + static_cast<long long>(col) * kGroups;
-    u32x4 xreg[4];
-    uint4 wreg[2];
-    uint16_t sreg[2];
-    uint16_t breg[2];
+#pragma unroll
+    for (int i = 0; i < kXPer; ++i) {
+        xr[i] = (256 * i + tid) >> 1;
+        const int row = m0 + xr[i] < a.m ? m0 + xr[i] : a.m - 1;
+        xsrc[i] = reinterpret_cast<const u32x4*>(static_cast<const __bf16*>(a.x) + static_cast<long long>(row) * K) + xq * 4;
+    }
+    const int wcol = tid >> 1;
+    const int wg = tid & 1;
+    const int col = n0 + wcol < a.n ? n0 + wcol : a.n - 1;
+    const uint4* wsrc = reinterpret_cast<const uint4*>(a.words + static_cast<long long>(col) * kWordsRow) + wg;
+    const uint16_t* ssrc = static_cast<const uint16_t*>(a.scale.p) + static_cast<long long>(col) * kGroups + wg;
+    const uint16_t* bsrc = static_cast<const uint16_t*>(a.bias.p) + static_cast<long long>(col) * kGroups + wg;
+    u32x4 xreg[kXPer][4];
+    uint4 wreg;
+    uint16_t sreg;
+    uint16_t breg;
     // unconditional loads (a window past the last repeats it): no vmcnt(0) at the stash
     auto load = [&](int w) {
         const int wl = w < kWindows ? w : kWindows - 1;
 #pragma unroll
-        for (int v = 0; v < 4; ++v) xreg[v] = xsrc[wl * 8 + v];
+        for (int i = 0; i < kXPer; ++i) {
 #pragma unroll
-        for (int g = 0; g < 2; ++g) {
-            wreg[g] = wsrc[2 * wl + g];
-            sreg[g] = ssrc[2 * wl + g];
-            breg[g] = bsrc[2 * wl + g];
+            for (int v = 0; v < 4; ++v) xreg[i][v] = xsrc[i][wl * 8 + v];
         }
+        wreg = wsrc[2 * wl];
+        sreg = ssrc[2 * wl];
+        breg = bsrc[2 * wl];
     };
     auto stash = [&]() {
-        u32x4* xd = reinterpret_cast<u32x4*>(xs + xr * kLd + xq * 32);
 #pragma unroll
-        for (int v = 0; v < 4; ++v) xd[v] = xreg[v];
-        u32x4* wd = reinterpret_cast<u32x4*>(ws + tid * kLd);
+        for (int i = 0; i < kXPer; ++i) {
+            u32x4* xd = reinterpret_cast<u32x4*>(xs + xr[i] * kLd + xq * 32);
 #pragma unroll
-        for (int g = 0; g < 2; ++g) {
-            const float s = __uint_as_float(static_cast<uint32_t>(sreg[g]) << 16);
-            const float b = __uint_as_float(static_cast<uint32_t>(breg[g]) << 16);
-            const uint32_t wv[4] = {wreg[g].x, wreg[g].y, wreg[g].z, wreg[g].w};
-#pragma unroll
-            for (int v = 0; v < 4; ++v) wd[g * 4 + v] = dequant8(wv[v], s, b);
+            for (int v = 0; v < 4; ++v) xd[v] = xreg[i][v];
         }
+        const float s = __uint_as_float(static_cast<uint32_t>(sreg) << 16);
+        const float b = __uint_as_float(static_cast<uint32_t>(breg) << 16);
+        const uint32_t wv[4] = {wreg.x, wreg.y, wreg.z, wreg.w};
+        u32x4* wd = reinterpret_cast<u32x4*>(ws + wcol * kLd + wg * 32);
+#pragma unroll
+        for (int v = 0; v < 4; ++v) wd[v] = dequant8(wv[v], s, b);
     };
     // wave (wm, wn): rows 64 wm.., columns 64 wn..; a lane: column lane % 16, rows 2 i + lane / 16
-    const int wm = wave & 1;
-    const int wn = wave >> 1;
+    const int wm = wave & 3;
+    const int wn = wave >> 2;
     f32x8 acc[4][4];
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
@@ -116,16 +128,14 @@ __device__ __forceinline__ void wmma_dense_inexact_tile(const Affine& a) {
     for (int w = 0; w < kWindows; ++w) {
 #pragma unroll
         for (int ks = 0; ks < kKW; ks += 16) {
-            bf16x16 af[4];
             bf16x16 bf[4];
-#pragma unroll
-            for (int i = 0; i < 4; ++i) af[i] = frag16(reinterpret_cast<const uint32_t*>(xs + (wm * 64 + i * 16 + rl) * kLd + ks));
 #pragma unroll
             for (int j = 0; j < 4; ++j) bf[j] = frag16(reinterpret_cast<const uint32_t*>(ws + (wn * 64 + j * 16 + rl) * kLd + ks));
 #pragma unroll
             for (int i = 0; i < 4; ++i) {
+                const bf16x16 af = frag16(reinterpret_cast<const uint32_t*>(xs + (wm * 64 + i * 16 + rl) * kLd + ks));
 #pragma unroll
-                for (int j = 0; j < 4; ++j) acc[i][j] = T::mma(af[i], bf[j], acc[i][j]);
+                for (int j = 0; j < 4; ++j) acc[i][j] = T::mma(af, bf[j], acc[i][j]);
             }
         }
         lds_barrier();
