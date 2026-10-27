@@ -101,7 +101,8 @@ pub fn wyOnMatrix() bool {
 /// A prompt's DeltaNet over `length` rows (dk = dv = 128, batch 1, state in place) in 32-token chunks on the gfx11
 /// matrix cores: f16 operands, fp32 accumulators, another order than tf_gated_delta (numerics=inexact only).
 /// `scratch`: wyScratch(length, key_heads, value_heads) bytes.
-pub fn tf_gdn_wy(l: *const Launcher, q: CF, k: CF, v: CF, gate: CF, beta: CF, state: F, y: F, length: c_int, key_heads: c_int, value_heads: c_int, scratch: u64, s: S) Error!void {
+/// `half`: q, k and v are f16 (tf_gdn_prompt_prep's half store), else fp32; the same packed operands either way.
+pub fn tf_gdn_wy(l: *const Launcher, q: CF, k: CF, v: CF, gate: CF, beta: CF, state: F, y: F, length: c_int, key_heads: c_int, value_heads: c_int, half: bool, scratch: u64, s: S) Error!void {
     if (key_heads < 1 or value_heads < 1 or @rem(value_heads, key_heads) != 0 or length < 1) return invalid("gated delta wy");
     const n: usize = @intCast(length);
     const kh: usize = @intCast(key_heads);
@@ -124,6 +125,7 @@ pub fn tf_gdn_wy(l: *const Launcher, q: CF, k: CF, v: CF, gate: CF, beta: CF, st
     try a.add(length);
     try a.add(key_heads);
     try a.add(value_heads);
+    try a.add(@as(c_int, @intFromBool(half)));
     try l.go(l.gdn_wy[0], dim(vh, chunks, 1), dim(128, 1, 1), 0, s, &a);
     var b: Args = .{};
     inline for (.{ kT, q16, vT, t1, t2, p, g }) |x| try b.add(x);

@@ -237,13 +237,27 @@ fn promptPrep(t: *Rig, rng: *rig.Rng, rows: usize, with_state: bool) !void {
     }
     {
         const b = bufs[1];
-        try l.tf_gdn_prompt_prep(ptr(at(x)), kind, @ptrFromInt(at(weight)), @ptrCast(@alignCast(st)), @ptrFromInt(at(b[5])), @ptrFromInt(at(b[0])), @ptrFromInt(at(b[1])), @ptrFromInt(at(b[2])), @ptrFromInt(at(norm)), @ptrFromInt(at(norm) + 512), eps, @intCast(rows), @intCast(kw), @intCast(vw), @intCast(kernel), ptr(at(dev_a)), ptr(at(dev_b)), @ptrFromInt(at(dev_log)), @ptrFromInt(at(dev_log) + vheads * 4), @ptrFromInt(at(b[3])), @ptrFromInt(at(b[4])), @intCast(vheads), s);
+        try l.tf_gdn_prompt_prep(ptr(at(x)), kind, @ptrFromInt(at(weight)), @ptrCast(@alignCast(st)), @ptrFromInt(at(b[5])), @ptrFromInt(at(b[0])), @ptrFromInt(at(b[1])), @ptrFromInt(at(b[2])), @ptrFromInt(at(norm)), @ptrFromInt(at(norm) + 512), eps, @intCast(rows), @intCast(kw), @intCast(vw), @intCast(kernel), ptr(at(dev_a)), ptr(at(dev_b)), @ptrFromInt(at(dev_log)), @ptrFromInt(at(dev_log) + vheads * 4), @ptrFromInt(at(b[3])), @ptrFromInt(at(b[4])), @intCast(vheads), false, s);
     }
     try t.stream.synchronize();
     for (0..6) |i| try same(bufs[0][i], bufs[1][i]);
+    // the half store (tf_gdn_wy's f16 input): q, k and v are the fp32 values rounded to f16 (nearest even) bit for bit,
+    // gate, beta and the conv state the same bytes
+    var half: [6]DeviceBuffer = .{ try t.alloc(rows * kw * 2), try t.alloc(rows * kw * 2), try t.alloc(rows * vw * 2), try t.alloc(rows * vheads * 4), try t.alloc(rows * vheads * 4), try t.alloc((kernel - 1) * ch * 4) };
+    defer for (&half) |*b| b.free();
+    try l.tf_gdn_prompt_prep(ptr(at(x)), kind, @ptrFromInt(at(weight)), @ptrCast(@alignCast(st)), @ptrFromInt(at(half[5])), @ptrFromInt(at(half[0])), @ptrFromInt(at(half[1])), @ptrFromInt(at(half[2])), @ptrFromInt(at(norm)), @ptrFromInt(at(norm) + 512), eps, @intCast(rows), @intCast(kw), @intCast(vw), @intCast(kernel), ptr(at(dev_a)), ptr(at(dev_b)), @ptrFromInt(at(dev_log)), @ptrFromInt(at(dev_log) + vheads * 4), @ptrFromInt(at(half[3])), @ptrFromInt(at(half[4])), @intCast(vheads), true, s);
+    try t.stream.synchronize();
+    for (0..3) |i| {
+        const wide = try rig.download(f32, bufs[1][i]);
+        defer gpa.free(wide);
+        const got = try rig.download(u16, half[i]);
+        defer gpa.free(got);
+        for (wide, got) |w, h| try std.testing.expectEqual(rig.f16Bits(w), h);
+    }
+    for (3..6) |i| try same(bufs[1][i], half[i]);
 }
 
-test "the prompt's merged conv, split, norms and gates write the chain's q, k, v, gate, beta and conv state" {
+test "the prompt's merged conv, split, norms and gates write the chain's q, k, v, gate, beta and conv state, and in f16 the same values rounded" {
     const t = try Rig.open(1 << 20);
     defer t.close();
     var rng: rig.Rng = .{ .state = 0x6D3 };

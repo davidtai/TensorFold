@@ -71,15 +71,22 @@ __device__ __forceinline__ wy_h16x16 wy_transposed(const wy_f32x8& x, int half) 
 // kT16 [key head][dk][token] and q16 [key head][token][dk] (the key head's first value head writes them),
 // vT16 [value head][dv][token], t1 = T diag(beta e^G), t2 = T diag(beta), p = P (rows: token i), g = G.
 extern "C" __global__ void __launch_bounds__(128)
-tf_gdn_wy_prep(const float* __restrict__ q, const float* __restrict__ k, const float* __restrict__ v,
+tf_gdn_wy_prep(const void* __restrict__ q, const void* __restrict__ k, const void* __restrict__ v,
                const float* __restrict__ gate, const float* __restrict__ beta, _Float16* __restrict__ kT16,
                _Float16* __restrict__ q16, _Float16* __restrict__ vT16, _Float16* __restrict__ t1,
                _Float16* __restrict__ t2, _Float16* __restrict__ p, float* __restrict__ g, int length, int key_heads,
-               int value_heads) {
+               int value_heads, int f16_in) {
 #if TF_DEVICE_WMMA_GFX11
     using namespace tf::rocm;
     constexpr int C = kWyChunk, D = kWyDim;
     const int head = blockIdx.x, chunk = blockIdx.y;
+    // f16_in: q, k and v arrive as f16 (tf_gdn_prompt_prep's half store); widened exactly, the LDS store below gives
+    // back the same f16 bits it would round the fp32 values to
+    auto get = [f16_in](const void* base, size_t at) {
+        if (!f16_in) return *reinterpret_cast<const float4*>(static_cast<const float*>(base) + at);
+        const _Float16* h = static_cast<const _Float16*>(base) + at;
+        return float4{static_cast<float>(h[0]), static_cast<float>(h[1]), static_cast<float>(h[2]), static_cast<float>(h[3])};
+    };
     const int t0 = chunk * C, n = min(C, length - t0);
     const int group = value_heads / key_heads, kh = head / group;
     const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5, col = lane & 15, half = lane >> 4;
@@ -96,9 +103,9 @@ tf_gdn_wy_prep(const float* __restrict__ q, const float* __restrict__ k, const f
         kv[it] = qv[it] = vv[it] = float4{0.f, 0.f, 0.f, 0.f};
         if (c < n) {
             const size_t at = (static_cast<size_t>(t0 + c) * key_heads + kh) * D + e;
-            kv[it] = *reinterpret_cast<const float4*>(k + at);
-            qv[it] = *reinterpret_cast<const float4*>(q + at);
-            vv[it] = *reinterpret_cast<const float4*>(v + (static_cast<size_t>(t0 + c) * value_heads + head) * D + e);
+            kv[it] = get(k, at);
+            qv[it] = get(q, at);
+            vv[it] = get(v, (static_cast<size_t>(t0 + c) * value_heads + head) * D + e);
         }
     }
     if (wave == 0) {

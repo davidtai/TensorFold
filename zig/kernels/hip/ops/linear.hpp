@@ -56,7 +56,12 @@ extern "C" __global__ void __launch_bounds__(256)
 tf_gdn_prompt_prep(const void* x, int kind, const float* weight, const float* state, float* new_state, float* q_out,
                    float* k_out, float* v_out, const float* qw, const float* kw_w, float eps, int len, int kwidth,
                    int vwidth, int kernel, const void* a, const void* b, const float* a_log, const float* dt_bias,
-                   float* gate, float* beta, int heads) {
+                   float* gate, float* beta, int heads, int half) {
+    // half: q, k and v go out as f16 (RNE, the rounding tf_gdn_wy_prep's LDS store applies to them), else fp32
+    auto put = [half](float* base, long long i, float value) {
+        if (half) reinterpret_cast<_Float16*>(base)[i] = static_cast<_Float16>(value);
+        else base[i] = value;
+    };
     const int channels = 2 * kwidth + vwidth, kept = kernel - 1;
     const int segs = (len + kPrepSeg - 1) / kPrepSeg;
     const int qk_heads = 2 * kwidth / 128;
@@ -100,13 +105,13 @@ tf_gdn_prompt_prep(const void* x, int kind, const float* weight, const float* st
 #pragma unroll
             for (int mask = 16; mask > 0; mask >>= 1) sum += __shfl_xor(sum, mask, 32);
             const float inv = rsqrtf(__shfl(sum, 0, 32) / 128.f + eps);
-            float* row = out + (static_cast<long long>(r) * (kwidth / 128) + head) * 128;
+            const long long row = (static_cast<long long>(r) * (kwidth / 128) + head) * 128;
 #pragma unroll
             for (int j = 0; j < 4; ++j) {
                 const int i = lane + 32 * j;
                 float value = v[j] * inv;
                 value *= nw[i];
-                row[i] = value;
+                put(out, row + i, value);
             }
         }
         return;
@@ -129,7 +134,7 @@ tf_gdn_prompt_prep(const void* x, int kind, const float* weight, const float* st
                 float p = win[tap] * w[tap];
                 acc = acc + p;
             }
-            v_out[static_cast<long long>(r) * vwidth + vc] = silu(acc);
+            put(v_out, static_cast<long long>(r) * vwidth + vc, silu(acc));
             for (int tap = 0; tap + 1 < kernel; ++tap) win[tap] = win[tap + 1];
         }
         return;

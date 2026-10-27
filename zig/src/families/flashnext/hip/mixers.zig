@@ -76,7 +76,7 @@ pub fn linear(
             }, o.stream);
             at_row += n;
         }
-        return recur(o, m, l, segs, index, q, k, v, gate, beta, z, rows, true);
+        return recur(o, m, l, segs, index, q, k, v, gate, beta, z, rows, true, false);
     }
     if (o.fused() and d.key_dim == 128 and d.conv <= 8) {
         // a stream's conv, split, q and k norms and gates in one launch (tf_gdn_prompt_prep: the chain's values)
@@ -86,6 +86,8 @@ pub fn linear(
             const st = g.c.linearAt(index);
             const conv_bytes = (d.conv - 1) * ch * 4;
             const next = try o.arena.take(conv_bytes);
+            // the WY walk reads q, k and v as f16 only (recur takes the same wyFits): written so, at half the bytes
+            const half = wyFits(o, d, false, n);
             try o.l.tf_gdn_prompt_prep(
                 @ptrFromInt(forward.at(qkv, at_row * ch).ptr),
                 @backingInt(m.act),
@@ -109,12 +111,13 @@ pub fn linear(
                 @ptrFromInt(gate + at_row * d.value_heads * 4),
                 @ptrFromInt(beta + at_row * d.value_heads * 4),
                 @intCast(d.value_heads),
+                half,
                 o.stream,
             );
             if (o.stream != hip.counting) try hip.runtime.check(o.l.r.api.hipMemcpyDtoDAsync(@ptrFromInt(st.conv), @ptrFromInt(next), conv_bytes, o.stream));
             at_row += n;
         }
-        return recur(o, m, l, segs, index, q, k, v, gate, beta, z, rows, false);
+        return recur(o, m, l, segs, index, q, k, v, gate, beta, z, rows, false, true);
     }
     const mixed = try o.arena.of(f32, rows * ch);
     var off: usize = 0;
@@ -156,7 +159,7 @@ pub fn linear(
         m.qk.eps,
     );
     try o.gdnGatePrefill(a, b, l.a_log, l.dt_bias, gate, beta, rows, d.value_heads);
-    return recur(o, m, l, segs, index, q, k, v, gate, beta, z, rows, false);
+    return recur(o, m, l, segs, index, q, k, v, gate, beta, z, rows, false, false);
 }
 
 /// The delta rule a stream at a time (a window's rows each with its state kept aside), the gated norm, the out product.
@@ -174,6 +177,8 @@ fn recur(
     z: Tensor,
     rows: usize,
     window: bool,
+    /// tf_gdn_prompt_prep wrote the WY walk's segments' q, k and v in f16 (each segment at its fp32 offset)
+    half: bool,
 ) !Tensor {
     const d = m.dims;
     const kw = d.key_heads * d.key_dim;
@@ -199,6 +204,7 @@ fn recur(
                 @intCast(n),
                 @intCast(d.key_heads),
                 @intCast(d.value_heads),
+                half,
                 scratch,
                 o.stream,
             );

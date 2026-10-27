@@ -228,6 +228,7 @@ test "the chunked matrix-core DeltaNet (numerics=inexact) stays within 5e-3 of t
             @intCast(sh.length),
             @intCast(sh.key_heads),
             @intCast(sh.value_heads),
+            false,
             rig.at(scratch),
             t.stream.handle,
         );
@@ -238,6 +239,69 @@ test "the chunked matrix-core DeltaNet (numerics=inexact) stays within 5e-3 of t
         defer gpa.free(gs);
         try rig.expect(relative(gy, ry) < 5e-3 and relative(gs, rs) < 5e-3, "wy length {d}: y {e}, state {e}", .{ sh.length, relative(gy, ry), relative(gs, rs) });
     }
+}
+
+/// tf_gdn_wy over q, k and v in f16 against the same inputs in fp32: the packed f16 operands, T, P, G, the rows and
+/// the state byte for byte (the fp32 walk rounds q, k and v to f16 as it packs them). Flash Next's heads.
+fn wyHalf(t: *Rig, sh: Shape) !void {
+    const in = try Inputs.make(sh, 0x4a1f + sh.length);
+    defer in.free();
+    var bufs: [2][7]DeviceBuffer = undefined; // q, k, v, state, y, scratch, gate and beta (one buffer)
+    const scratch_bytes = @import("../launches.zig").Launcher.gdn_wy_scratch(sh.length, sh.key_heads, sh.value_heads);
+    for (0..2) |w| {
+        const half = w == 1;
+        for (0..3) |i| {
+            const src = ([_][]f32{ in.q, in.k, in.v })[i];
+            if (!half) {
+                bufs[w][i] = try t.upload(src);
+                continue;
+            }
+            const h = try gpa.alloc(u16, src.len);
+            defer gpa.free(h);
+            for (src, h) |x, *b| b.* = rig.f16Bits(x);
+            bufs[w][i] = try t.upload(h);
+        }
+        bufs[w][3] = try t.upload(in.state);
+        bufs[w][4] = try t.alloc(sh.length * sh.value_heads * d * 4);
+        bufs[w][5] = try t.alloc(scratch_bytes);
+        bufs[w][6] = try t.alloc(2 * in.gate.len * 4);
+        try bufs[w][6].upload(0, std.mem.sliceAsBytes(in.gate));
+        try bufs[w][6].upload(in.gate.len * 4, std.mem.sliceAsBytes(in.beta));
+    }
+    defer for (&bufs) |*set| for (set) |*b| b.free();
+    for (0..2) |w| {
+        const b = bufs[w];
+        try t.on.tf_gdn_wy(
+            @ptrFromInt(rig.at(b[0])),
+            @ptrFromInt(rig.at(b[1])),
+            @ptrFromInt(rig.at(b[2])),
+            @ptrFromInt(rig.at(b[6])),
+            @ptrFromInt(rig.at(b[6]) + in.gate.len * 4),
+            @ptrFromInt(rig.at(b[3])),
+            @ptrFromInt(rig.at(b[4])),
+            @intCast(sh.length),
+            @intCast(sh.key_heads),
+            @intCast(sh.value_heads),
+            w == 1,
+            rig.at(b[5]),
+            t.stream.handle,
+        );
+    }
+    try t.stream.synchronize();
+    for ([_]usize{ 5, 4, 3 }) |i| {
+        const a = try rig.download(u8, bufs[0][i]);
+        defer gpa.free(a);
+        const b = try rig.download(u8, bufs[1][i]);
+        defer gpa.free(b);
+        try std.testing.expectEqualSlices(u8, a, b);
+    }
+}
+
+test "the chunked DeltaNet over f16 q, k and v packs the same operands and writes the same rows and state as over fp32" {
+    if (!@import("../launches.zig").Launcher.gdn_wy_on()) return error.SkipZigTest;
+    const t = try Rig.open(1 << 30);
+    defer t.close();
+    for ([_]usize{ 1, 33, 300, 4170 }) |length| try wyHalf(t, .{ .length = length, .key_heads = 16, .value_heads = 48 });
 }
 
 test "a prompt cut on either side of 64 rows gives the same rows and state as one call" {
