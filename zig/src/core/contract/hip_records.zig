@@ -591,8 +591,8 @@ const own_records = [_]Record{
         .launch = .{ .name = "prompt dense inexact tile 4-bit K 2560", .symbol = "_ZN2tf4rocm25affine_wmma_dense_inexactILi2560EEEvNS0_6AffineE", .image = "affine_tiles", .threads = 256, .served = limits.gfx11_only },
         .usage = .{
             .{ .vgprs = 0, .sgprs = 0, .lds = 0, .private = 0, .bound = 256, .wave = 32 },
-            .{ .vgprs = 255, .sgprs = 20, .lds = 55296, .private = 0, .bound = 256, .wave = 32 },
-            .{ .vgprs = 255, .sgprs = 20, .lds = 55296, .private = 0, .bound = 256, .wave = 32 },
+            .{ .vgprs = 252, .sgprs = 20, .lds = 55296, .private = 0, .bound = 256, .wave = 32 },
+            .{ .vgprs = 252, .sgprs = 20, .lds = 55296, .private = 0, .bound = 256, .wave = 32 },
             .{ .vgprs = 0, .sgprs = 0, .lds = 0, .private = 0, .bound = 256, .wave = 32 },
         },
     },
@@ -600,8 +600,8 @@ const own_records = [_]Record{
         .launch = .{ .name = "prompt dense inexact tile 4-bit K 6144", .symbol = "_ZN2tf4rocm25affine_wmma_dense_inexactILi6144EEEvNS0_6AffineE", .image = "affine_tiles", .threads = 256, .served = limits.gfx11_only },
         .usage = .{
             .{ .vgprs = 0, .sgprs = 0, .lds = 0, .private = 0, .bound = 256, .wave = 32 },
-            .{ .vgprs = 255, .sgprs = 20, .lds = 55296, .private = 0, .bound = 256, .wave = 32 },
-            .{ .vgprs = 255, .sgprs = 20, .lds = 55296, .private = 0, .bound = 256, .wave = 32 },
+            .{ .vgprs = 252, .sgprs = 20, .lds = 55296, .private = 0, .bound = 256, .wave = 32 },
+            .{ .vgprs = 252, .sgprs = 20, .lds = 55296, .private = 0, .bound = 256, .wave = 32 },
             .{ .vgprs = 0, .sgprs = 0, .lds = 0, .private = 0, .bound = 256, .wave = 32 },
         },
     },
