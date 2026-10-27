@@ -579,6 +579,42 @@ const own_records = [_]Record{
         },
     },
     .{
+        .launch = .{ .name = "prompt dense inexact tile 4-bit K 2560", .symbol = "_ZN2tf4rocm25affine_wmma_dense_inexactILi2560EEEvNS0_6AffineE", .image = "affine_tiles", .threads = 256, .served = limits.gfx11_only },
+        .usage = .{
+            .{ .vgprs = 0, .sgprs = 0, .lds = 0, .private = 0, .bound = 256, .wave = 32 },
+            .{ .vgprs = 255, .sgprs = 20, .lds = 55296, .private = 0, .bound = 256, .wave = 32 },
+            .{ .vgprs = 255, .sgprs = 20, .lds = 55296, .private = 0, .bound = 256, .wave = 32 },
+            .{ .vgprs = 0, .sgprs = 0, .lds = 0, .private = 0, .bound = 256, .wave = 32 },
+        },
+    },
+    .{
+        .launch = .{ .name = "prompt dense inexact tile 4-bit K 6144", .symbol = "_ZN2tf4rocm25affine_wmma_dense_inexactILi6144EEEvNS0_6AffineE", .image = "affine_tiles", .threads = 256, .served = limits.gfx11_only },
+        .usage = .{
+            .{ .vgprs = 0, .sgprs = 0, .lds = 0, .private = 0, .bound = 256, .wave = 32 },
+            .{ .vgprs = 255, .sgprs = 20, .lds = 55296, .private = 0, .bound = 256, .wave = 32 },
+            .{ .vgprs = 255, .sgprs = 20, .lds = 55296, .private = 0, .bound = 256, .wave = 32 },
+            .{ .vgprs = 0, .sgprs = 0, .lds = 0, .private = 0, .bound = 256, .wave = 32 },
+        },
+    },
+    .{
+        .launch = .{ .name = "prompt expert gate+up inexact tile 4-bit", .symbol = "_ZN2tf4rocm26affine_wmma_moe_gu_inexactILi4EEEvNS0_6AffineEf", .image = "affine_tiles", .threads = 256, .served = limits.gfx11_only },
+        .usage = .{
+            .{ .vgprs = 0, .sgprs = 0, .lds = 0, .private = 0, .bound = 256, .wave = 32 },
+            .{ .vgprs = 219, .sgprs = 31, .lds = 36864, .private = 0, .bound = 256, .wave = 32 },
+            .{ .vgprs = 218, .sgprs = 31, .lds = 36864, .private = 0, .bound = 256, .wave = 32 },
+            .{ .vgprs = 0, .sgprs = 0, .lds = 0, .private = 0, .bound = 256, .wave = 32 },
+        },
+    },
+    .{
+        .launch = .{ .name = "prompt expert down inexact tile 4-bit", .symbol = "_ZN2tf4rocm28affine_wmma_moe_down_inexactILi4EEEvNS0_6AffineE", .image = "affine_tiles", .threads = 256, .served = limits.gfx11_only },
+        .usage = .{
+            .{ .vgprs = 0, .sgprs = 0, .lds = 0, .private = 0, .bound = 256, .wave = 32 },
+            .{ .vgprs = 150, .sgprs = 31, .lds = 27648, .private = 0, .bound = 256, .wave = 32 },
+            .{ .vgprs = 149, .sgprs = 31, .lds = 27648, .private = 0, .bound = 256, .wave = 32 },
+            .{ .vgprs = 0, .sgprs = 0, .lds = 0, .private = 0, .bound = 256, .wave = 32 },
+        },
+    },
+    .{
         .launch = .{ .name = "Flash Next prompt sparse attention tile", .symbol = "tf_fn_sparse_prompt", .image = "flashnext", .threads = 128, .served = limits.gfx11_only },
         .usage = .{
             .{ .vgprs = 0, .sgprs = 0, .lds = 0, .private = 0, .bound = 128, .wave = 32 },
