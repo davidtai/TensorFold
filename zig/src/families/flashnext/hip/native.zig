@@ -24,6 +24,11 @@ pub const prefill_step: u32 = 0;
 pub const policy_prefill_step: u32 = 8192;
 /// Drafts a verify window holds at most past its pending token (`--mtp-drafts` above it is refused before the load).
 pub const max_drafts: u32 = lanes_mod.max_depth;
+/// The MTP policy Flash Next takes on HIP where neither --mtp-drafts, --mtp-confidence nor the mtp_depth key names one
+/// (the HIP default is the depth rule at 3 drafts under 0.3): the chain gated to 7 drafts, a draft under 0.9 the last.
+/// Floor chosen off the benchmark (prose.json and a held-out CPython 3.13 prompt, greedy, 2026-10-27): 0.6 / 0.7 / 0.8 /
+/// 0.85 / 0.9 gave x1.072 / 1.083 / 1.087 / 1.091 / 1.098 decode against the rule at 3 drafts, the same text.
+pub const policy_mtp: struct { drafts: u8, confidence: f64, depth: hip.policy.MtpDepth } = .{ .drafts = 7, .confidence = 0.9, .depth = .gated };
 /// Device bytes a rank keeps for the forward's scratch until the engine counts its own.
 pub const scratch_bytes: u64 = 2 << 30;
 
