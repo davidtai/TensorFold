@@ -7,7 +7,7 @@
 //   g = up(act) (fp32)                -> mixed[d] = mean over s of round(round(sigmoid(round(g[s, d]))) * x[s, d])
 //
 // Rounding sites are the chain's (tf_fn_hc_gates, the up product, tf_fn_hc_mix); only the fp32 order of the up sum
-// differs. Up to 4 rows a block, each row's arithmetic its own: a row's bits are the same alone or in a window.
+// differs. Up to 8 rows a block, each row's arithmetic its own: a row's bits are the same alone or in a window.
 // Shapes compiled in: 4 streams of 2,560, low rank 320 (+ 4 inject columns), MLX affine 4-bit groups of 32, bf16.
 
 #include "../ops/common.hpp"
@@ -18,7 +18,7 @@ namespace {
 constexpr int kUmS = 4;                         // streams
 constexpr int kUmH = 2560;                      // a stream's width
 constexpr int kUmL = 320;                       // low rank
-constexpr int kUmRows = 4;                      // rows a block takes
+constexpr int kUmRows = 8;                      // rows a block takes (a verify's 5-8 rows read the weights once)
 constexpr int kUmThreads = 256;
 constexpr int kUmChunks = kUmL / 32;            // 10 chunks of 32 codes an up row
 constexpr int kUmHalf = kUmChunks / 2;          // two lanes a row, 5 chunks each

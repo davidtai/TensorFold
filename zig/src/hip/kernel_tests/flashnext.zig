@@ -547,7 +547,7 @@ test "hyper-connection gates, up and mix in one launch: the chain's values, each
     defer t.close();
     if (!t.bf16) return; // compiled for bf16 activations
     var rng: rig.Rng = .{ .state = 0x4C3 };
-    const rows = 5; // a block of 4 rows and one of 1
+    const rows = 11; // a block of 8 rows and one of 3
     const s = 4;
     const d = 2560;
     const w = s * d;
@@ -649,5 +649,57 @@ test "hyper-connection gates, up and mix in one launch: the chain's values, each
             us[which] = @as(f64, @floatFromInt(nowNs() - t0)) / reps / 1e3;
         }
         std.debug.print("  hc up mix (inject {}): {d} of {d} mixed values differ from the chain's; 1 row {d:.1} us, the chain's three launches {d:.1} us (back to back)\n", .{ with_inject, differ, got[0][0].len, us[0], us[1] });
+    }
+}
+
+test "the MoE combine inside the HC norm: moe_combine_kernel's then tf_fn_hc_norm's bytes, 1 to 8 rows" {
+    const t = try Rig.open(64 << 20);
+    defer t.close();
+    var rng: rig.Rng = .{ .state = 0x4C7 };
+    const s = 4;
+    const d = 2560;
+    const slots = 11; // Flash Next: 10 routed experts and the shared one
+    const k = t.kind();
+    const st = t.stream.handle;
+    for ([_]usize{ 1, 3, 4, 8 }) |rows| {
+        const yh = try gpa.alloc(f32, rows * slots * d);
+        defer gpa.free(yh);
+        for (yh) |*v| v.* = rng.unit() * 2.0;
+        const wh = try gpa.alloc(f32, rows * slots);
+        defer gpa.free(wh);
+        for (wh) |*v| v.* = rng.unit() * 0.5;
+        const hh = try acts(t, &rng, rows * s * d, 3.0);
+        defer gpa.free(hh);
+        const ih = try acts(t, &rng, rows * s, 2.0);
+        defer gpa.free(ih);
+        const sh = try gpa.alloc(f32, s * d);
+        defer gpa.free(sh);
+        for (sh) |*v| v.* = 1.0 + rng.unit() * 0.25;
+        var y = try t.upload(yh);
+        defer y.free();
+        var w = try t.upload(wh);
+        defer w.free();
+        var inject = try t.upload(ih);
+        defer inject.free();
+        var scale = try t.upload(sh);
+        defer scale.free();
+        var h = [_]DeviceBuffer{ try t.upload(hh), try t.upload(hh) };
+        defer for (&h) |*b| b.free();
+        var x = [_]DeviceBuffer{ try t.alloc(rows * s * d * 2), try t.alloc(rows * s * d * 2) };
+        defer for (&x) |*b| b.free();
+        var branch = try t.alloc(rows * d * 2);
+        defer branch.free();
+        // the chain: the combine into the activation kind, then the norm with it as the branch
+        try t.ops(&t.on).moeCombine(at(y), at(w), .{ .ptr = at(branch), .kind = if (k == 2) .bf16 else .f16 }, rows, slots, d);
+        try t.on.fn_hc_norm(@ptrFromInt(at(h[0])), @ptrFromInt(at(branch)), @ptrFromInt(at(inject)), @ptrFromInt(at(h[0])), @ptrFromInt(at(x[0])), @ptrFromInt(at(scale)), k, @intCast(rows), s, d, 1e-6, st);
+        try t.on.fn_hc_norm_moe(@ptrFromInt(at(h[1])), @ptrFromInt(at(y)), @ptrFromInt(at(w)), @ptrFromInt(at(inject)), @ptrFromInt(at(h[1])), @ptrFromInt(at(x[1])), @ptrFromInt(at(scale)), k, @intCast(rows), s, d, 1e-6, slots, st);
+        try t.stream.synchronize();
+        for ([_][2]DeviceBuffer{ h, x }) |pair| {
+            const a = try rig.download(u16, pair[0]);
+            defer gpa.free(a);
+            const b = try rig.download(u16, pair[1]);
+            defer gpa.free(b);
+            try std.testing.expectEqualSlices(u16, a, b);
+        }
     }
 }

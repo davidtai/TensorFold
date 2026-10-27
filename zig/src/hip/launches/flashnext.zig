@@ -22,6 +22,7 @@ const kernels = @import("../kernels.zig");
 
 pub const Fns = struct {
     hc_norm: Function,
+    hc_norm_moe: Function,
     hc_gates: Function,
     rms_wide: Function,
     hc_mix: Function,
@@ -43,6 +44,7 @@ pub const Fns = struct {
     pub fn load(m: Module) Error!Fns {
         return .{
             .hc_norm = try m.function("tf_fn_hc_norm"),
+            .hc_norm_moe = try m.function("tf_fn_hc_norm_moe"),
             .hc_gates = try m.function("tf_fn_hc_gates"),
             .rms_wide = try m.function("tf_fn_rms_wide"),
             .hc_mix = try m.function("tf_fn_hc_mix"),
@@ -85,6 +87,31 @@ pub fn hcNorm(
     s: S,
 ) Error!void {
     return hcNormShares(l, h, branch, inject, h_out, x_out, scale, kind, rows, streams, dims, eps, 0, 0, s);
+}
+
+/// hcNorm with the MoE's combine as the branch: `y` [rows, slots, dims] the routed and shared experts' fp32 rows,
+/// `wts` [rows, slots] their weights; the bytes of moe_combine_kernel into `kind` and then hcNorm.
+pub fn hcNormMoe(
+    l: *const Launcher,
+    h: C,
+    y: CF,
+    wts: CF,
+    inject: C,
+    h_out: P,
+    x_out: P,
+    scale: CF,
+    kind: c_int,
+    rows: c_int,
+    streams: c_int,
+    dims: c_int,
+    eps: f32,
+    slots: c_int,
+    s: S,
+) Error!void {
+    if (dims > most_dims or slots < 1) return util.invalid("hcNormMoe");
+    var a: Args = .{};
+    inline for (.{ ad(h), ad(y), ad(wts), ad(inject), ad(h_out), ad(x_out), ad(scale), kind, streams, dims, eps, slots }) |v| try a.add(v);
+    try l.go(l.fnx.hc_norm_moe, dim(streams, rows, 1), dim(1024, 1, 1), 0, s, &a);
 }
 
 /// hcNorm with the branch as `world` fp32 shares `stride` values apart (a tensor-parallel gather), summed in order.
@@ -182,7 +209,7 @@ pub const hc_up = struct {
     pub const streams = 4;
     pub const hidden = 2560;
     pub const low = 320;
-    pub const rows = 4; // rows a block
+    pub const rows = 8; // rows a block
     pub const cols = 32; // hidden columns a block
     /// Rows the launch takes at most: decode and verify windows (a prompt's rows take the products).
     pub const most_rows = 16;

@@ -27,10 +27,12 @@ __device__ float fn_block_sum(float v, float* scratch) {
     return total;
 }
 
-// Block (s, r): h_s += round(branch * inject[s]) (tp: `world` fp32 shares, summed in order), then x = h rinv scale.
-extern "C" __global__ void __launch_bounds__(kNormThreads)
-tf_fn_hc_norm(const void* h, const void* branch, const void* inject, void* h_out, void* x_out, const float* scale,
-              int kind, int streams, int dims, float eps, int world, long long stride) {
+// Block (s, r): h_s += round(branch(r, d) * inject[s]) when there is a branch, then x = h rinv scale. `branch` gives
+// row r's value at d already rounded to `kind`.
+template <typename Branch>
+__device__ __forceinline__ void hc_norm_body(const void* h, bool has_branch, Branch branch, const void* inject,
+                                             void* h_out, void* x_out, const float* scale, int kind, int streams,
+                                             int dims, float eps) {
     __shared__ float scratch[kNormThreads / 32];
     const int s = blockIdx.x, r = blockIdx.y;
     const long long base = (static_cast<long long>(r) * streams + s) * dims;
@@ -42,17 +44,8 @@ tf_fn_hc_norm(const void* h, const void* branch, const void* inject, void* h_out
         v[j] = 0.f;
         if (d >= dims) continue;
         float x = load(h, kind, base + d);
-        if (branch != nullptr) {
-            const long long at = static_cast<long long>(r) * dims + d;
-            float b;
-            if (world > 0) {
-                b = 0.f;
-                for (int w = 0; w < world; ++w) b += static_cast<const float*>(branch)[w * stride + at];
-                b = rounded(b, kind);
-            } else {
-                b = load(branch, kind, at);
-            }
-            const float add = rounded(b * load(inject, kind, static_cast<long long>(r) * streams + s), kind);
+        if (has_branch) {
+            const float add = rounded(branch(r, d) * load(inject, kind, static_cast<long long>(r) * streams + s), kind);
             x = rounded(x + add, kind);
         }
         v[j] = x;
@@ -67,6 +60,37 @@ tf_fn_hc_norm(const void* h, const void* branch, const void* inject, void* h_out
         if (h_out != nullptr) store(h_out, kind, base + d, v[j]);
         store(x_out, kind, base + d, (v[j] * rinv) * scale[s * dims + d]);
     }
+}
+
+// Block (s, r): h_s += round(branch * inject[s]) (tp: `world` fp32 shares, summed in order), then x = h rinv scale.
+extern "C" __global__ void __launch_bounds__(kNormThreads)
+tf_fn_hc_norm(const void* h, const void* branch, const void* inject, void* h_out, void* x_out, const float* scale,
+              int kind, int streams, int dims, float eps, int world, long long stride) {
+    hc_norm_body(
+        h, branch != nullptr,
+        [&](int r, int d) {
+            const long long at = static_cast<long long>(r) * dims + d;
+            if (world <= 0) return load(branch, kind, at);
+            float b = 0.f;
+            for (int w = 0; w < world; ++w) b += static_cast<const float*>(branch)[w * stride + at];
+            return rounded(b, kind);
+        },
+        inject, h_out, x_out, scale, kind, streams, dims, eps);
+}
+
+// The same with the MoE's combine as the branch: row r's `slots` fp32 expert rows y[r, k, :] times wts[r, k], summed in
+// slot order and rounded to `kind` as moe_combine_kernel writes them (one launch instead of the combine and the norm).
+extern "C" __global__ void __launch_bounds__(kNormThreads)
+tf_fn_hc_norm_moe(const void* h, const float* y, const float* wts, const void* inject, void* h_out, void* x_out,
+                  const float* scale, int kind, int streams, int dims, float eps, int slots) {
+    hc_norm_body(
+        h, true,
+        [&](int r, int d) {
+            float acc = 0.f;
+            for (int k = 0; k < slots; ++k) acc += y[(static_cast<long long>(r) * slots + k) * dims + d] * wts[r * slots + k];
+            return rounded(acc, kind);
+        },
+        inject, h_out, x_out, scale, kind, streams, dims, eps);
 }
 
 // From z [rows, low (+ streams with inject)] / streams: silu for the up projection, 2 sigmoid for the inject gates.
