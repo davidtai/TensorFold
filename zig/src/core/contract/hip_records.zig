@@ -546,8 +546,8 @@ const own_records = [_]Record{
         .launch = .{ .name = "prompt dense tile 4-bit K 320 with the HC mix", .symbol = "tf_affine_dense_hcmix", .image = "affine_tiles", .threads = 256, .served = limits.gfx11_only },
         .usage = .{
             .{ .vgprs = 0, .sgprs = 0, .lds = 0, .private = 0, .bound = 256, .wave = 32 },
-            .{ .vgprs = 208, .sgprs = 22, .lds = 39936, .private = 0, .bound = 256, .wave = 32 },
-            .{ .vgprs = 208, .sgprs = 22, .lds = 39936, .private = 0, .bound = 256, .wave = 32 },
+            .{ .vgprs = 215, .sgprs = 22, .lds = 39936, .private = 0, .bound = 256, .wave = 32 },
+            .{ .vgprs = 215, .sgprs = 22, .lds = 39936, .private = 0, .bound = 256, .wave = 32 },
             .{ .vgprs = 0, .sgprs = 0, .lds = 0, .private = 0, .bound = 256, .wave = 32 },
         },
     },
