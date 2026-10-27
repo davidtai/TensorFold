@@ -44,7 +44,7 @@ constexpr int kThreads = 256;
 // tables, plain products only. Blocks in row-major order of 128 x 128 tiles (Strata's grouped order, 8 row tiles a
 // group, measured slower: dn_qkv 14.3 ms against 13.8).
 template <int K, int AHEAD = 1, bool HC_MIX = false>
-__device__ __forceinline__ void wmma_dense_tile(const Affine& a, HcMix mix = {}) {
+__device__ __forceinline__ void wmma_dense_tile(const Affine& a, HcMix mix = {}, const uint16_t* gates = nullptr) {
 #if TF_DEVICE_WMMA_GFX11
     using namespace dense_tile;
     using Dec = MlxDecoder<4>;
@@ -219,7 +219,9 @@ __device__ __forceinline__ void wmma_dense_tile(const Affine& a, HcMix mix = {})
     if constexpr (HC_MIX) {
         // wave wn holds stream wn (kWC = 32 columns: the block's d's). The block's x tile [128 rows][4 streams][32 d] goes
         // to LDS in 16-byte loads (rows 0..63 over xs, 64..127 over ws: the stash's, past the last window); each thread
-        // turns its x into tf_fn_hc_mix's term in place; then 16 d a thread sum their 4 terms in stream order.
+        // turns its x into tf_fn_hc_mix's term in place, its gate read from `gates` (rnd(sigmoid(g)) for every bf16 g:
+        // the formula on the critical path cost 0.36 ms of hc up at 2,004 rows); then 16 d a thread sum their 4 terms in
+        // stream order.
         auto bits = [](float v) { return __builtin_bit_cast(uint16_t, narrow<T>(v)); };
         auto wide = [](uint16_t h) { return __uint_as_float(static_cast<uint32_t>(h) << 16); };
         auto rnd = [&](float v) { return wide(bits(v)); };
@@ -250,8 +252,7 @@ __device__ __forceinline__ void wmma_dense_tile(const Affine& a, HcMix mix = {})
 #pragma unroll
                 for (int nt = 0; nt < kNT; ++nt) {
                     const int j = nt * 16 + rl;
-                    const float g = rnd(acc[mt][nt][i]);
-                    const float gate = rnd(1.0f / (1.0f + expf(-g)));
+                    const float gate = wide(gates[bits(acc[mt][nt][i])]);
                     at[j] = bits(rnd(gate * wide(at[j])));
                 }
             }

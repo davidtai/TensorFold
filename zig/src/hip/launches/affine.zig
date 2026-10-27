@@ -161,6 +161,8 @@ pub const Kernels = struct {
     dense: [dense_ks.len]?Function,
     /// hc up (K 320) on the dense tile with tf_fn_hc_mix in its epilogue (tf_affine_dense_hcmix); gfx11.
     dense_hcmix: ?Function,
+    /// Fills the tile's gate table (rnd(sigmoid(g)) for every bf16 g) once a device; gfx11.
+    hc_gate_fill: ?Function,
     /// The same at each of inexact_ks with the codes dequantized to bf16 (tiles/dense_inexact.hpp); numerics=inexact.
     dense_inexact: [inexact_ks.len]?Function,
     kp: [bit_widths.len][kp_tiles.len]Function,
@@ -200,6 +202,7 @@ pub const Kernels = struct {
         k.moe_gu_inexact = if (k.matrix) try tiles_obj.function(r ++ "26affine_wmma_moe_gu_inexactILi4EEEvNS0_6AffineEf") else null;
         k.moe_down_inexact = if (k.matrix) try tiles_obj.function(r ++ "28affine_wmma_moe_down_inexactILi4EEEvNS0_6AffineE") else null;
         k.dense_hcmix = if (k.matrix) try tiles_obj.function("tf_affine_dense_hcmix") else null;
+        k.hc_gate_fill = if (k.matrix) try tiles_obj.function("tf_hc_gate_fill") else null;
         inline for (dense_ks, 0..) |dk, i| {
             k.dense[i] = if (k.matrix) try tiles_obj.function(std.fmt.comptimePrint(r ++ "17affine_wmma_denseILi{d}EEEvNS0_6AffineE", .{dk})) else null;
         }
@@ -260,6 +263,14 @@ pub const Kernels = struct {
         var args: hl.Args = .{};
         try args.add(lut.address);
         try hl.launch(k.fill, .{ .grid = .{ .x = 1 }, .block = .{ .x = 256 } }, .{ .r = r, .handle = null }, &args);
+        try runtime.check(r.api.hipStreamSynchronize(null));
+    }
+
+    /// tf_affine_dense_hcmix's gate table into the tiles module: 65,536 gates, once a device.
+    pub fn fillHcGate(k: *const Kernels, r: *const runtime.Runtime) Error!void {
+        const f = k.hc_gate_fill orelse return;
+        var args: hl.Args = .{};
+        try hl.launch(f, .{ .grid = .{ .x = 256 }, .block = .{ .x = 256 } }, .{ .r = r, .handle = null }, &args);
         try runtime.check(r.api.hipStreamSynchronize(null));
     }
 

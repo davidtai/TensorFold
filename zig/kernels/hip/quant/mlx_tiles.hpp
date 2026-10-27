@@ -79,8 +79,16 @@ __global__ void __launch_bounds__(dense_tile::kThreads) affine_wmma_dense(Affine
 }
 
 // hc up (K 320) with tf_fn_hc_mix in the epilogue: the dense tile's products, mixed per hidden column (dense_gemm.hpp)
+// tf_fn_hc_mix's gate rnd(sigmoid(g)) in bf16 for every bf16 g, filled once a device by tf_hc_gate_fill
+__device__ uint16_t tf_hc_gate[1 << 16];
+extern "C" __global__ void __launch_bounds__(256) tf_hc_gate_fill() {
+    const int h = blockIdx.x * 256 + threadIdx.x;
+    const float g = __uint_as_float(static_cast<uint32_t>(h) << 16);
+    tf_hc_gate[h] = __builtin_bit_cast(uint16_t, narrow<WmmaBF16>(1.0f / (1.0f + expf(-g))));
+}
+
 extern "C" __global__ void __launch_bounds__(dense_tile::kThreads) tf_affine_dense_hcmix(Affine a, HcMix mix) {
-    wmma_dense_tile<320, DenseTune<320>::kAhead, true>(a, mix);
+    wmma_dense_tile<320, DenseTune<320>::kAhead, true>(a, mix, tf_hc_gate);
 }
 
 // numerics=inexact: the same products with the codes dequantized to bf16 in the tile, one WMMA accumulation over K
