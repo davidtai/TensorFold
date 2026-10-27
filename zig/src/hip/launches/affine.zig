@@ -102,6 +102,9 @@ pub const stream_pair_code_words = 8;
 /// The widest columns a lane of a routed plain product (the experts' down) by row tile (stream_rows): on gfx1151 the
 /// 4-bit down at K 640 takes 4 at the 2-row tile (8 lost 8 % at 4-8 rows); 1 and 4 rows keep the waves rule
 pub const stream_routed_cb_top = [stream_rows.len]c_int{ 8, 4, 4 };
+/// The columns below which one row of a plain product takes one column a lane (Flash Next's in-proj 16,480 and
+/// attention 13,952 do; lm_head 248,320 and the draft readout 79,591 keep the waves rule)
+pub const stream_one_col_n = 20_000;
 
 /// The K-parallel tiles of a short prompt: cb columns a lane set, r rows a pass over up to rb row blocks.
 pub const KpTile = struct { cb: c_int, r: c_int, waves: c_int, rb: c_int, loop: bool = true };
@@ -404,6 +407,11 @@ pub const Kernels = struct {
             if (stream_cbs[c] * stream_rows[ri] > 16 or stream_cbs[c] * a.bits > stream_code_words or (stream_cbs[c] < 2 and (pair_div == 2 or relu2))) continue;
             if (pair_div == 2 and stream_cbs[c] > 2 and stream_cbs[c] * a.bits > stream_pair_code_words) continue;
             if (a.route.items != 0 and pair_div == 1 and !relu2 and stream_cbs[c] > stream_routed_cb_top[ri]) continue;
+            // one row of a plain product (not routed, not a pair or relu^2) of fewer than stream_one_col_n columns at one
+            // column a lane: on gfx1151 it beats 4 and 8 on Flash Next's in-proj and attention and matches the rule where
+            // the rule took 1; lm_head and the draft head's readout keep the rule (one column a lane slows the served
+            // default-spec prompt pass by about 0.1 s)
+            if (ri == 0 and a.route.items == 0 and pair_div == 1 and !relu2 and total_n < stream_one_col_n and stream_cbs[c] > 1) continue;
             pick = c;
             const per_block: c_int = stream_waves * (@as(c_int, 32) >> lpc_log2) * @divExact(stream_cbs[c], pair_div);
             if (@as(u64, cdiv(total_n, per_block)) * stream_waves * @as(u64, @intCast(items)) * cdiv(a.m, stream_rows[ri]) >= streams_wanted) break;
