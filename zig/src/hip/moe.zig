@@ -136,8 +136,8 @@ fn expertParts(o: Ops, kind: Kind, r: Routed, x: Tensor, rows: usize, logits: u6
         count = slots;
     } else {
         tile = tileFor(o, rows);
-        // a verify window's 2 to 4 rows: the router, the pick and tf_moe_route's plan in one launch
-        const planned = rows <= 4 and try o.moeRouterSelect(x, r.rows16, r.done, logits, pick, wts, .{ .items = items, .members = members }, cap, rows, ex.dims, r.rows, r.top_k, tile);
+        // a verify window's 2 to 8 rows: the router, the pick and tf_moe_route's plan in one launch
+        const planned = rows <= 8 and try o.moeRouterSelect(x, r.rows16, r.done, logits, pick, wts, .{ .items = items, .members = members }, cap, rows, ex.dims, r.rows, r.top_k, tile);
         if (!planned) {
             if (!try o.moeRouterSelect(x, r.rows16, r.done, logits, pick, wts, null, 0, rows, ex.dims, r.rows, r.top_k, 0)) {
                 try o.moeRouter(x, r.rows32, logits, rows, ex.dims, r.rows);

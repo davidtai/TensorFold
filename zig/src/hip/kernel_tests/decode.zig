@@ -117,8 +117,8 @@ fn tails(t: *Rig, rng: *rig.Rng, rows: usize, width: usize, slots: usize) !void 
 }
 
 /// The router over bf16 rows and the pick in one launch against tf_moe_router over the widened rows and tf_select_decode
-/// (and tf_moe_route for 2 to 4 rows): the same logits, picks, weights and plan, byte for byte; `ties` copies expert rows
-/// so logits tie. The plan of 2 to 4 rows is the window's (tile 8, the decode tile's rows).
+/// (and tf_moe_route for 2 to 8 rows): the same logits, picks, weights and plan, byte for byte; `ties` copies expert rows
+/// so logits tie. The plan of 2 to 8 rows is the window's (tile 8, the decode tile's rows).
 fn routerSelect(t: *Rig, rng: *rig.Rng, rows: usize, d: usize, e: usize, top_k: usize, ties: bool) !void {
     const slots = top_k + 1;
     const cap: usize = 16 * slots + 16 * slots / 8;
@@ -154,7 +154,7 @@ fn routerSelect(t: *Rig, rng: *rig.Rng, rows: usize, d: usize, e: usize, top_k: 
         }
         defer for (&bufs) |*b| b.free();
         const s = t.stream.handle;
-        const planned = rows <= 4;
+        const planned = rows <= 8;
         const tile: usize = if (rows == 1) 0 else 8;
         const items: ?[*]i32 = if (planned) @ptrFromInt(at(bufs[3])) else null;
         const members: ?[*]i32 = if (planned) @ptrFromInt(at(bufs[4])) else null;
@@ -182,7 +182,7 @@ test "the router and the pick in one launch give the two launches' bytes (Qwen3.
     const t = try Rig.open(1 << 20);
     defer t.close();
     var rng: rig.Rng = .{ .state = 0x9E3779B97F4A7C15 };
-    for ([_]usize{ 1, 2, 3, 4, 16 }) |rows| for ([_]bool{ false, true }) |ties| try routerSelect(t, &rng, rows, 2560, 513, 10, ties);
+    for ([_]usize{ 1, 2, 3, 4, 5, 6, 7, 8, 16 }) |rows| for ([_]bool{ false, true }) |ties| try routerSelect(t, &rng, rows, 2560, 513, 10, ties);
 }
 
 test "the merged router launch is no further from float64 than twice the launch it replaces" {

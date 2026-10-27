@@ -583,7 +583,7 @@ __device__ bool select_row_wave(const float* logits, int row, int* pick, float* 
 // tf_moe_route's plan of a few rows' pairs (at most kPlanPairs) by the last block: the pairs stable-sorted by expert
 // into members, items of at most `tile` pairs cut a capacity slot each; the same members and items as tf_moe_route's
 // (an expert's pairs in pair order, the same starts, ends and slot search).
-constexpr int kPlanPairs = 64;
+constexpr int kPlanPairs = 32 * kRouterWaves;  // a pair a thread: 8 rows of top 10 + the shared expert (88)
 // The shared memory it takes from `pool`, in ints: 3 * experts + 2 * 32 * kRouterWaves + kPlanPairs.
 __device__ void route_plan(const int* picks, int pairs, int experts, int tile, int* members, int* items, int capacity,
                            int* pool) {
@@ -650,9 +650,9 @@ __device__ void route_plan(const int* picks, int pairs, int experts, int tile, i
 
 // tf_router_decode's logits from bf16 rows, then the pick of every row (tf_select_decode's) by the last block to finish:
 // one launch for both. `e` counts the rows with the shared gate's; `done` is zero between launches (the last block
-// zeroes it). `items` also gets the plan: one row's own, or for 2 to 4 rows tf_moe_route's at `tile` pairs an item.
+// zeroes it). `items` also gets the plan: one row's own, or for 2 to 8 rows tf_moe_route's at `tile` pairs an item.
 // `staged`: the host gave r * d bf16 of dynamic shared memory for x's rows (x 16-byte aligned, d a multiple of 8). A
-// 2 to 4 row plan takes the dynamic shared memory after the router: the waves' top lists, then route_plan's pool.
+// 2 to 8 row plan takes the dynamic shared memory after the router: the waves' top lists, then route_plan's pool.
 template <int KIND>
 __device__ void router_select(const void* x, const void* rows, float* logits, int r, int d, int e, int* pick, float* wts,
                               int* items, int* members, int capacity, int top_k, int tile, int staged, unsigned* done) {
@@ -676,18 +676,18 @@ __device__ void router_select(const void* x, const void* rows, float* logits, in
     __threadfence();
     if (r == 1) {
         select_row(logits, 0, pick, wts, items, members, capacity, e - 1, top_k);
-    } else if (r <= kRouterWaves && e - 1 <= kSelectMax) {
-        // a wave a row; a row with a NaN logit then takes select_row's rank loop
+    } else if (r <= 2 * kRouterWaves && e - 1 <= kSelectMax) {
+        // a wave a row (rows w and w + 4 for wave w past 4 rows); a row with a NaN logit then takes select_row's rank loop
         // the waves' top lists, then the plan's arrays, in the dynamic shared memory (the staged rows are free by then)
-        __shared__ int fallback[kRouterWaves];
+        __shared__ int fallback[2 * kRouterWaves];
         float* wave_top_v = reinterpret_cast<float*>(router_shared);
         int* wave_top_i = reinterpret_cast<int*>(router_shared) + 32 * kRouterWaves;
         int* pool = wave_top_i + 32 * kRouterWaves;
         const int wave = threadIdx.x >> 5;
         __syncthreads();
-        if (wave < r) {
-            const bool ok = select_row_wave(logits, wave, pick, wts, e - 1, top_k, wave_top_v + 32 * wave, wave_top_i + 32 * wave);
-            if ((threadIdx.x & 31) == 0) fallback[wave] = !ok;
+        for (int row = wave; row < r; row += kRouterWaves) {
+            const bool ok = select_row_wave(logits, row, pick, wts, e - 1, top_k, wave_top_v + 32 * wave, wave_top_i + 32 * wave);
+            if ((threadIdx.x & 31) == 0) fallback[row] = !ok;
         }
         __syncthreads();
         for (int row = 0; row < r; ++row)

@@ -54,13 +54,13 @@ pub fn routerWindow(l: *const Launcher, x: C, kind: c_int, rows: CF, logits: F, 
 }
 
 /// A decode call's router logits from bf16 rows and the pick of each row (tf_select_decode's) in one launch, the plan too
-/// when `items` is given: one row's own, or for 2 to 4 rows tf_moe_route's at `tile` pairs an item; false (nothing
+/// when `items` is given: one row's own, or for 2 to 8 rows tf_moe_route's at `tile` pairs an item; false (nothing
 /// launched) where the shape keeps the router and the pick apart. `done` is a u32 that is zero between launches.
 pub fn routerSelect(l: *const Launcher, x: C, kind: c_int, rows16: C, logits: F, pick: I, wts: F, items: I, members: I, capacity: c_int, r: c_int, d: c_int, e: c_int, top_k: c_int, tile: c_int, done: u64, s: S) Error!bool {
     if (!l.fuse or done == 0 or r < 1 or r > 16 or @rem(d, 4) != 0 or ad(rows16) % 8 != 0 or ad(x) % 8 != 0) return false;
     if (e - 1 > 1024 or top_k < 1 or top_k > 31) return false;
-    // the plan in the launch: one row, or 2 to 4 rows of at most 64 pairs (the last block's waves, route_plan's buffers)
-    if (items != null and r != 1 and (r > 4 or r * (top_k + 1) > 64 or tile < 1)) return false;
+    // the plan in the launch: one row, or 2 to 8 rows of at most plan_pairs pairs (route_plan's pair a thread)
+    if (items != null and r != 1 and (r > 8 or r * (top_k + 1) > plan_pairs or tile < 1)) return false;
     var a: Args = .{};
     try a.add(ad(x));
     try a.add(ad(rows16));
@@ -87,15 +87,18 @@ pub fn routerSelect(l: *const Launcher, x: C, kind: c_int, rows16: C, logits: F,
 /// staged, 55.1 us not; work/tensorfold-halo/w4/bench/router_bench.hip).
 const STAGED = 2 * 2560 * 2;
 
+/// decode.hip's kPlanPairs: the pairs route_plan takes in the router launch, a thread each (32 * kRouterWaves).
+const plan_pairs = 128;
+
 /// tf_router_select's dynamic shared memory: a verify window's rows staged (x 16-byte aligned, d a multiple of 8, at most
-/// STAGED bytes), then for 2 to 4 rows the waves' top lists and a plan's route_plan pool; the larger of the two, since the
+/// STAGED bytes), then for 2 to 8 rows the waves' top lists and a plan's route_plan pool; the larger of the two, since the
 /// second takes it after the first. One row takes none (its pick and plan are in static shared memory).
 fn routerShared(x: usize, r: c_int, d: c_int, e: c_int, plan: bool) struct { bytes: u32, staged: bool } {
-    if (r < 2 or r > 4) return .{ .bytes = 0, .staged = false };
+    if (r < 2 or r > 8) return .{ .bytes = 0, .staged = false };
     const staged = @rem(d, 8) == 0 and x % 16 == 0 and r * d * 2 <= STAGED;
     const rows: c_int = if (staged) r * d * 2 else 0;
     // the waves' top values and indices (32 each a wave), then route_plan's counts, starts and ends, scans and pairs
-    const ints: c_int = if (e - 1 <= 1024) 2 * 32 * 4 + (if (plan) 3 * e + 2 * 128 + 64 else 0) else 0;
+    const ints: c_int = if (e - 1 <= 1024) 2 * 32 * 4 + (if (plan) 3 * e + 2 * 128 + plan_pairs else 0) else 0;
     return .{ .bytes = @intCast(@max(rows, ints * 4)), .staged = staged };
 }
 
