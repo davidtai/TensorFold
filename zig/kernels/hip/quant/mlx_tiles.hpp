@@ -11,6 +11,7 @@
 #include "tiles/gemm.hpp"
 #include "tiles/gemm_kp.hpp"
 #include "tiles/dense_gemm.hpp"
+#include "tiles/dense_inexact.hpp"
 #include "tiles/matrix_gemm.hpp"
 #include "tiles/moe_gemm.hpp"
 #include "tiles/stream.hpp"
@@ -56,12 +57,32 @@ __global__ void __launch_bounds__(moe_tile::kThreads) affine_wmma_moe_down(Affin
     wmma_moe_tile<MoeDown, BITS, 64, MoeDown::kAhead>(a, 0.f);
 }
 
+// numerics=inexact: the same with the codes dequantized to bf16 (gate+up: 128-row passes of 64 x 32 waves)
+template <int BITS>
+__global__ void __launch_bounds__(moe_tile::kThreads) affine_wmma_moe_gu_inexact(Affine a, float limit) {
+    static_assert(BITS == 4, "4-bit codes");
+    wmma_moe_inexact_tile<MoeGateUp, 2, 128, 64>(a, limit);
+}
+
+template <int BITS>
+__global__ void __launch_bounds__(moe_tile::kThreads) affine_wmma_moe_down_inexact(Affine a) {
+    static_assert(BITS == 4, "4-bit codes");
+    wmma_moe_inexact_tile<MoeDown, 2, 64, 32>(a, 0.f);
+}
+
 // ---- a prompt's plain 4-bit group-32 products at Qwen3.8-Flash-Next's K (tiles/dense_gemm.hpp, gfx11 matrix cores) ----
 
 // K 2560 (the trunk's input projections), 6144 (out), 10240 (hc down), 320 (hc up); the bytes of affine_wmma_gemm
 template <int K>
 __global__ void __launch_bounds__(dense_tile::kThreads) affine_wmma_dense(Affine a) {
     wmma_dense_tile<K, DenseTune<K>::kAhead>(a);
+}
+
+// numerics=inexact: the same products with the codes dequantized to bf16 in the tile, one WMMA accumulation over K
+// (K 2560 and 6144; at hc_down's K 10240 the exact tile is faster, at hc_up's K 320 equal)
+template <int K>
+__global__ void __launch_bounds__(dense_inexact::kThreads) affine_wmma_dense_inexact(Affine a) {
+    wmma_dense_inexact_tile<K>(a);
 }
 
 // ---- the decode stream tile ----

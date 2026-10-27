@@ -436,8 +436,12 @@ test "the routed gate and up with its activation writes the same bytes at 2, 4 a
 /// Flash Next's prompt expert products (tiles/moe_gemm.hpp) against the 128-row matrix tile: the same bytes. Gate and
 /// up (`down` false) is compared after moe_act on both sides; down (`down` true) on the fp32 sums, x a row a pair.
 /// `skew` piles the pairs onto a few experts (items of 128 rows and of 1 row); `limit` > 0 clamps before the activation.
-fn promptExperts(t: *Rig, rng: *rig.Rng, down: bool, rows: usize, experts: usize, skew: bool, limit: f32) !void {
+/// `inexact`: the numerics=inexact tiles (codes dequantized to bf16) instead, within 2 u (down) or 3 u (gate+up's bf16
+/// activation) relative RMS of those bytes, u = 2^-9.
+fn promptExperts(t: *Rig, rng: *rig.Rng, down: bool, rows: usize, experts: usize, skew: bool, limit: f32, inexact: bool) !void {
     const kernels = &t.on.affine;
+    var chosen = t.on.affine;
+    chosen.inexact = inexact;
     const sh = if (down) affine.Kernels.moe_down_shape else affine.Kernels.moe_gu_shape;
     const n: usize = @intCast(sh.n);
     const k: usize = @intCast(sh.k);
@@ -496,12 +500,12 @@ fn promptExperts(t: *Rig, rng: *rig.Rng, down: bool, rows: usize, experts: usize
     try kernels.blockGo(&t.r, a, t.stream.handle, @intCast(count), .matrix);
     if (down) {
         a.out = at(sums[1]);
-        try std.testing.expect(try kernels.moeDown(&t.r, a, @intCast(count), t.stream.handle));
+        try std.testing.expect(try chosen.moeDown(&t.r, a, @intCast(count), t.stream.handle));
     } else {
         try t.off.tf_moe_act(@ptrFromInt(at(sums[0])), @ptrFromInt(at(acts[0])), t.kind(), @intCast(pairs), @intCast(width), limit, t.stream.handle);
         a.out = 0;
         a.out16 = at(acts[1]);
-        try std.testing.expect(try kernels.moeGateUp(&t.r, a, @intCast(count), limit, t.stream.handle));
+        try std.testing.expect(try chosen.moeGateUp(&t.r, a, @intCast(count), limit, t.stream.handle));
     }
     try t.stream.synchronize();
     const cmp = if (down) sums else acts;
@@ -510,6 +514,23 @@ fn promptExperts(t: *Rig, rng: *rig.Rng, down: bool, rows: usize, experts: usize
     const got = try rig.download(u8, cmp[1]);
     defer gpa.free(got);
     const size: usize = if (down) 4 else 2;
+    if (inexact) {
+        var num: f64 = 0;
+        var den: f64 = 0;
+        for (0..want.len / size) |e| {
+            const w: f64 = if (down) @as(f32, @bitCast(want[e * 4 ..][0..4].*)) else @as(f32, @bitCast(@as(u32, @as(u16, @bitCast(want[e * 2 ..][0..2].*))) << 16));
+            const g: f64 = if (down) @as(f32, @bitCast(got[e * 4 ..][0..4].*)) else @as(f32, @bitCast(@as(u32, @as(u16, @bitCast(got[e * 2 ..][0..2].*))) << 16));
+            num += (g - w) * (g - w);
+            den += w * w;
+        }
+        const rel = @sqrt(num / den);
+        std.debug.print("  prompt experts inexact down {} rows {d}: relative RMS {e:.2} against the exact tiles\n", .{ down, rows, rel });
+        // down's fp32 sums differ by the weights' bf16 rounding (2 u, u = 2^-9); gate+up's bf16 outputs carry it and
+        // a rounding of the activation on each side (3 u)
+        const u: f64 = 1.0 / 512.0;
+        try std.testing.expect(rel <= @as(f64, if (down) 2.0 else 3.0) * u);
+        return;
+    }
     var differ: usize = 0;
     for (0..want.len / size) |e| if (!std.mem.eql(u8, want[e * size ..][0..size], got[e * size ..][0..size])) {
         if (differ < 4) std.debug.print("  prompt experts down {} rows {d} skew {}: pair {d} column {d} differs\n", .{ down, rows, skew, e / width, e % width });
@@ -533,10 +554,10 @@ test "Flash Next's prompt gate and up with its activation in one launch writes t
     defer t.close();
     if (t.on.affine.moe_gu == null) return error.SkipZigTest;
     var rng: rig.Rng = .{ .state = 0x9E3779B97F4A7C15 };
-    try promptExperts(t, &rng, false, 300, 24, false, 0);
-    try promptExperts(t, &rng, false, 2048, 24, true, 0);
-    try promptExperts(t, &rng, false, 64, 24, false, 0);
-    try promptExperts(t, &rng, false, 512, 24, false, 7.0);
+    try promptExperts(t, &rng, false, 300, 24, false, 0, false);
+    try promptExperts(t, &rng, false, 2048, 24, true, 0, false);
+    try promptExperts(t, &rng, false, 64, 24, false, 0, false);
+    try promptExperts(t, &rng, false, 512, 24, false, 7.0, false);
 }
 
 test "Flash Next's prompt expert down writes the bytes of the matrix tile" {
@@ -544,9 +565,9 @@ test "Flash Next's prompt expert down writes the bytes of the matrix tile" {
     defer t.close();
     if (t.on.affine.moe_down == null) return error.SkipZigTest;
     var rng: rig.Rng = .{ .state = 0x2545F4914F6CDD1D };
-    try promptExperts(t, &rng, true, 300, 24, false, 0);
-    try promptExperts(t, &rng, true, 2048, 24, true, 0);
-    try promptExperts(t, &rng, true, 64, 24, false, 0);
+    try promptExperts(t, &rng, true, 300, 24, false, 0, false);
+    try promptExperts(t, &rng, true, 2048, 24, true, 0, false);
+    try promptExperts(t, &rng, true, 64, 24, false, 0, false);
 }
 
 /// A prompt's plain product on the dense tile of its K (tiles/dense_gemm.hpp) against the 128-row matrix tile: the same
@@ -621,4 +642,75 @@ test "a prompt's dense products at Flash Next's K write the bytes of the matrix 
     try promptDense(t, &rng, 200, 324, 10240);
     try promptDense(t, &rng, 383, 10240, 320);
     try promptDense(t, &rng, 1024, 1024, 2560);
+}
+
+/// numerics=inexact: the inexact dense tile (tiles/dense_inexact.hpp) against the matrix tile's fp32 sums, which differ
+/// by the bf16 rounding of the dequantized weights: relative RMS at most 4e-3 (2^-8). Its bf16 output is the rounding
+/// of its own fp32 sums, and the registry takes it only under numerics=inexact.
+fn promptDenseInexact(t: *Rig, rng: *rig.Rng, rows: usize, n: usize, k: usize) !void {
+    const kernels = &t.on.affine;
+    var m = try Matrix.init(t, rng, n, k, 4, 32, 1);
+    defer m.deinit();
+    const hx = try gpa.alloc(u16, rows * k);
+    defer gpa.free(hx);
+    for (hx) |*v| v.* = t.bits(rng.unit());
+    var x = try t.upload(hx);
+    defer x.free();
+    var outs = [2]@import("../memory.zig").DeviceBuffer{ try t.alloc(rows * n * 4), try t.alloc(rows * n * 4) };
+    defer for (&outs) |*b| b.free();
+    var halves = [2]@import("../memory.zig").DeviceBuffer{ try t.alloc(rows * n * 2), try t.alloc(rows * n * 2) };
+    defer for (&halves) |*b| b.free();
+    try outs[1].fill8(0xA5);
+    try halves[1].fill8(0xA5);
+    var a = m.arg(t, at(x), rows, at(outs[0]));
+    try kernels.blockGo(&t.r, a, t.stream.handle, 1, .matrix);
+    try std.testing.expect(!std.mem.endsWith(u8, kernels.choose(.project, .prefill, affine.Kernels.shapeOf(a, 1)).?.id, "inexact"));
+    a.out = at(outs[1]);
+    try kernels.denseInexactGo(&t.r, a, t.stream.handle);
+    try t.on.tf_cast(@ptrFromInt(at(outs[1])), 0, @ptrFromInt(at(halves[0])), t.kind(), @intCast(rows * n), t.stream.handle);
+    a.out = 0;
+    a.out16 = at(halves[1]);
+    try kernels.denseInexactGo(&t.r, a, t.stream.handle);
+    try t.stream.synchronize();
+    const want = try rig.download(f32, outs[0]);
+    defer gpa.free(want);
+    const got = try rig.download(f32, outs[1]);
+    defer gpa.free(got);
+    var num: f64 = 0;
+    var den: f64 = 0;
+    for (want, got) |w, g| {
+        num += (@as(f64, g) - w) * (@as(f64, g) - w);
+        den += @as(f64, w) * w;
+    }
+    const rel = @sqrt(num / den);
+    std.debug.print("  prompt dense inexact {d}x{d} rows {d}: relative RMS {e:.2} against the exact tile\n", .{ n, k, rows, rel });
+    try std.testing.expect(rel <= 4e-3);
+    const w16 = try rig.download(u16, halves[0]);
+    defer gpa.free(w16);
+    const g16 = try rig.download(u16, halves[1]);
+    defer gpa.free(g16);
+    try std.testing.expectEqualSlices(u16, w16, g16);
+}
+
+test "numerics=inexact: the dense tile with bf16-dequantized weights is within 4e-3 of the exact sums" {
+    const t = try Rig.open(1 << 20);
+    defer t.close();
+    if (t.on.affine.dense_inexact[0] == null) return error.SkipZigTest;
+    var rng: rig.Rng = .{ .state = 0xBB67AE8584CAA73B };
+    try promptDenseInexact(t, &rng, 300, 640, 2560);
+    try promptDenseInexact(t, &rng, 257, 2560, 6144);
+    try promptDenseInexact(t, &rng, 130, 200, 2560);
+    try promptDenseInexact(t, &rng, 1024, 1024, 2560);
+}
+
+test "numerics=inexact: Flash Next's prompt expert tiles with bf16-dequantized weights are within 2-3 bf16 steps of the exact bytes" {
+    const t = try Rig.open(1 << 20);
+    defer t.close();
+    if (t.on.affine.moe_gu_inexact == null) return error.SkipZigTest;
+    var rng: rig.Rng = .{ .state = 0x3C6EF372FE94F82B };
+    try promptExperts(t, &rng, false, 300, 24, false, 0, true);
+    try promptExperts(t, &rng, false, 2048, 24, true, 0, true);
+    try promptExperts(t, &rng, false, 512, 24, false, 7.0, true);
+    try promptExperts(t, &rng, true, 300, 24, false, 0, true);
+    try promptExperts(t, &rng, true, 2048, 24, true, 0, true);
 }

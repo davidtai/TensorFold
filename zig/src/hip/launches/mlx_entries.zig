@@ -40,6 +40,7 @@ fn matrixOn(e: Env) bool {
     return e.matrix and e.matrix_on and e.gemm_on;
 }
 
+
 // ---- the shapes the tiles have code for
 
 fn groupOk(s: Shape) bool {
@@ -193,6 +194,12 @@ fn fitsPrefillDense(s: Shape) bool {
         s.n >= 128 and Kernels.denseIndex(@intCast(s.k)) != null;
 }
 
+/// The inexact dense tile: the dense tile's products at a K it compiles.
+fn fitsPrefillDenseInexact(s: Shape) bool {
+    return fitsPrefillMatrix(s) and s.items == 0 and s.bits == 4 and s.group == 32 and s.tables == .bf16 and s.x_aligned and
+        s.n >= 128 and Kernels.inexactIndex(@intCast(s.k)) != null;
+}
+
 fn fitsPrefillGemm(s: Shape) bool {
     return prefillOk(s) and gemmFits(s);
 }
@@ -251,6 +258,10 @@ fn launchDense(k: *const Kernels, c: Call) Error!void {
     try k.denseGo(c.r, c.arg, c.s);
 }
 
+fn launchDenseInexact(k: *const Kernels, c: Call) Error!void {
+    try k.denseInexactGo(c.r, c.arg, c.s);
+}
+
 fn launchKp(comptime tier: usize) Launch {
     return struct {
         fn f(k: *const Kernels, c: Call) Error!void {
@@ -270,6 +281,7 @@ const Spec = struct {
     policy: *const fn (Env) bool = &always,
     rounds: registry.Rounds = .never,
     round_any: bool = false,
+    exact: bool = true,
 };
 
 fn entry(comptime op: Op, comptime path: registry.Path, comptime name: []const u8, comptime spec: Spec) Entry {
@@ -284,6 +296,7 @@ fn entry(comptime op: Op, comptime path: registry.Path, comptime name: []const u
         .fits = spec.fits,
         .rounds = spec.rounds,
         .round_any = spec.round_any,
+        .exact = spec.exact,
         .launch = spec.launch,
     };
 }
@@ -328,6 +341,7 @@ fn prefill(comptime op: Op) [7]Entry {
 }
 
 const project_prefill = [_]Entry{
+    entry(.project, .prefill, "dense_inexact", .{ .family = .gemm, .fits = &fitsPrefillDenseInexact, .launch = &launchDenseInexact, .caps = &matrixCores, .policy = &matrixOn, .rounds = .always, .exact = false }),
     entry(.project, .prefill, "dense", .{ .family = .gemm, .fits = &fitsPrefillDense, .launch = &launchDense, .caps = &matrixCores, .policy = &matrixOn, .rounds = .always }),
 };
 
@@ -450,4 +464,27 @@ test "a prompt's plain 4-bit group-32 products at Flash Next's K take the dense 
     shape.items = 0;
     try std.testing.expect(std.mem.endsWith(u8, r.select(envOn("gfx1151", true, true, false), .mlx, .project, .prefill, shape).?.id, "gemm"));
     try std.testing.expect(std.mem.endsWith(u8, r.select(envOn("gfx1201", true, true, true), .mlx, .project, .prefill, shape).?.id, "gemm"));
+}
+
+test "numerics=inexact takes the inexact dense tile at K 2560 and 6144; exact never takes it" {
+    const r = kernelsOn("gfx1151");
+    const exact = envOn("gfx1151", true, true, true);
+    var inexact = exact;
+    inexact.inexact = true;
+    var shape: Shape = .{ .m = 8192, .n = 10240, .k = 2560, .bits = 4, .group = 32, .fp16 = false };
+    for ([_]u32{ 2560, 6144 }) |k| {
+        shape.k = k;
+        try std.testing.expect(std.mem.endsWith(u8, r.select(inexact, .mlx, .project, .prefill, shape).?.id, "dense_inexact"));
+        try std.testing.expect(std.mem.endsWith(u8, r.select(exact, .mlx, .project, .prefill, shape).?.id, ".dense"));
+    }
+    // hc_down and hc_up stay on the exact dense tile; few rows keep the K-parallel tiles
+    for ([_]u32{ 320, 10240 }) |k| {
+        shape.k = k;
+        try std.testing.expect(std.mem.endsWith(u8, r.select(inexact, .mlx, .project, .prefill, shape).?.id, ".dense"));
+    }
+    shape.k = 2560;
+    shape.m = 32;
+    try std.testing.expect(std.mem.endsWith(u8, r.select(inexact, .mlx, .project, .prefill, shape).?.id, "kp2"));
+    // the family rule holds under inexact too
+    try r.verify(inexact, .mlx);
 }

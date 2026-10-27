@@ -25,6 +25,7 @@
 
 #include "common/wmma.hpp"
 #include "quant/mlx_decoder.hpp"
+#include "tiles/dense_inexact.hpp"
 #include "tiles/plan.hpp"
 
 namespace tf {
@@ -275,6 +276,169 @@ __device__ __forceinline__ void wmma_moe_tile(Affine a, float limit) {
                 } else {
 #pragma unroll
                     for (int j = 0; j < 2; ++j) a.out[orow * S::kN + S::col(bx, lines[j])] = acc[mt][j][i];
+                }
+            }
+        }
+    }
+#else
+    (void)a;
+    (void)limit;
+    __builtin_trap();
+#endif
+}
+
+// numerics=inexact: the same products with the codes dequantized to bf16 in the stash (w = bf16(fma(scale, q, bias)),
+// dense_inexact.hpp's rounding) and one WMMA accumulation over K: no per-group d, fold or sums of x, so a wave can hold
+// more tiles. BM rows a pass, the same 128 staged weight rows (S::col), waves of WR rows. gfx1151 at 8,192 rows
+// (w2/moe_bench.hip, -DTF_BENCH_INEXACT): gate+up at 128 rows, 64 x 32 waves, 22.6 ms against 25.0 for the exact tile;
+// down at 64 rows, 32 x 32 waves, 12.2 ms against 13.8. Relative RMS against float64 2.4e-3 and 1.7e-3.
+template <class S, int AHEAD, int BM, int WR>
+__device__ __forceinline__ void wmma_moe_inexact_tile(Affine a, float limit) {
+#if TF_DEVICE_WMMA_GFX11
+    using moe_tile::kBN;
+    constexpr int KW = 64;
+    constexpr int kK = S::kK, kGW = KW / 32, kWindows = kK / KW, kLdw = (KW + 8) / 2;
+    constexpr int kWChunks = kBN * kGW / 256, kXPer = KW / 8, kXChunks = BM * kXPer / 256;
+    constexpr int kWordsRow = kK / 8, kGroups = kK / 32;
+    constexpr int kWM = BM / WR, kWC = BM * kBN / 8 / WR, kMT = WR / 16, kNT = kWC / 16;
+    static_assert(kWindows % AHEAD == 0 && kXChunks >= 1 && (!S::kAct || kNT % 2 == 0), "shape");
+    using Dec = MlxDecoder<4>;
+    using T = WmmaBF16;
+    if (!Dec::take_item(a, blockIdx.z)) return;
+    __shared__ __attribute__((aligned(16))) uint32_t xs[BM * kLdw];
+    __shared__ __attribute__((aligned(16))) uint32_t ws[kBN * kLdw];
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int wave = __builtin_amdgcn_readfirstlane(tid >> 5);
+    const int bx = blockIdx.x;
+    // weights: chunk i of thread t is staged row (256 i + t) / 2, group t % 2 of the window, with its scale and bias
+    const int wq = tid % kGW;
+    const uint32_t* wsrc[kWChunks];
+    const uint16_t* ssrc[kWChunks];
+    const uint16_t* bsrc[kWChunks];
+#pragma unroll
+    for (int i = 0; i < kWChunks; ++i) {
+        const long long c = S::col(bx, (256 * i + tid) / kGW);
+        wsrc[i] = a.words + c * kWordsRow + wq * 4;
+        ssrc[i] = static_cast<const uint16_t*>(a.scale.p) + c * kGroups + wq;
+        bsrc[i] = static_cast<const uint16_t*>(a.bias.p) + c * kGroups + wq;
+    }
+    const int xc = tid % kXPer;
+    // wave (wm, wn): rows WR wm.., kNT staged-row tiles (gate+up: the first half gate, the second the same up columns)
+    const int wm = wave % kWM;
+    const int wn = wave / kWM;
+    const int rl = lane & 15;
+    const int rh = lane >> 4;
+    int lines[kNT];
+#pragma unroll
+    for (int j = 0; j < kNT; ++j) {
+        if constexpr (S::kAct) lines[j] = (j < kNT / 2 ? 0 : kBN / 2) + wn * (kWC / 2) + (j % (kNT / 2)) * 16 + rl;
+        else lines[j] = wn * kWC + j * 16 + rl;
+    }
+    const f32x8 zero = {0, 0, 0, 0, 0, 0, 0, 0};
+    for (int h0 = 0; h0 < a.m; h0 += BM) {
+        const int rows_left = a.m - h0 < BM ? a.m - h0 : BM;
+        const u32x4* xsrc[kXChunks];
+#pragma unroll
+        for (int i = 0; i < kXChunks; ++i) {
+            const int r = (256 * i + tid) / kXPer;
+            const int rs = h0 + (r < rows_left ? r : rows_left - 1);
+            xsrc[i] = reinterpret_cast<const u32x4*>(static_cast<const __bf16*>(a.x) + x_row(a, rs) * kK) + xc;
+        }
+        u32x4 wreg[AHEAD][kWChunks];
+        u32x4 xreg[AHEAD][kXChunks];
+        uint16_t sreg[AHEAD][kWChunks];
+        uint16_t breg[AHEAD][kWChunks];
+        f32x8 acc[kMT][kNT];
+#pragma unroll
+        for (int mt = 0; mt < kMT; ++mt) {
+#pragma unroll
+            for (int j = 0; j < kNT; ++j) acc[mt][j] = zero;
+        }
+        // unconditional loads (a window past the last repeats it): no vmcnt(0) at the stash
+        auto load = [&]<int R>(std::integral_constant<int, R>, int w) {
+            const int wl = w < kWindows ? w : kWindows - 1;
+#pragma unroll
+            for (int i = 0; i < kWChunks; ++i) {
+                wreg[R][i] = *reinterpret_cast<const u32x4*>(wsrc[i] + wl * kGW * 4);
+                sreg[R][i] = ssrc[i][wl * kGW];
+                breg[R][i] = bsrc[i][wl * kGW];
+            }
+#pragma unroll
+            for (int i = 0; i < kXChunks; ++i) xreg[R][i] = xsrc[i][wl * kXPer];
+        };
+        auto stash = [&]<int R>(std::integral_constant<int, R>) {
+#pragma unroll
+            for (int i = 0; i < kWChunks; ++i) {
+                const int row = (256 * i + tid) / kGW;
+                const float sv = __uint_as_float(static_cast<uint32_t>(sreg[R][i]) << 16);
+                const float bv = __uint_as_float(static_cast<uint32_t>(breg[R][i]) << 16);
+                const uint32_t wv[4] = {wreg[R][i].x, wreg[R][i].y, wreg[R][i].z, wreg[R][i].w};
+                u32x4* dst = reinterpret_cast<u32x4*>(ws + row * kLdw + wq * 16);
+#pragma unroll
+                for (int v = 0; v < 4; ++v) dst[v] = dense_inexact::dequant8(wv[v], sv, bv);
+            }
+#pragma unroll
+            for (int i = 0; i < kXChunks; ++i) {
+                const int row = (256 * i + tid) / kXPer;
+                *reinterpret_cast<u32x4*>(xs + row * kLdw + xc * 4) = xreg[R][i];
+            }
+        };
+        lds_barrier();
+        [&]<int... R>(std::integer_sequence<int, R...>) {
+            (load(std::integral_constant<int, R>{}, R), ...);
+        }(std::make_integer_sequence<int, AHEAD>{});
+        stash(std::integral_constant<int, 0>{});
+        load(std::integral_constant<int, 0>{}, AHEAD);
+        lds_barrier();
+        auto window = [&]<int J>(std::integral_constant<int, J>, int w) {
+            constexpr int next = (J + 1) % AHEAD;
+#pragma unroll
+            for (int k16 = 0; k16 < KW / 16; ++k16) {
+                bf16x16 bf[kNT];
+#pragma unroll
+                for (int j = 0; j < kNT; ++j) bf[j] = frag16(ws + lines[j] * kLdw + k16 * 8);
+#pragma unroll
+                for (int mt = 0; mt < kMT; ++mt) {
+                    const bf16x16 af = frag16(xs + (wm * WR + mt * 16 + rl) * kLdw + k16 * 8);
+#pragma unroll
+                    for (int j = 0; j < kNT; ++j) acc[mt][j] = T::mma(af, bf[j], acc[mt][j]);
+                }
+            }
+            lds_barrier();
+            // past the last window the stash rewrites LDS no later window reads
+            stash(std::integral_constant<int, next>{});
+            load(std::integral_constant<int, next>{}, w + 1 + AHEAD);
+            lds_barrier();
+        };
+        for (int w0 = 0; w0 < kWindows; w0 += AHEAD) {
+            [&]<int... J>(std::integer_sequence<int, J...>) {
+                (window(std::integral_constant<int, J>{}, w0 + J), ...);
+            }(std::make_integer_sequence<int, AHEAD>{});
+        }
+#pragma unroll
+        for (int mt = 0; mt < kMT; ++mt) {
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const int row = wm * WR + mt * 16 + 2 * i + rh;
+                if (row >= rows_left) continue;
+                const long long orow = out_row(a, h0 + row);
+                if constexpr (S::kAct) {
+                    // moe_act_kernel on the pair's fp32 sums: clamp when limit > 0, g / (1 + exp(-g)) * u, hip_bfloat16
+#pragma unroll
+                    for (int j = 0; j < kNT / 2; ++j) {
+                        float g = acc[mt][j][i];
+                        float u = acc[mt][j + kNT / 2][i];
+                        if (limit > 0.f) {
+                            g = fminf(g, limit);
+                            u = fminf(fmaxf(u, -limit), limit);
+                        }
+                        const hip_bfloat16 v(g / (1.f + expf(-g)) * u);
+                        reinterpret_cast<uint16_t*>(a.out16)[orow * S::kNI + 64 * bx + lines[j]] = v.data;
+                    }
+                } else {
+#pragma unroll
+                    for (int j = 0; j < kNT; ++j) a.out[orow * S::kN + S::col(bx, lines[j])] = acc[mt][j][i];
                 }
             }
         }

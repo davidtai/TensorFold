@@ -21,7 +21,8 @@ const Error = runtime.Error;
 pub const Matrix = enum { auto, on, off };
 
 /// Which product tiles a run takes where two give the same bits; every one defaults on.
-pub const Choices = struct { matrix: Matrix = .auto, stream: bool = true, gemm: bool = true };
+/// `inexact` (policy numerics=inexact) also lets the tiles that change a product's bits run.
+pub const Choices = struct { matrix: Matrix = .auto, stream: bool = true, gemm: bool = true, inexact: bool = false };
 
 /// quant/mlx.hpp's GroupTable, Routing and Affine as the kernels take them by value.
 pub const GroupTable = extern struct { p: u64, kind: c_int };
@@ -128,6 +129,8 @@ pub const Kernels = struct {
     mode: Matrix,
     /// Which GEMM tile the products take; the policy's reference switch picks the reference one.
     tile: Tile,
+    /// The tiles that change a product's bits may run (numerics=inexact).
+    inexact: bool,
     lanes: [bit_widths.len][row_counts.len][piece_counts.len]Function,
     row: [bit_widths.len][piece_counts.len]Function,
     /// The stream tile (tiles/stream.hpp) by width, rows and columns a lane; null where columns * rows > 16.
@@ -148,8 +151,13 @@ pub const Kernels = struct {
     moe_gu: ?Function,
     /// The same tile's routed down of a prompt, fp32 out.
     moe_down: ?Function,
+    /// Both with the codes dequantized to bf16 (numerics=inexact).
+    moe_gu_inexact: ?Function,
+    moe_down_inexact: ?Function,
     /// A prompt's plain 4-bit group-32 products at each of dense_ks (tiles/dense_gemm.hpp); gfx11.
     dense: [dense_ks.len]?Function,
+    /// The same at each of inexact_ks with the codes dequantized to bf16 (tiles/dense_inexact.hpp); numerics=inexact.
+    dense_inexact: [inexact_ks.len]?Function,
     kp: [bit_widths.len][kp_tiles.len]Function,
     span: [2]Function,
     fold: Function,
@@ -167,6 +175,7 @@ pub const Kernels = struct {
         k.wmma = wmma;
         k.matrix = wmma and caps.matrix == .wmma11;
         k.mode = choices.matrix;
+        k.inexact = choices.inexact;
         k.tile = if (choices.gemm) .gemm else .block;
         k.stream_on = choices.stream;
         k.stream_cb_force = 0;
@@ -183,8 +192,13 @@ pub const Kernels = struct {
         k.fill = try dot2_obj.function(r ++ "13fill_byte_lutEP6__half");
         k.moe_gu = if (k.matrix) try tiles_obj.function(r ++ "18affine_wmma_moe_guILi4EEEvNS0_6AffineEf") else null;
         k.moe_down = if (k.matrix) try tiles_obj.function(r ++ "20affine_wmma_moe_downILi4EEEvNS0_6AffineE") else null;
+        k.moe_gu_inexact = if (k.matrix) try tiles_obj.function(r ++ "26affine_wmma_moe_gu_inexactILi4EEEvNS0_6AffineEf") else null;
+        k.moe_down_inexact = if (k.matrix) try tiles_obj.function(r ++ "28affine_wmma_moe_down_inexactILi4EEEvNS0_6AffineE") else null;
         inline for (dense_ks, 0..) |dk, i| {
             k.dense[i] = if (k.matrix) try tiles_obj.function(std.fmt.comptimePrint(r ++ "17affine_wmma_denseILi{d}EEEvNS0_6AffineE", .{dk})) else null;
+        }
+        inline for (inexact_ks, 0..) |dk, i| {
+            k.dense_inexact[i] = if (k.matrix) try tiles_obj.function(std.fmt.comptimePrint(r ++ "25affine_wmma_dense_inexactILi{d}EEEvNS0_6AffineE", .{dk})) else null;
         }
         return k;
     }
@@ -296,7 +310,7 @@ pub const Kernels = struct {
 
     /// The GPU and the run's switches as the registry reads them.
     pub fn env(k: *const Kernels) registry.Env {
-        return .{ .bf16 = k.wmma, .matrix = k.matrix, .matrix_on = k.matrix and k.mode != .off, .stream_on = k.stream_on, .gemm_on = k.tile == .gemm };
+        return .{ .bf16 = k.wmma, .matrix = k.matrix, .matrix_on = k.matrix and k.mode != .off, .stream_on = k.stream_on, .gemm_on = k.tile == .gemm, .inexact = k.inexact };
     }
 
     /// The MLX entry that takes a product, or null.
@@ -513,7 +527,9 @@ pub const Kernels = struct {
         var args: hl.Args = .{};
         try args.add(a);
         try args.add(limit);
-        try go(r, k.moe_gu.?, .{ .x = moe_gu_shape.blocks, .z = @intCast(items) }, .{ .x = 256 }, s, &args);
+        // numerics=inexact: the codes dequantized to bf16 in the tile, other bits
+        const f = if (k.inexact) k.moe_gu_inexact orelse k.moe_gu.? else k.moe_gu.?;
+        try go(r, f, .{ .x = moe_gu_shape.blocks, .z = @intCast(items) }, .{ .x = 256 }, s, &args);
         return true;
     }
 
@@ -523,7 +539,8 @@ pub const Kernels = struct {
         if (!k.moeDownTakes(a, items) or a.out == 0 or a.out16 != 0) return false;
         var args: hl.Args = .{};
         try args.add(a);
-        try go(r, k.moe_down.?, .{ .x = moe_down_shape.blocks, .z = @intCast(items) }, .{ .x = 256 }, s, &args);
+        const f = if (k.inexact) k.moe_down_inexact orelse k.moe_down.? else k.moe_down.?;
+        try go(r, f, .{ .x = moe_down_shape.blocks, .z = @intCast(items) }, .{ .x = 256 }, s, &args);
         return true;
     }
 
@@ -541,6 +558,22 @@ pub const Kernels = struct {
         var args: hl.Args = .{};
         try args.add(a);
         try go(r, f, .{ .x = cdiv(a.n, 128) * cdiv(a.m, 128) }, .{ .x = 256 }, s, &args);
+    }
+
+    /// The K tiles/dense_inexact.hpp compiles (affine_wmma_dense_inexact): 128 x 256 blocks.
+    pub const inexact_ks = [_]c_int{ 2560, 6144 };
+
+    pub fn inexactIndex(k: c_int) ?usize {
+        for (inexact_ks, 0..) |d, i| if (d == k) return i;
+        return null;
+    }
+
+    /// numerics=inexact: a prompt's plain product with the codes dequantized to bf16 in the tile.
+    pub fn denseInexactGo(k: *const Kernels, r: *const runtime.Runtime, a: Arg, s: abi.Stream) Error!void {
+        const f = k.dense_inexact[inexactIndex(a.k) orelse return refuse("inexact dense K")] orelse return refuse("inexact dense tile");
+        var args: hl.Args = .{};
+        try args.add(a);
+        try go(r, f, .{ .x = cdiv(a.n, 256) * cdiv(a.m, 128) }, .{ .x = 256 }, s, &args);
     }
 
     /// K-parallel tile `tier` (an index of kp_tiles) of a short prompt.

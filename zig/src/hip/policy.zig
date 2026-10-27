@@ -96,7 +96,7 @@ pub const Policy = struct {
             .on => .on,
             .off => .off,
         };
-        return .{ .fuse = p.fused(), .inexact = p.inexact(), .wide = p.wideAttention(), .products = .{ .matrix = matrix, .stream = p.streamOn(), .gemm = p.gemmOn() } };
+        return .{ .fuse = p.fused(), .inexact = p.inexact(), .wide = p.wideAttention(), .products = .{ .matrix = matrix, .stream = p.streamOn(), .gemm = p.gemmOn(), .inexact = p.inexact() } };
     }
 
     /// Whether the 64-row prefill attention tile is on.
