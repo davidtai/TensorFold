@@ -636,8 +636,11 @@ pub const Fx = struct {
             var mixed = forward.at(out.mixed, (follow.len - 1) * m.dims.hidden);
             var streams = out.streams.ptr + (follow.len - 1) * row_bytes;
             const depth = @min(r.depth, max_depth);
-            // a chain past the first round ends after a draft the head gives under the confidence (--mtp-confidence)
-            const stop_under: f32 = if (r.rows != null) @floatCast(e.o.policy.mtp.confidence) else 0.0;
+            // a chain past the first round ends after a draft the head gives under the confidence (--mtp-confidence);
+            // under mtp_depth=gated the first round's chain too, so the round after the prompt is no deeper than the gate
+            // allows (an ungated first chain drafted the whole cap: +34-70 ms to the first token at cap 7)
+            const gate = r.rows != null or e.o.policy.mtp_depth == .gated;
+            const stop_under: f32 = if (gate) @floatCast(e.o.policy.mtp.confidence) else 0.0;
             var d: usize = 0;
             var chained: usize = 0;
             while (d < depth) : (d += 1) {
