@@ -427,4 +427,291 @@ extern "C" __global__ void tf_fn_sparse_merge_gate(const float* parts_o, const f
     sparse_merge(parts_o, parts_ms, qg, kind, out, heads, dims, parts);
 }
 
+// ---- W4 prototypes (w4/proto-ql3, never merged): the inexact prompt tile (sparse_prompt<false, false, false>) with
+// fewer 128-byte lines a gather load. Same arithmetic in the same order, so the same bytes.
+//   KCO (QL-10): K in coalesced loads, 8 lanes a key's 128-byte line (4 keys a load, 8 loads a chunk, against 16 loads
+//        of 16 lines), staged in the wave's own vt area ([32 keys][64 + 8 dims] bf16) and read back as B fragments.
+//   VT (QL-3): V in the cache in 4-token blocks of dim pairs: block b = key / 4 of head g holds, for dim pair p, the 4
+//        tokens' (2p, 2p + 1) as one dword each: dword ((g cap / 4 + b) 128 + p) 4 + key % 4. A load is one cell's
+//        64 dims (32 lanes x 4 bytes over 512 bytes: 4 lines, against 8 loads of 32 lines); each lane then holds dims
+//        2 lane, 2 lane + 1 of all 32 cells, written to vt as two rows of 16-byte stores (no 2-byte transpose).
+// LDS, launch and outputs are tf_fn_sparse_prompt_hi's.
+template <bool KCO, bool VT, bool PARTS = false, bool LO = false>
+__device__ void w4_sparse_ql(const float* __restrict__ q, const uint16_t* __restrict__ k, const uint16_t* __restrict__ v,
+                             const int* __restrict__ ids, long long id_stride, const int* __restrict__ count,
+                             const int* __restrict__ sparse, const uint16_t* qg, void* out, float* parts_ms,
+                             long long cap, float scale) {
+#if TF_DEVICE_WMMA_GFX11
+    using tf::rocm::bf16x16;
+    using tf::rocm::f32x8;
+    using tf::rocm::u32x8;
+    using Mma = tf::rocm::WmmaBF16;
+    __shared__ PromptSmem S;
+    const int r = blockIdx.x, g = blockIdx.y;
+    const int t = threadIdx.x, lane = t & 31, wave = t >> 5;
+    const int col = lane & 15, half = lane >> 4;
+    const int dim0 = wave * 64;
+    const int n_row = count[r];
+    const int part = PARTS ? static_cast<int>(blockIdx.z) : 0, parts = PARTS ? static_cast<int>(gridDim.z) : 1;
+    const int lo_key = static_cast<int>(static_cast<long long>(part) * n_row / parts);
+    const int n = static_cast<int>(static_cast<long long>(part + 1) * n_row / parts);
+    const bool listed = ids != nullptr && sparse != nullptr && sparse[r] != 0;
+    const int* row_ids = ids + r * id_stride;
+    const long long head_base = static_cast<long long>(g) * cap * kPromptDims;
+    // the compiler's view of the wave's LDS order (one wave's LDS operations run in order)
+    auto wave_order = [] {
+        __builtin_amdgcn_fence(__ATOMIC_SEQ_CST, "wavefront");
+        __builtin_amdgcn_wave_barrier();
+    };
+    constexpr int kKsRow = 9;  // KCO stage row: 64 dims + 8, in 16-byte units
+    uint4* ks = reinterpret_cast<uint4*>(&S.vt[wave][0][0]);
+    static_assert(32 * kKsRow * 16 <= sizeof(S.vt[0]), "the K stage fits the wave's vt area");
+
+    bf16x16 qh[4];
+#pragma unroll
+    for (int kk = 0; kk < 4; ++kk) {
+        u32x8 hw;
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            float x0 = 0.f, x1 = 0.f;
+            if (col < kPromptGroup) {
+                const float* src = q + (static_cast<long long>(r) * kPromptHeads + g * kPromptGroup + col) * kPromptDims +
+                                   dim0 + kk * 16 + 2 * i;
+                x0 = src[0] * scale;
+                x1 = src[1] * scale;
+            }
+            hw[i] = prompt_pack(float_to_bf16(x0), float_to_bf16(x1));
+        }
+        qh[kk] = __builtin_bit_cast(bf16x16, hw);
+    }
+    if (t < 16) {
+        S.m[t] = -INFINITY;
+        S.l[t] = 0.f;
+    }
+    f32x8 acc[4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) acc[j] = f32x8{0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+
+    for (int c0 = lo_key; c0 < n; c0 += kPromptChunk) {
+        const int cell = c0 + lane;
+        const bool live = cell < n;
+        const int key = live ? (listed ? row_ids[cell] : cell) : 0;
+        uint4 kx[2][4][2];
+        uint4 kc[8];
+        if constexpr (KCO) {
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const int kr = __shfl(key, 4 * i + (lane >> 3), 32);
+                kc[i] = *reinterpret_cast<const uint4*>(k + head_base + static_cast<long long>(kr) * kPromptDims + dim0 + 8 * (lane & 7));
+            }
+        } else {
+#pragma unroll
+            for (int nt = 0; nt < 2; ++nt) {
+                const int kr = __shfl(key, nt * 16 + col, 32);
+                const uint4* src = reinterpret_cast<const uint4*>(k + head_base + static_cast<long long>(kr) * kPromptDims + dim0);
+#pragma unroll
+                for (int kk = 0; kk < 4; ++kk) {
+                    kx[nt][kk][0] = src[2 * kk];
+                    kx[nt][kk][1] = src[2 * kk + 1];
+                }
+            }
+        }
+        uint4 vx[8];
+        uint32_t vw[32];
+        if constexpr (VT) {
+            const uint32_t* v4 = reinterpret_cast<const uint32_t*>(v) + head_base / 2 + (dim0 / 2 + lane) * 4;
+#pragma unroll
+            for (int c = 0; c < 32; ++c) {
+                const int kc_ = __shfl(key, c, 32);
+                vw[c] = v4[static_cast<long long>(kc_ >> 2) * 512 + (kc_ & 3)];
+            }
+        } else {
+            const uint4* src = reinterpret_cast<const uint4*>(v + head_base + static_cast<long long>(key) * kPromptDims + dim0);
+#pragma unroll
+            for (int i = 0; i < 8; ++i) vx[i] = src[i];
+        }
+        if constexpr (KCO) {
+            wave_order();  // the previous chunk's p.v reads of vt
+#pragma unroll
+            for (int i = 0; i < 8; ++i) ks[(4 * i + (lane >> 3)) * kKsRow + (lane & 7)] = kc[i];
+            wave_order();
+#pragma unroll
+            for (int nt = 0; nt < 2; ++nt)
+#pragma unroll
+                for (int kk = 0; kk < 4; ++kk) {
+                    kx[nt][kk][0] = ks[(nt * 16 + col) * kKsRow + 2 * kk];
+                    kx[nt][kk][1] = ks[(nt * 16 + col) * kKsRow + 2 * kk + 1];
+                }
+        }
+#pragma unroll
+        for (int nt = 0; nt < 2; ++nt) {
+            f32x8 s = f32x8{0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+            for (int kk = 0; kk < 4; ++kk) {
+                const u32x8 w = {kx[nt][kk][0].x, kx[nt][kk][0].y, kx[nt][kk][0].z, kx[nt][kk][0].w,
+                                 kx[nt][kk][1].x, kx[nt][kk][1].y, kx[nt][kk][1].z, kx[nt][kk][1].w};
+                s = Mma::mma(qh[kk], __builtin_bit_cast(bf16x16, w), s);
+            }
+#pragma unroll
+            for (int i = 0; i < 8; ++i) S.part[wave][2 * i + half][nt * 16 + col] = s[i];
+        }
+        if constexpr (KCO) wave_order();  // the stage's reads before vt is rewritten
+        if constexpr (VT) {
+            uint32_t ra[16], rb[16];
+#pragma unroll
+            for (int i = 0; i < 16; ++i) {
+                ra[i] = (vw[2 * i] & 0xffffu) | (vw[2 * i + 1] << 16);
+                rb[i] = (vw[2 * i] >> 16) | (vw[2 * i + 1] & 0xffff0000u);
+            }
+            uint4* da = reinterpret_cast<uint4*>(&S.vt[wave][2 * lane][0]);
+            uint4* db = reinterpret_cast<uint4*>(&S.vt[wave][2 * lane + 1][0]);
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                da[i] = uint4{ra[4 * i], ra[4 * i + 1], ra[4 * i + 2], ra[4 * i + 3]};
+                db[i] = uint4{rb[4 * i], rb[4 * i + 1], rb[4 * i + 2], rb[4 * i + 3]};
+            }
+        } else {
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const uint32_t w4[4] = {vx[i].x, vx[i].y, vx[i].z, vx[i].w};
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    S.vt[wave][i * 8 + 2 * j][lane] = static_cast<uint16_t>(w4[j] & 0xffffu);
+                    S.vt[wave][i * 8 + 2 * j + 1][lane] = static_cast<uint16_t>(w4[j] >> 16);
+                }
+            }
+        }
+        __syncthreads();
+        {
+            const int row = t >> 3, sub = t & 7;
+            float x[4], mx = -INFINITY;
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const int c = sub * 4 + j;
+                const float sc = ((S.part[0][row][c] + S.part[1][row][c]) + S.part[2][row][c]) + S.part[3][row][c];
+                x[j] = c0 + c < n ? sc : -INFINITY;
+                mx = fmaxf(mx, x[j]);
+            }
+#pragma unroll
+            for (int mask = 1; mask < 8; mask <<= 1) mx = fmaxf(mx, __shfl_xor(mx, mask, 32));
+            const float m_old = S.m[row];
+            const float m_new = fmaxf(m_old, mx);
+            float sum = 0.f;
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const float e = x[j] == -INFINITY ? 0.f : expf(x[j] - m_new);
+                S.p[row][sub * 4 + j] = e;
+                sum += e;
+            }
+#pragma unroll
+            for (int mask = 1; mask < 8; mask <<= 1) sum += __shfl_xor(sum, mask, 32);
+            if (sub == 0) {
+                const float f = expf(m_old - m_new);
+                S.alpha[row] = f;
+                S.l[row] = S.l[row] * f + sum;
+                S.m[row] = m_new;
+            }
+        }
+        __syncthreads();
+        float a[8];
+#pragma unroll
+        for (int i = 0; i < 8; ++i) a[i] = S.alpha[2 * i + half];
+#pragma unroll
+        for (int j = 0; j < 4; ++j)
+#pragma unroll
+            for (int i = 0; i < 8; ++i) acc[j][i] *= a[i];
+#pragma unroll
+        for (int ks_ = 0; ks_ < 2; ++ks_) {
+            u32x8 hw, lw;
+            const float* pr = &S.p[col][ks_ * 16];
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const float p0 = pr[2 * i], p1 = pr[2 * i + 1];
+                const uint16_t h0 = float_to_bf16(p0), h1 = float_to_bf16(p1);
+                hw[i] = prompt_pack(h0, h1);
+                if constexpr (LO) lw[i] = prompt_pack(float_to_bf16(p0 - bf16_to_float(h0)), float_to_bf16(p1 - bf16_to_float(h1)));
+            }
+            const bf16x16 ph = __builtin_bit_cast(bf16x16, hw), pl = __builtin_bit_cast(bf16x16, lw);
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const uint4* src = reinterpret_cast<const uint4*>(&S.vt[wave][j * 16 + col][ks_ * 16]);
+                const uint4 lo = src[0], hi = src[1];
+                const u32x8 w = {lo.x, lo.y, lo.z, lo.w, hi.x, hi.y, hi.z, hi.w};
+                const bf16x16 b = __builtin_bit_cast(bf16x16, w);
+                acc[j] = Mma::mma(ph, b, acc[j]);
+                if constexpr (LO) acc[j] = Mma::mma(pl, b, acc[j]);
+            }
+        }
+    }
+    __syncthreads();
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const int h = 2 * i + half;
+        if (h >= kPromptGroup) continue;
+        if constexpr (PARTS) {
+            const long long row = (static_cast<long long>(r) * kPromptHeads + g * kPromptGroup + h) * parts + part;
+#pragma unroll
+            for (int j = 0; j < 4; ++j) static_cast<float*>(out)[row * kPromptDims + dim0 + j * 16 + col] = acc[j][i];
+            if (wave == 0 && col == 0) {
+                parts_ms[row * 2] = S.m[h];
+                parts_ms[row * 2 + 1] = S.l[h];
+            }
+            continue;
+        }
+        const float total = S.l[h];
+        const long long at = (static_cast<long long>(r) * kPromptHeads + g * kPromptGroup + h) * kPromptDims;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int d = dim0 + j * 16 + col;
+            const float o = total > 0.f ? acc[j][i] / total : 0.f;
+            if (qg == nullptr) {
+                static_cast<float*>(out)[at + d] = o;
+            } else {
+                const float gate = bf16_to_float(qg[at * 2 + kPromptDims + d]);
+                static_cast<uint16_t*>(out)[at + d] = float_to_bf16(o * sigmoid(gate));
+            }
+        }
+    }
+#else
+    __builtin_trap();
+#endif
+}
+
+#define W4_QL_KERNEL(NAME, KCO, VT)                                                                                     \
+    extern "C" __global__ void __launch_bounds__(kPromptThreads)                                                        \
+    NAME(const float* q, const void* k, const void* v, const int* ids, long long id_stride, const int* count,           \
+         const int* sparse, const void* qg, void* out, long long cap, float scale) {                                    \
+        w4_sparse_ql<KCO, VT>(q, static_cast<const uint16_t*>(k), static_cast<const uint16_t*>(v), ids, id_stride,      \
+                              count, sparse, static_cast<const uint16_t*>(qg), out, nullptr, cap, scale);               \
+    }
+W4_QL_KERNEL(w4_sparse_ql_ref, false, false)
+W4_QL_KERNEL(w4_sparse_ql10, true, false)
+W4_QL_KERNEL(w4_sparse_ql3, false, true)
+W4_QL_KERNEL(w4_sparse_ql3k, true, true)
+#undef W4_QL_KERNEL
+
+// The decode tile (tf_fn_sparse_tile_parts: parts, p v over hi + lo) on today's V layout and on QL-3's.
+#define W4_QL_PARTS(NAME, VT)                                                                                           \
+    extern "C" __global__ void __launch_bounds__(kPromptThreads)                                                        \
+    NAME(const float* q, const void* k, const void* v, const int* ids, long long id_stride, const int* count,           \
+         const int* sparse, float* parts_o, float* parts_ms, long long cap, float scale) {                              \
+        w4_sparse_ql<false, VT, true, true>(q, static_cast<const uint16_t*>(k), static_cast<const uint16_t*>(v), ids,   \
+                                            id_stride, count, sparse, nullptr, parts_o, parts_ms, cap, scale);          \
+    }
+W4_QL_PARTS(w4_sparse_tile_parts_ref, false)
+W4_QL_PARTS(w4_sparse_tile_parts_ql3, true)
+#undef W4_QL_PARTS
+
+// kv_write (tf_kv_write) into QL-3's V layout: element (r, h, j) of the (len, kv_heads, 256) bf16 rows at slot pos0 + r
+extern "C" __global__ void w4_kv_write_ql3(const uint16_t* src, uint16_t* cache, int len, int kv_heads, int total, int pos0) {
+    const long long i = gid();
+    if (i >= static_cast<long long>(len) * kv_heads * kPromptDims) return;
+    const int j = static_cast<int>(i % kPromptDims);
+    const int h = static_cast<int>((i / kPromptDims) % kv_heads);
+    const int r = static_cast<int>(i / (static_cast<long long>(kPromptDims) * kv_heads));
+    const long long slot = pos0 + r;
+    const long long to = (((static_cast<long long>(h) * (total / 4) + slot / 4) * (kPromptDims / 2) + j / 2) * 4 + slot % 4) * 2 + j % 2;
+    cache[to] = src[i];
+}
+
 }  // namespace
