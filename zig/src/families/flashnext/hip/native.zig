@@ -18,10 +18,11 @@ pub const formats: []const []const u8 = &.{ "mlx-q3g32", "mlx-q4g32", "mlx-q6g32
 pub const default_context: i64 = 32768;
 /// The engine cuts prompts itself.
 pub const prefill_step: u32 = 0;
-/// The prompt chunk Flash Next takes on HIP where the policy names none (the HIP default is 1,024 rows). Measured on
+/// The prompt chunk Flash Next takes on HIP where the policy names none (the HIP default is 1,024 rows): 20,480 rows, a
+/// prompt within a 20K window in one pass, so each routed expert takes all of its prompt rows in one launch. Measured on
 /// gfx1151 with the MLX 4-bit MTP checkpoint (2026-10-25, a 17,755-token prompt): 8,192 rows against 2,048 gave
 /// prefill +11.3 % in a two-seed ABBA, the same tokens and logits at every step, 9.2 GiB more scratch on the device.
-pub const policy_prefill_step: u32 = 8192;
+pub const policy_prefill_step: u32 = 20480;
 /// Drafts a verify window holds at most past its pending token (`--mtp-drafts` above it is refused before the load).
 pub const max_drafts: u32 = lanes_mod.max_depth;
 /// The MTP policy Flash Next takes on HIP where neither --mtp-drafts, --mtp-confidence nor the mtp_depth key names one
