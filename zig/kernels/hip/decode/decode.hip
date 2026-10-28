@@ -519,38 +519,46 @@ __device__ void select_row(const float* logits, int row, int* pick, float* wts, 
     __syncthreads();
 }
 
-// select_row for one row by one wave (a verify window's rows each get a wave of the last block): the same order (value
-// descending, index ascending) by the same comparisons, so the same top_v and top_i, and lane 0 does thread 0's
-// arithmetic. False, nothing written, when a logit is NaN (select_row's rank loop takes the row then).
-__device__ bool select_row_wave(const float* logits, int row, int* pick, float* wts, int experts, int top_k, float* top_v,
-                                int* top_i) {
-    constexpr int kPer = kSelectMax / 32;
+// select_row for one row by LANES lanes of a wave (32: the wave takes one row; 16: each half of the wave takes its own
+// row, so 8 rows fit 4 waves in one pass): each row by the same order (value descending, index ascending) and the same
+// comparisons, so the same top_v and top_i, and the group's first lane does thread 0's arithmetic in its order. A lane
+// scans KPER logits (KPER * LANES >= experts); top_k <= LANES. `live`: the group has a row (the lanes of a group without
+// one run along and write nothing). True when the row had a NaN logit and nothing of it was written (select_row's rank
+// loop takes the row then).
+template <int KPER, int LANES>
+__device__ bool select_row_lanes(const float* logits, int row, bool live, int* pick, float* wts, int experts, int top_k) {
     const int lane = threadIdx.x & 31;
+    const int hl = lane & (LANES - 1);
+    const int base = lane & ~(LANES - 1);
+    const unsigned group = LANES == 32 ? 0xffffffffu : ((1u << LANES) - 1u) << base;
     const int slots = top_k + 1;
-    float* l = const_cast<float*>(logits) + static_cast<long long>(row) * (experts + 1);
-    float v[kPer];
+    const float* l = logits + static_cast<long long>(live ? row : 0) * (experts + 1);
+    float v[KPER];
     unsigned taken = 0;
     bool nan = false;
 #pragma unroll
-    for (int j = 0; j < kPer; ++j) {
-        const int i = lane + 32 * j;
+    for (int j = 0; j < KPER; ++j) {
+        const int i = hl + LANES * j;
         v[j] = i < experts ? __hip_atomic_load(l + i, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) : 0.f;
         nan |= i < experts && v[j] != v[j];
     }
-    if (__any(nan)) return false;
+    const bool bad = (static_cast<unsigned>(__ballot(nan)) & group) != 0u;
+    // the k-th pick, held by the group's lane k
+    float mine_v = 0.f;
+    int mine_i = 0;
     for (int k = 0; k < top_k; ++k) {
         float bv = 0.f;
         int bi = 0x7fffffff;
 #pragma unroll
-        for (int j = 0; j < kPer; ++j) {
-            const int i = lane + 32 * j;
+        for (int j = 0; j < KPER; ++j) {
+            const int i = hl + LANES * j;
             if (i < experts && !((taken >> j) & 1u) && (bi == 0x7fffffff || v[j] > bv || (v[j] == bv && i < bi))) {
                 bv = v[j];
                 bi = i;
             }
         }
 #pragma unroll
-        for (int mask = 16; mask > 0; mask >>= 1) {
+        for (int mask = LANES / 2; mask > 0; mask >>= 1) {
             const float ov = __shfl_xor(bv, mask, 32);
             const int oi = __shfl_xor(bi, mask, 32);
             if (oi != 0x7fffffff && (bi == 0x7fffffff || ov > bv || (ov == bv && oi < bi))) {
@@ -558,26 +566,29 @@ __device__ bool select_row_wave(const float* logits, int row, int* pick, float* 
                 bi = oi;
             }
         }
-        if ((bi & 31) == lane) taken |= 1u << (bi >> 5);
-        if (lane == 0) {
-            top_v[k] = bv;
-            top_i[k] = bi;
+        if (bi % LANES == hl) taken |= 1u << (bi / LANES);
+        if (hl == k) {
+            mine_v = bv;
+            mine_i = bi;
         }
     }
-    if (lane == 0) {
-        // thread 0's arithmetic; each exp is taken again for its weight (the same value), not kept in a local array
-        const float top = top_v[0];
-        float total = 0.f;
-        for (int k = 0; k < top_k; ++k) total += expf(top_v[k] - top);
-        for (int k = 0; k < top_k; ++k) {
-            pick[row * slots + k] = top_i[k];
-            wts[row * slots + k] = round_bf16_f(expf(top_v[k] - top) / total);
+    // thread 0's arithmetic in its order; each exp is taken again for its weight (the same value)
+    const float top = __shfl(mine_v, base, 32);
+    float total = 0.f;
+    for (int k = 0; k < top_k; ++k) total += expf(__shfl(mine_v, base + k, 32) - top);
+    if (live && !bad) {
+        const int at = row * slots;
+        if (hl < top_k) {
+            pick[at + hl] = mine_i;
+            wts[at + hl] = round_bf16_f(expf(mine_v - top) / total);
         }
-        const float gate = round_bf16_f(__hip_atomic_load(l + experts, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT));
-        pick[row * slots + top_k] = experts;
-        wts[row * slots + top_k] = round_bf16_f(1.f / (1.f + expf(-gate)));
+        if (hl == 0) {
+            const float gate = round_bf16_f(__hip_atomic_load(l + experts, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT));
+            pick[at + top_k] = experts;
+            wts[at + top_k] = round_bf16_f(1.f / (1.f + expf(-gate)));
+        }
     }
-    return true;
+    return bad;
 }
 
 // tf_moe_route's plan of a few rows' pairs (at most kPlanPairs) by the last block: the pairs stable-sorted by expert
@@ -677,17 +688,26 @@ __device__ void router_select(const void* x, const void* rows, float* logits, in
     if (r == 1) {
         select_row(logits, 0, pick, wts, items, members, capacity, e - 1, top_k);
     } else if (r <= 2 * kRouterWaves && e - 1 <= kSelectMax) {
-        // a wave a row (rows w and w + 4 for wave w past 4 rows); a row with a NaN logit then takes select_row's rank loop
-        // the waves' top lists, then the plan's arrays, in the dynamic shared memory (the staged rows are free by then)
+        // a wave a row, or past kRouterWaves rows half a wave a row (one pass for 8 rows). A row with a NaN logit then
+        // takes select_row's rank loop. The plan's arrays are in the dynamic shared memory (the
+        // staged rows are free by then)
         __shared__ int fallback[2 * kRouterWaves];
-        float* wave_top_v = reinterpret_cast<float*>(router_shared);
-        int* wave_top_i = reinterpret_cast<int*>(router_shared) + 32 * kRouterWaves;
-        int* pool = wave_top_i + 32 * kRouterWaves;
+        int* pool = reinterpret_cast<int*>(router_shared) + 2 * 32 * kRouterWaves;
         const int wave = threadIdx.x >> 5;
         __syncthreads();
-        for (int row = wave; row < r; row += kRouterWaves) {
-            const bool ok = select_row_wave(logits, row, pick, wts, e - 1, top_k, wave_top_v + 32 * wave, wave_top_i + 32 * wave);
-            if ((threadIdx.x & 31) == 0) fallback[row] = !ok;
+        const int lane = threadIdx.x & 31;
+        if (r > kRouterWaves && e - 1 <= 16 * 32 && top_k <= 16) {
+            // 5 to 8 rows: half a wave a row, rows w and w + kRouterWaves in wave w's two halves
+            const int row = wave + (lane >= 16 ? kRouterWaves : 0);
+            const bool live = row < r;
+            const bool bad = select_row_lanes<32, 16>(logits, row, live, pick, wts, e - 1, top_k);
+            if (live && (lane & 15) == 0) fallback[row] = bad;
+        } else {
+            for (int row = wave; row < r; row += kRouterWaves) {
+                const bool bad = e - 1 <= 16 * 32 ? select_row_lanes<16, 32>(logits, row, true, pick, wts, e - 1, top_k)
+                                                  : select_row_lanes<kSelectMax / 32, 32>(logits, row, true, pick, wts, e - 1, top_k);
+                if (lane == 0) fallback[row] = bad;
+            }
         }
         __syncthreads();
         for (int row = 0; row < r; ++row)
