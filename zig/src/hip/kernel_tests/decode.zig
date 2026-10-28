@@ -371,10 +371,11 @@ test "the routed gate and up with its activation in one launch is no further fro
     try pair(t, &rng, 1, 512, 2048, 4, 128);
 }
 
-/// A verify window's routed experts at every columns-a-lane count against the launcher's own pick: the same bytes.
-/// Flash Next's gate+up with its activation (`down` false: 640 x 2 columns, K 2560) or its down (`down` true: 2560
-/// columns, K 640, x a row a pair), 4-bit group 32; rows x 11 (row, slot) pairs over 11 + 5.5 (rows - 1) experts,
-/// round-robin, or over `unique` experts when given (4 rows an expert at unique 11 x rows / 4).
+/// A verify window's routed experts at every columns-a-lane count against the launcher's own pick, and against the
+/// same pairs with every pair its own item (each pass then on the 1-row tile): the same bytes. Flash Next's gate+up
+/// with its activation (`down` false: 640 x 2 columns, K 2560) or its down (`down` true: 2560 columns, K 640, x a row
+/// a pair), 4-bit group 32; rows x 11 (row, slot) pairs over 11 + 5.5 (rows - 1) experts, round-robin, or over
+/// `unique` experts when given (4 rows an expert at unique 11 x rows / 4); the plan ends in 9 dead items, as tf_moe_route's.
 fn windowBytes(t: *Rig, rng: *rig.Rng, down: bool, rows: usize, unique_in: ?usize) !void {
     const n: usize = if (down) 2560 else 2 * 640;
     const k: usize = if (down) 640 else 2560;
@@ -392,10 +393,14 @@ fn windowBytes(t: *Rig, rng: *rig.Rng, down: bool, rows: usize, unique_in: ?usiz
     for (hx) |*v| v.* = t.bits(rng.unit());
     var x = try t.upload(hx);
     defer x.free();
-    const items = try gpa.alloc(i32, unique * 3);
+    const dead = 9;
+    const items = try gpa.alloc(i32, (unique + dead) * 3);
     defer gpa.free(items);
     const members = try gpa.alloc(i32, pairs);
     defer gpa.free(members);
+    // the same pairs, every one its own item (members in the same order), then the dead items
+    const single = try gpa.alloc(i32, (pairs + dead) * 3);
+    defer gpa.free(single);
     var first: usize = 0;
     var most: usize = 0;
     for (0..unique) |i| {
@@ -403,27 +408,37 @@ fn windowBytes(t: *Rig, rng: *rig.Rng, down: bool, rows: usize, unique_in: ?usiz
         var j = i;
         while (j < pairs) : (j += unique) {
             members[first + count] = @intCast(j);
+            single[3 * (first + count) ..][0..3].* = .{ @intCast((i * 7) % experts), @intCast(first + count), 1 };
             count += 1;
         }
         items[3 * i ..][0..3].* = .{ @intCast((i * 7) % experts), @intCast(first), @intCast(count) };
         first += count;
         most = @max(most, count);
     }
+    for (0..dead) |d| {
+        items[3 * (unique + d) ..][0..3].* = .{ experts - 1, @intCast(pairs), 0 };
+        single[3 * (pairs + d) ..][0..3].* = .{ experts - 1, @intCast(pairs), 0 };
+    }
     var dev_items = try t.upload(items);
     defer dev_items.free();
+    var dev_single = try t.upload(single);
+    defer dev_single.free();
     var dev_members = try t.upload(members);
     defer dev_members.free();
     const out_bytes = if (down) pairs * n * 4 else pairs * (n / 2) * 2;
     var want: ?[]u8 = null;
     defer if (want) |w| gpa.free(w);
-    for ([_]c_int{ 0, 1, 2, 4, 8 }) |cb| {
+    // the CBs on the grouped plan, then the rule's CB on the plan of single items (a.m 1: every pass a 1-row tile)
+    for ([_]c_int{ 0, 1, 2, 4, 8, -1 }) |cb| {
         var out = try t.alloc(out_bytes);
         defer out.free();
-        var a = m.arg(t, at(x), most, if (down) at(out) else 0);
+        const split = cb < 0;
+        var a = m.arg(t, at(x), if (split) 1 else most, if (down) at(out) else 0);
         if (!down) a.out16 = at(out);
-        a.route = .{ .items = at(dev_items), .members = at(dev_members), .x_div = if (down) 1 else slots };
-        kernels.stream_cb_force = cb;
-        if (down) try kernels.routed(&t.r, a, @intCast(unique), t.stream.handle) else try std.testing.expect(try kernels.pairRun(&t.r, a, 0, @intCast(unique), t.stream.handle));
+        a.route = .{ .items = at(if (split) dev_single else dev_items), .members = at(dev_members), .x_div = if (down) 1 else slots };
+        const n_items: c_int = @intCast(if (split) pairs + dead else unique + dead);
+        kernels.stream_cb_force = @max(cb, 0);
+        if (down) try kernels.routed(&t.r, a, n_items, t.stream.handle) else try std.testing.expect(try kernels.pairRun(&t.r, a, 0, n_items, t.stream.handle));
         try t.stream.synchronize();
         const got = try rig.download(u8, out);
         if (want) |w| {
@@ -433,7 +448,7 @@ fn windowBytes(t: *Rig, rng: *rig.Rng, down: bool, rows: usize, unique_in: ?usiz
     }
 }
 
-test "the routed gate+up and down write the same bytes at every columns a lane (Flash Next, 1 to 8 rows)" {
+test "the routed gate+up and down write the same bytes at every columns a lane and as single-pair items (Flash Next, 1 to 8 rows)" {
     const t = try Rig.open(1 << 20);
     defer t.close();
     var rng: rig.Rng = .{ .state = 0x9E3779B97F4A7C15 };
