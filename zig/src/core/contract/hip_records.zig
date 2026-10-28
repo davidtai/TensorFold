@@ -534,19 +534,19 @@ const own_records = [_]Record{
     .{
         .launch = .{ .name = "MoE router and pick in one launch (decode, bf16 rows) tf_router_select_f16", .symbol = "tf_router_select_f16", .image = "decode", .threads = 128, .dynamic = 2 * 2560 * 2 },
         .usage = .{
-            .{ .vgprs = 148, .sgprs = 86, .lds = 5456, .private = 0, .bound = 128, .wave = 32 },
-            .{ .vgprs = 148, .sgprs = 82, .lds = 5456, .private = 0, .bound = 128, .wave = 32 },
-            .{ .vgprs = 148, .sgprs = 82, .lds = 5456, .private = 0, .bound = 128, .wave = 32 },
-            .{ .vgprs = 148, .sgprs = 83, .lds = 5456, .private = 0, .bound = 128, .wave = 32 },
+            .{ .vgprs = 135, .sgprs = 86, .lds = 5456, .private = 0, .bound = 128, .wave = 32 },
+            .{ .vgprs = 135, .sgprs = 82, .lds = 5456, .private = 0, .bound = 128, .wave = 32 },
+            .{ .vgprs = 135, .sgprs = 82, .lds = 5456, .private = 0, .bound = 128, .wave = 32 },
+            .{ .vgprs = 135, .sgprs = 83, .lds = 5456, .private = 0, .bound = 128, .wave = 32 },
         },
     },
     .{
         .launch = .{ .name = "MoE router and pick in one launch (decode, bf16 rows) tf_router_select_bf16", .symbol = "tf_router_select_bf16", .image = "decode", .threads = 128, .dynamic = 2 * 2560 * 2 },
         .usage = .{
-            .{ .vgprs = 148, .sgprs = 86, .lds = 5456, .private = 0, .bound = 128, .wave = 32 },
-            .{ .vgprs = 148, .sgprs = 82, .lds = 5456, .private = 0, .bound = 128, .wave = 32 },
-            .{ .vgprs = 148, .sgprs = 82, .lds = 5456, .private = 0, .bound = 128, .wave = 32 },
-            .{ .vgprs = 148, .sgprs = 83, .lds = 5456, .private = 0, .bound = 128, .wave = 32 },
+            .{ .vgprs = 135, .sgprs = 86, .lds = 5456, .private = 0, .bound = 128, .wave = 32 },
+            .{ .vgprs = 135, .sgprs = 82, .lds = 5456, .private = 0, .bound = 128, .wave = 32 },
+            .{ .vgprs = 135, .sgprs = 82, .lds = 5456, .private = 0, .bound = 128, .wave = 32 },
+            .{ .vgprs = 135, .sgprs = 83, .lds = 5456, .private = 0, .bound = 128, .wave = 32 },
         },
     },
     .{
