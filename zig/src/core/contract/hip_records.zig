@@ -44,19 +44,19 @@ const own_records = [_]Record{
     .{
         .launch = listTile(true),
         .usage = .{
-            .{ .vgprs = 0, .sgprs = 0, .lds = 0, .private = 0, .bound = 128, .wave = 32 },
-            .{ .vgprs = 0, .sgprs = 0, .lds = 0, .private = 0, .bound = 128, .wave = 32 },
-            .{ .vgprs = 0, .sgprs = 0, .lds = 0, .private = 0, .bound = 128, .wave = 32 },
-            .{ .vgprs = 0, .sgprs = 0, .lds = 0, .private = 0, .bound = 128, .wave = 32 },
+            .{ .vgprs = 161, .sgprs = 102, .lds = 0, .private = 0, .bound = 128, .wave = 32 },
+            .{ .vgprs = 163, .sgprs = 102, .lds = 0, .private = 0, .bound = 128, .wave = 32 },
+            .{ .vgprs = 163, .sgprs = 102, .lds = 0, .private = 0, .bound = 128, .wave = 32 },
+            .{ .vgprs = 163, .sgprs = 105, .lds = 0, .private = 0, .bound = 128, .wave = 32 },
         },
     },
     .{
         .launch = listTile(false),
         .usage = .{
-            .{ .vgprs = 0, .sgprs = 0, .lds = 0, .private = 0, .bound = 128, .wave = 32 },
-            .{ .vgprs = 0, .sgprs = 0, .lds = 0, .private = 0, .bound = 128, .wave = 32 },
-            .{ .vgprs = 0, .sgprs = 0, .lds = 0, .private = 0, .bound = 128, .wave = 32 },
-            .{ .vgprs = 0, .sgprs = 0, .lds = 0, .private = 0, .bound = 128, .wave = 32 },
+            .{ .vgprs = 194, .sgprs = 107, .lds = 0, .private = 0, .bound = 128, .wave = 32 },
+            .{ .vgprs = 220, .sgprs = 107, .lds = 0, .private = 0, .bound = 128, .wave = 32 },
+            .{ .vgprs = 220, .sgprs = 107, .lds = 0, .private = 0, .bound = 128, .wave = 32 },
+            .{ .vgprs = 220, .sgprs = 107, .lds = 0, .private = 0, .bound = 128, .wave = 32 },
         },
     },
     .{
