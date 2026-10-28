@@ -652,8 +652,8 @@ const own_records = [_]Record{
         .launch = .{ .name = "prompt expert down inexact tile 4-bit", .symbol = "_ZN2tf4rocm28affine_wmma_moe_down_inexactILi4EEEvNS0_6AffineE", .image = "affine_tiles", .threads = 256, .served = limits.gfx11_only },
         .usage = .{
             .{ .vgprs = 0, .sgprs = 0, .lds = 0, .private = 0, .bound = 256, .wave = 32 },
-            .{ .vgprs = 150, .sgprs = 31, .lds = 27648, .private = 0, .bound = 256, .wave = 32 },
-            .{ .vgprs = 149, .sgprs = 31, .lds = 27648, .private = 0, .bound = 256, .wave = 32 },
+            .{ .vgprs = 222, .sgprs = 31, .lds = 36864, .private = 0, .bound = 256, .wave = 32 },
+            .{ .vgprs = 221, .sgprs = 31, .lds = 36864, .private = 0, .bound = 256, .wave = 32 },
             .{ .vgprs = 0, .sgprs = 0, .lds = 0, .private = 0, .bound = 256, .wave = 32 },
         },
     },
