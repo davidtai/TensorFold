@@ -291,7 +291,8 @@ __device__ __forceinline__ void wmma_moe_tile(Affine a, float limit) {
 // dense_inexact.hpp's rounding) and one WMMA accumulation over K: no per-group d, fold or sums of x, so a wave can hold
 // more tiles. BM rows a pass, the same 128 staged weight rows (S::col), waves of WR rows. gfx1151 at 8,192 rows
 // (w2/moe_bench.hip, -DTF_BENCH_INEXACT): gate+up at 128 rows, 64 x 32 waves, 22.6 ms against 25.0 for the exact tile;
-// down at 64 rows, 32 x 32 waves, 12.2 ms against 13.8. Relative RMS against float64 2.4e-3 and 1.7e-3.
+// down at 64 rows, 32 x 32 waves, 12.2 ms against 13.8. Relative RMS against float64 2.4e-3 and 1.7e-3. Served at
+// PC-1's one chunk the 64-row down dequantized each item twice; MG-2 runs it at 128 rows (mlx_tiles.hpp).
 template <class S, int AHEAD, int BM, int WR>
 __device__ __forceinline__ void wmma_moe_inexact_tile(Affine a, float limit) {
 #if TF_DEVICE_WMMA_GFX11
