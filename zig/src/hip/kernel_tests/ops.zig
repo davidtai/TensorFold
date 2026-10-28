@@ -232,7 +232,7 @@ test "top-k in parts gives tf_topk's ids, values and order byte for byte (Flash 
     };
 }
 
-test "the MoE route sorts pairs by expert, stably, into items of at most a tile" {
+test "the MoE route sorts pairs by expert, stably, into items of at most a tile (one block, or three launches for a prompt)" {
     const t = try Rig.open(1 << 20);
     defer t.close();
     const o = t.ops(&t.on);
@@ -243,6 +243,11 @@ test "the MoE route sorts pairs by expert, stably, into items of at most a tile"
         .{ 64, 1000, 64 },
         .{ 513, 11, 8 },
         .{ 513, 2816, 8 },
+        // a prompt's pairs: tf_moe_route_wide's three launches (2,048 pairs and more)
+        .{ 513, 2048, 128 },
+        .{ 513, 45089, 128 },
+        .{ 513, 90112, 128 },
+        .{ 1024, 20000, 16 },
     }) |shape| {
         const experts = shape[0];
         const pairs = shape[1];
