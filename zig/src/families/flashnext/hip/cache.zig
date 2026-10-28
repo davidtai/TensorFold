@@ -1,4 +1,5 @@
-//! A stream's state on a rank: sparse layers' keys, DeltaNet states, the n-gram tail; a window's per-row snapshots.
+//! A stream's state on a rank: sparse layers' keys, DeltaNet states, the n-gram tail; a window's per-row conv snapshots
+//! and its DeltaNet inputs (a keep runs the states through the kept rows).
 const std = @import("std");
 const hip = @import("hip");
 const model = @import("model.zig");
@@ -14,6 +15,9 @@ pub const SparseView = struct { k: u64, v: u64, raw: u64, pooled: u64 };
 /// Where one DeltaNet layer's conv tail (fp32 (taps - 1, channels)) and recurrent state (fp32) live.
 pub const LinearView = struct { conv: u64, state: u64 };
 
+/// One DeltaNet layer's window inputs, as the window's conv and split wrote them and its keep reads them.
+pub const WindowInputs = struct { k: u64, v: u64, gate: u64, beta: u64 };
+
 pub const Layout = struct {
     sparse: usize,
     linear: usize,
@@ -26,6 +30,13 @@ pub const Layout = struct {
     state_bytes: usize,
     tail_rows: usize,
     tail_bytes: usize,
+    /// fp32 values of one window row's DeltaNet inputs: k (key heads x Dk), v (value heads x Dv), gate and beta (value
+    /// heads each)
+    in_row: usize,
+    key_heads: usize,
+    key_dim: usize,
+    value_heads: usize,
+    value_dim: usize,
     kv_heads: usize,
     head_dim: usize,
     index_dim: usize,
@@ -48,6 +59,11 @@ pub const Layout = struct {
             .state_bytes = d.value_heads * d.key_dim * d.value_dim * 4,
             .tail_rows = d.ngram * (d.ple_taps - 1),
             .tail_bytes = d.ngram * (d.ple_taps - 1) * d.wide() * a,
+            .in_row = d.key_heads * d.key_dim + d.value_heads * d.value_dim + 2 * d.value_heads,
+            .key_heads = d.key_heads,
+            .key_dim = d.key_dim,
+            .value_heads = d.value_heads,
+            .value_dim = d.value_dim,
             .kv_heads = d.kv_heads,
             .head_dim = d.head_dim,
             .index_dim = d.index_dim,
@@ -75,9 +91,14 @@ pub const Layout = struct {
         return l.sparse * sparse_rows + l.linear * l.linearBytes() + l.tail_bytes;
     }
 
-    /// Device bytes of a window's snapshots: every DeltaNet layer's conv tail and state after each row.
+    /// Device bytes of one DeltaNet layer's window inputs: max_window rows of k, then of v, then of gate, then of beta.
+    pub fn inBytes(l: Layout) usize {
+        return max_window * l.in_row * 4;
+    }
+
+    /// Device bytes of a window's keep material: every DeltaNet layer's conv tail after each row, then its inputs.
     pub fn windowBytes(l: Layout) usize {
-        return max_window * l.linear * l.linearBytes();
+        return max_window * l.linear * l.conv_bytes + l.linear * l.inBytes();
     }
 
     /// Device bytes of the n-gram conv's input over a window: the tail, then the window's rows.
@@ -92,12 +113,13 @@ pub const Caches = struct {
     slot: []usize,
     linear: []bool,
     mem: hip.DeviceBuffer,
-    /// Snapshots of the last window: every linear layer's conv tails (a row each), then their states (a row each).
+    /// The last window's keep material: every linear layer's conv tails (a row each), then its DeltaNet inputs.
     window: hip.DeviceBuffer,
     /// The n-gram conv's input over the last window (the tail, then its rows): a keep takes its new tail from it.
     cin: hip.DeviceBuffer,
-    /// The window snapshot row the DeltaNet layers' states are at (null: their own places), as the device word at
+    /// The window snapshot row the DeltaNet layers' conv tails are at (null: their own places), as the device word at
     /// `start()` says: a keep that drops rows names its last kept row instead of copying it back (`settle` copies).
+    /// The states are always in their places: a window holds them and its keep runs them through the kept rows.
     pending: ?usize = null,
     /// Positions kept, and complete blocks pooled in every sparse layer.
     len: usize = 0,
@@ -183,7 +205,7 @@ pub const Caches = struct {
         return .{ .conv = at, .state = at + l.conv_bytes };
     }
 
-    /// The device i32 the window kernels read: the snapshot row their DeltaNet states start from, -1 for their places.
+    /// The device i32 the window kernels read: the snapshot row their DeltaNet conv tails start from, -1 for their places.
     pub fn start(c: *const Caches) u64 {
         return c.window.base() + c.layout.windowBytes();
     }
@@ -197,19 +219,40 @@ pub const Caches = struct {
         c.pending = row;
     }
 
-    /// The DeltaNet states back in their own places (copied from the snapshot row a keep named), for every reader but
-    /// a window's kernels: a prompt's forward, a saved state.
+    /// The DeltaNet conv tails back in their own places (copied from the snapshot row a keep named), for every reader
+    /// but a window's kernels: a prompt's forward, a saved state. The states are in their places already.
     pub fn settle(c: *Caches, s: hip.Stream) !void {
         const row = c.pending orelse return;
         const l = c.layout;
         for (c.linear, 0..) |linear, i| {
             if (!linear) continue;
-            const from = c.snapshot(i, row);
-            const to = c.linearAt(i);
-            try hip.runtime.check(c.window.r.api.hipMemcpyDtoDAsync(@ptrFromInt(to.conv), @ptrFromInt(from.conv), l.conv_bytes, s.handle));
-            try hip.runtime.check(c.window.r.api.hipMemcpyDtoDAsync(@ptrFromInt(to.state), @ptrFromInt(from.state), l.state_bytes, s.handle));
+            try hip.runtime.check(c.window.r.api.hipMemcpyDtoDAsync(@ptrFromInt(c.linearAt(i).conv), @ptrFromInt(c.snapshot(i, row)), l.conv_bytes, s.handle));
         }
         try c.startAt(null, s);
+    }
+
+    /// Every DeltaNet layer's state run through the first `kept` rows of the last window's inputs (the window held
+    /// the states): one launch, the window's scan, so each state equals the snapshot the window would have kept.
+    pub fn keepStates(c: *const Caches, l: *const hip.Launcher, kept: usize, s: hip.Stream) !void {
+        const lay = c.layout;
+        if (lay.linear == 0) return;
+        const first = for (c.linear, 0..) |linear, i| {
+            if (linear and c.slot[i] == 0) break i;
+        } else return error.NoLinearLayer;
+        try l.tf_gdn_keep(
+            @ptrFromInt(c.linearAt(first).state),
+            @intCast(lay.linearBytes() / 4),
+            @ptrFromInt(c.inputs(first).k),
+            @intCast(lay.inBytes() / 4),
+            max_window,
+            @intCast(kept),
+            @intCast(lay.linear),
+            @intCast(lay.key_heads),
+            @intCast(lay.value_heads),
+            @intCast(lay.key_dim),
+            @intCast(lay.value_dim),
+            s.handle,
+        );
     }
 
     /// The n-gram conv's tail rows (act dtype, (tail_rows, W)).
@@ -218,12 +261,20 @@ pub const Caches = struct {
         return c.mem.base() + l.sparse * l.sparseBytes() + l.linear * l.linearBytes();
     }
 
-    /// Row `row` of the window's snapshots of linear layer `layer`; a layer's rows consecutive, as the kernels write.
-    pub fn snapshot(c: *const Caches, layer: usize, row: usize) LinearView {
-        const l = c.layout;
+    /// Row `row` of the window's conv-tail snapshots of linear layer `layer`; a layer's rows consecutive, as the
+    /// kernels write.
+    pub fn snapshot(c: *const Caches, layer: usize, row: usize) u64 {
         const n = c.slot[layer] * max_window + row;
-        const states = c.window.base() + l.linear * max_window * l.conv_bytes;
-        return .{ .conv = c.window.base() + n * l.conv_bytes, .state = states + n * l.state_bytes };
+        return c.window.base() + n * c.layout.conv_bytes;
+    }
+
+    /// Where linear layer `layer`'s window inputs live: max_window rows of k, of v, of gate and of beta (fp32).
+    pub fn inputs(c: *const Caches, layer: usize) WindowInputs {
+        const l = c.layout;
+        const k = c.window.base() + l.linear * max_window * l.conv_bytes + c.slot[layer] * l.inBytes();
+        const v = k + max_window * l.key_heads * l.key_dim * 4;
+        const gate = v + max_window * l.value_heads * l.value_dim * 4;
+        return .{ .k = k, .v = v, .gate = gate, .beta = gate + max_window * l.value_heads * 4 };
     }
 };
 

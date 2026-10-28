@@ -234,6 +234,33 @@ gated_delta_tile(const float* __restrict__ q, const float* __restrict__ k, const
                                            blockIdx.z, true, from);
 }
 
+// A verify window that holds its state: the rows' outputs, no snapshot and no state store. The keep that follows runs
+// the state through the kept rows (gated_delta_keep), so the state in its place is always the committed one.
+template <int DK, int ROWS, int STEPS>
+__device__ __forceinline__ void
+gated_delta_hold(const float* __restrict__ q, const float* __restrict__ k, const float* __restrict__ v,
+                 const float* __restrict__ gate, const float* __restrict__ beta, float* __restrict__ state,
+                 float* __restrict__ y, int length, int key_heads, int value_heads, int dv) {
+    gated_delta_tile_body<DK, ROWS, STEPS>(q, k, v, gate, beta, state, y, length, key_heads, value_heads, dv, nullptr,
+                                           blockIdx.z, false, nullptr);
+}
+
+// A keep: layer z's state runs from its place through the first `kept` rows of its window's inputs (k, v, gate and
+// beta of `rows` rows from in + z * in_stride, as the window read them) by the window's own scan, and is stored back.
+// The state equals the snapshot the window would have written after its row kept - 1.
+template <int DK>
+__device__ __forceinline__ void
+gated_delta_keep(float* state, long long state_stride, const float* in, long long in_stride, int rows, int kept,
+                 int key_heads, int value_heads, int dv) {
+    const long long layer = blockIdx.z;
+    const float* k = in + layer * in_stride;
+    const float* v = k + static_cast<long long>(rows) * key_heads * DK;
+    const float* gate = v + static_cast<long long>(rows) * value_heads * dv;
+    const float* beta = gate + static_cast<long long>(rows) * value_heads;
+    gated_delta_tile_body<DK, 8, 16>(nullptr, k, v, gate, beta, state + layer * state_stride, nullptr, kept, key_heads,
+                                     value_heads, dv, nullptr, 0);
+}
+
 // A round's windows in one launch, a grid plane a slot; rows, state and snapshots come from the plan, same scan.
 template <int DK>
 __device__ __forceinline__ void
@@ -394,6 +421,30 @@ gated_delta_prompt_body(const float* __restrict__ q, const float* __restrict__ k
 
 }  // namespace rocm
 }  // namespace tf
+
+extern "C" __global__ void __launch_bounds__(256)
+tf_gdn_hold_128(const float* q, const float* k, const float* v, const float* gate, const float* beta, float* state,
+                float* y, int length, int key_heads, int value_heads, int dv) {
+    tf::rocm::gated_delta_hold<128, 8, 16>(q, k, v, gate, beta, state, y, length, key_heads, value_heads, dv);
+}
+
+extern "C" __global__ void __launch_bounds__(256)
+tf_gdn_hold_16(const float* q, const float* k, const float* v, const float* gate, const float* beta, float* state,
+               float* y, int length, int key_heads, int value_heads, int dv) {
+    tf::rocm::gated_delta_hold<16, 8, 16>(q, k, v, gate, beta, state, y, length, key_heads, value_heads, dv);
+}
+
+extern "C" __global__ void __launch_bounds__(256)
+tf_gdn_keep_128(float* state, long long state_stride, const float* in, long long in_stride, int rows, int kept,
+                int key_heads, int value_heads, int dv) {
+    tf::rocm::gated_delta_keep<128>(state, state_stride, in, in_stride, rows, kept, key_heads, value_heads, dv);
+}
+
+extern "C" __global__ void __launch_bounds__(256)
+tf_gdn_keep_16(float* state, long long state_stride, const float* in, long long in_stride, int rows, int kept,
+               int key_heads, int value_heads, int dv) {
+    tf::rocm::gated_delta_keep<16>(state, state_stride, in, in_stride, rows, kept, key_heads, value_heads, dv);
+}
 
 extern "C" __global__ void __launch_bounds__(256)
 tf_gdn_plan_128(const float* q, const float* k, const float* v, const float* gate, const float* beta, float* y,

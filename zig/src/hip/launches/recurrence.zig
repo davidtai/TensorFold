@@ -75,6 +75,44 @@ pub fn tf_gated_delta(l: *const Launcher, q: CF, k: CF, v: CF, gate: CF, beta: C
     }
 }
 
+/// A verify window's recurrence that holds the state (no snapshot, no store): the rows' outputs only. The keep that
+/// follows (tf_gdn_keep) runs the state through the kept rows. dv a multiple of 8.
+pub fn tf_gdn_hold(l: *const Launcher, q: CF, k: CF, v: CF, gate: CF, beta: CF, state: F, y: F, length: c_int, key_heads: c_int, value_heads: c_int, dk: c_int, dv: c_int, s: S) Error!void {
+    if ((dk != 16 and dk != 128) or @rem(dv, 8) != 0 or key_heads < 1 or @rem(value_heads, key_heads) != 0 or length < 1 or length > 16) {
+        return invalid("gated delta hold");
+    }
+    var a: Args = .{};
+    try a.add(ad(q));
+    try a.add(ad(k));
+    try a.add(ad(v));
+    try a.add(ad(gate));
+    try a.add(ad(beta));
+    try a.add(ad(state));
+    try a.add(ad(y));
+    try a.add(length);
+    try a.add(key_heads);
+    try a.add(value_heads);
+    try a.add(dv);
+    try l.go(l.gdn_hold[if (dk == 128) 0 else 1], dim(@divExact(dv, 8), value_heads, 1), dim(32, 8, 1), 0, s, &a);
+}
+
+/// A keep: `layers` DeltaNet states (layer z at state + z * state_stride floats) each run through the first `kept`
+/// rows of its window's inputs (k, v, gate, beta of `rows` rows at in + z * in_stride floats), by the window's scan.
+pub fn tf_gdn_keep(l: *const Launcher, state: F, state_stride: i64, in: CF, in_stride: i64, rows: c_int, kept: c_int, layers: c_int, key_heads: c_int, value_heads: c_int, dk: c_int, dv: c_int, s: S) Error!void {
+    if ((dk != 16 and dk != 128) or @rem(dv, 8) != 0 or kept < 1 or kept > rows or layers < 1) return invalid("gated delta keep");
+    var a: Args = .{};
+    try a.add(ad(state));
+    try a.add(state_stride);
+    try a.add(ad(in));
+    try a.add(in_stride);
+    try a.add(rows);
+    try a.add(kept);
+    try a.add(key_heads);
+    try a.add(value_heads);
+    try a.add(dv);
+    try l.go(l.gdn_keep[if (dk == 128) 0 else 1], dim(@divExact(dv, 8), value_heads, layers), dim(32, 8, 1), 0, s, &a);
+}
+
 /// Tokens a chunk of tf_gdn_wy and its packed operands (gated_delta_wy.hpp).
 const wy_chunk = 32;
 const wy_pack = 128 * wy_chunk * 2;

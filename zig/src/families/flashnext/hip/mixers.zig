@@ -41,21 +41,23 @@ pub fn linear(
     const gate = try o.arena.of(f32, rows * d.value_heads);
     const beta = try o.arena.of(f32, rows * d.value_heads);
     if (window) {
-        // a window's conv, split, q and k norms and gates in one launch a stream, each row's conv state kept aside
+        // a window's conv, split, q and k norms and gates in one launch a stream, each row's conv state kept aside; k,
+        // v, gate and beta go to the stream's window inputs, which the window's recurrence and its keep read
         var at_row: usize = 0;
         for (segs) |g| {
             const n = g.tokens.len;
             const nh = n * d.value_heads;
+            const in = g.c.inputs(index);
             try o.l.tf_conv_split(.{
                 .x = forward.at(qkv, at_row * ch).ptr,
                 .kind = @backingInt(m.act),
                 .weight = l.conv,
                 .state = g.c.linearAt(index).conv,
-                .states = g.c.snapshot(index, 0).conv,
+                .states = g.c.snapshot(index, 0),
                 .from = g.c.start(),
                 .qn = q + at_row * kw * 4,
-                .kn = k + at_row * kw * 4,
-                .v = v + at_row * vw * 4,
+                .kn = in.k,
+                .v = in.v,
                 .channels = @intCast(ch),
                 .kernel = @intCast(d.conv),
                 .rows = @intCast(n),
@@ -69,8 +71,8 @@ pub fn linear(
                 .gb = forward.at(b, at_row * d.value_heads).ptr,
                 .a_log = l.a_log,
                 .dt_bias = l.dt_bias,
-                .gate = gate + at_row * d.value_heads * 4,
-                .beta = beta + at_row * d.value_heads * 4,
+                .gate = in.gate,
+                .beta = in.beta,
                 .gcount = @intCast(nh),
                 .heads = @intCast(d.value_heads),
             }, o.stream);
@@ -182,7 +184,13 @@ fn recur(
     var off: usize = 0;
     for (segs) |g| {
         const n = g.tokens.len;
-        const snaps: ?u64 = if (window) g.c.snapshot(index, 0).state else null;
+        if (window) {
+            // the window holds the state: its rows' outputs only, from the inputs its keep reads again
+            const in = g.c.inputs(index);
+            try o.gatedDeltaHold(q + off * kw * 4, in.k, in.v, in.gate, in.beta, g.c.linearAt(index).state, y + off * vw * 4, n, d.key_heads, d.value_heads, d.key_dim, d.value_dim);
+            off += n;
+            continue;
+        }
         if (wyFits(o, d, window, n)) {
             // numerics=inexact: the prompt's rows in 32-token chunks on the matrix cores
             const mark = o.arena.mark();
@@ -218,8 +226,8 @@ fn recur(
             d.value_heads,
             d.key_dim,
             d.value_dim,
-            snaps,
-            if (window) g.c.start() else 0,
+            null,
+            0,
         );
         off += n;
     }

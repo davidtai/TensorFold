@@ -261,13 +261,15 @@ pub const Engine = struct {
         return .{ .ptr = out, .kind = y.kind };
     }
 
-    /// The first `kept` rows of a window from `c.len` become the stream's: DeltaNet states, n-gram tail and history.
-    /// A window that kept every row left its states in place; one that dropped rows names its last kept row's
+    /// The first `kept` rows of a window from `c.len` become the stream's: DeltaNet states and conv tails, n-gram
+    /// tail and history. The window held the states: they run through the kept rows here (Caches.keepStates). A window
+    /// that kept every row left its conv tails in place; one that dropped rows names its last kept row's conv
     /// snapshot, which the next window starts from (no copy: Caches.start).
     pub fn keepWindow(e: *Engine, c: *cache.Caches, tokens: []const u32, kept: usize) !void {
         if (kept == 0 or kept > tokens.len) return error.BadKeep;
         const l = c.layout;
         const s = e.stream.handle;
+        try c.keepStates(&e.lib, kept, e.stream);
         try c.startAt(if (kept < tokens.len) kept - 1 else null, e.stream);
         const row = l.tail_bytes / l.tail_rows;
         try hip.runtime.check(e.driver.api.hipMemcpyDtoDAsync(

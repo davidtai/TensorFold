@@ -385,3 +385,116 @@ test "a prompt's recurrence a block a value head gives the bits of a wave a row 
         };
     }
 }
+
+/// Rows a keep's inputs hold a layer (Flash Next's cache.max_window): a keep's row stride.
+const keep_rows = 8;
+
+/// Layer `z`'s keep inputs as Flash Next's window writes them: keep_rows rows of k, then of v, gate and beta; the
+/// rows past `rows` NaN, so a keep that read one would show it.
+fn keepInputs(sh: Shape, in: Inputs, rows: usize, out: []f32) void {
+    @memset(out, std.math.nan(f32));
+    const kr = sh.key_heads * d;
+    const vr = sh.value_heads * d;
+    const gr = sh.value_heads;
+    const v_at = keep_rows * kr;
+    const g_at = v_at + keep_rows * vr;
+    const b_at = g_at + keep_rows * gr;
+    @memcpy(out[0 .. rows * kr], in.k[0 .. rows * kr]);
+    @memcpy(out[v_at..][0 .. rows * vr], in.v[0 .. rows * vr]);
+    @memcpy(out[g_at..][0 .. rows * gr], in.gate[0 .. rows * gr]);
+    @memcpy(out[b_at..][0 .. rows * gr], in.beta[0 .. rows * gr]);
+}
+
+test "a held window and its keep give the bits of today's window: its outputs, and the snapshot after row kept - 1" {
+    const t = try Rig.open(1 << 30);
+    defer t.close();
+    // Flash Next's heads; two layers in one keep, each its own inputs and state, the states apart by a stride
+    const sh: Shape = .{ .length = keep_rows, .key_heads = 16, .value_heads = 48 };
+    const layers = 2;
+    var ins: [layers]Inputs = undefined;
+    for (&ins, 0..) |*in, z| in.* = try Inputs.make(sh, 0xD25 + z);
+    defer for (ins) |in| in.free();
+    const state_floats = sh.value_heads * d * d;
+    const state_bytes = state_floats * 4;
+    const state_stride = state_floats + 64;
+    const in_row = sh.key_heads * d + sh.value_heads * d + 2 * sh.value_heads;
+    const in_stride = keep_rows * in_row;
+    const vy_bytes = sh.length * sh.value_heads * d * 4;
+    const F = ?[*]f32;
+    const CF = ?[*]const f32;
+    for (1..keep_rows + 1) |rows| {
+        // today: each layer's window of `rows` rows writes its outputs, a snapshot after each row and the last state
+        var want_y: [layers][]u8 = undefined;
+        var want_snaps: [layers][]u8 = undefined;
+        for (0..layers) |z| {
+            const in = ins[z];
+            var bufs: [5]DeviceBuffer = undefined;
+            for (&bufs, [_][]f32{ in.q, in.k, in.v, in.gate, in.beta }) |*b, a| b.* = try t.upload(a);
+            defer for (&bufs) |*b| b.free();
+            var state = try t.upload(in.state);
+            defer state.free();
+            var y = try t.alloc(vy_bytes);
+            defer y.free();
+            try y.fill8(0);
+            var snaps = try t.alloc(rows * state_bytes);
+            defer snaps.free();
+            try window(t, sh, bufs, state, y, snaps, 0, 0, rows);
+            try t.stream.synchronize();
+            want_y[z] = try rig.download(u8, y);
+            want_snaps[z] = try rig.download(u8, snaps);
+        }
+        defer for (want_y, want_snaps) |a, b| {
+            gpa.free(a);
+            gpa.free(b);
+        };
+        // the held window: the same outputs, the state untouched
+        for (0..layers) |z| {
+            const in = ins[z];
+            var bufs: [5]DeviceBuffer = undefined;
+            for (&bufs, [_][]f32{ in.q, in.k, in.v, in.gate, in.beta }) |*b, a| b.* = try t.upload(a);
+            defer for (&bufs) |*b| b.free();
+            var state = try t.upload(in.state);
+            defer state.free();
+            var y = try t.alloc(vy_bytes);
+            defer y.free();
+            try y.fill8(0);
+            try t.on.tf_gdn_hold(@ptrFromInt(rig.at(bufs[0])), @ptrFromInt(rig.at(bufs[1])), @ptrFromInt(rig.at(bufs[2])), @ptrFromInt(rig.at(bufs[3])), @ptrFromInt(rig.at(bufs[4])), @ptrFromInt(rig.at(state)), @ptrFromInt(rig.at(y)), @intCast(rows), @intCast(sh.key_heads), @intCast(sh.value_heads), d, d, t.stream.handle);
+            try t.stream.synchronize();
+            const got_y = try rig.download(u8, y);
+            defer gpa.free(got_y);
+            try std.testing.expectEqualSlices(u8, want_y[z], got_y);
+            const held = try rig.download(f32, state);
+            defer gpa.free(held);
+            try std.testing.expectEqualSlices(u32, @ptrCast(in.state), @ptrCast(held));
+        }
+        // the keep of every count a window of `rows` can keep: kept 1 is a full reject (the pending token alone)
+        const packed_in = try gpa.alloc(f32, layers * in_stride);
+        defer gpa.free(packed_in);
+        for (0..layers) |z| keepInputs(sh, ins[z], rows, packed_in[z * in_stride ..][0..in_stride]);
+        var inputs = try t.upload(packed_in);
+        defer inputs.free();
+        const states = try gpa.alloc(f32, layers * state_stride);
+        defer gpa.free(states);
+        for (1..rows + 1) |kept| {
+            @memset(states, std.math.nan(f32));
+            for (0..layers) |z| @memcpy(states[z * state_stride ..][0..state_floats], ins[z].state);
+            var state = try t.upload(states);
+            defer state.free();
+            try t.on.tf_gdn_keep(@as(F, @ptrFromInt(rig.at(state))), @intCast(state_stride), @as(CF, @ptrFromInt(rig.at(inputs))), @intCast(in_stride), keep_rows, @intCast(kept), layers, @intCast(sh.key_heads), @intCast(sh.value_heads), d, d, t.stream.handle);
+            try t.stream.synchronize();
+            const got = try rig.download(u8, state);
+            defer gpa.free(got);
+            for (0..layers) |z| {
+                const want = want_snaps[z][(kept - 1) * state_bytes ..][0..state_bytes];
+                std.testing.expectEqualSlices(u8, want, got[z * state_stride * 4 ..][0..state_bytes]) catch |err| {
+                    std.debug.print("gdn keep rows={d} kept={d} layer={d}: state differs from the snapshot\n", .{ rows, kept, z });
+                    return err;
+                };
+                // the stride's gap stays as it was: the keep stores the states alone
+                const gap = (z * state_stride + state_floats) * 4;
+                const gap_bytes = (state_stride - state_floats) * 4;
+                try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(states)[gap..][0..gap_bytes], got[gap..][0..gap_bytes]);
+            }
+        }
+    }
+}
