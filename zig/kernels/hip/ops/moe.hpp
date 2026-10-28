@@ -86,6 +86,93 @@ extern "C" __global__ void tf_moe_route(const int* picks, int pairs, int experts
     }
 }
 
+// tf_moe_route's plan of a prompt's many pairs in three launches: the same members (an expert's pairs in pair order)
+// and items. Segments of kRouteSeg pairs: each block counts its segment's experts (tf_route_count), one block turns
+// the counts into each segment's place within its expert and cuts the items (tf_route_scan), and each block writes its
+// segment's members (tf_route_scatter). `offs` (segments x experts ints, then experts ints of starts) is scratch.
+constexpr int kRouteSeg = 512;
+constexpr int kRouteMaxExperts = 1024;
+
+extern "C" __global__ void __launch_bounds__(256) tf_route_count(const int* picks, int pairs, int experts, int* offs) {
+    __shared__ int counts[kRouteMaxExperts];
+    for (int e = threadIdx.x; e < experts; e += blockDim.x) counts[e] = 0;
+    __syncthreads();
+    const int from = blockIdx.x * kRouteSeg;
+    for (int p = from + threadIdx.x; p < pairs && p < from + kRouteSeg; p += blockDim.x) atomicAdd(&counts[picks[p]], 1);
+    __syncthreads();
+    for (int e = threadIdx.x; e < experts; e += blockDim.x) offs[static_cast<long long>(blockIdx.x) * experts + e] = counts[e];
+}
+
+extern "C" __global__ void __launch_bounds__(1024) tf_route_scan(int* offs, int segs, int experts, int tile, int* items,
+                                                                 int capacity) {
+    __shared__ int counts[kRouteMaxExperts];
+    __shared__ int starts[kRouteMaxExperts];
+    __shared__ int ends[kRouteMaxExperts];
+    __shared__ int scan_c[1024];
+    __shared__ int scan_n[1024];
+    const int t = threadIdx.x;
+    // an expert's segments in order: each one's place within the expert, and the expert's total
+    if (t < experts) {
+        int run = 0;
+        for (int g = 0; g < segs; ++g) {
+            int* at = offs + static_cast<long long>(g) * experts + t;
+            const int c = *at;
+            *at = run;
+            run += c;
+        }
+        counts[t] = run;
+    }
+    // starts: the counts' exclusive sums; ends: the tiles' inclusive sums (an expert a thread)
+    const int own_c = t < experts ? counts[t] : 0;
+    const int own_n = t < experts ? (counts[t] + tile - 1) / tile : 0;
+    scan_c[t] = own_c;
+    scan_n[t] = own_n;
+    __syncthreads();
+    for (int off = 1; off < static_cast<int>(blockDim.x); off <<= 1) {
+        const int vc = t >= off ? scan_c[t - off] : 0, vn = t >= off ? scan_n[t - off] : 0;
+        __syncthreads();
+        scan_c[t] += vc;
+        scan_n[t] += vn;
+        __syncthreads();
+    }
+    if (t < experts) {
+        starts[t] = scan_c[t] - own_c;
+        ends[t] = scan_n[t];
+        offs[static_cast<long long>(segs) * experts + t] = starts[t];
+    }
+    __syncthreads();
+    for (int slot = t; slot < capacity; slot += blockDim.x) {
+        int lo = 0, hi = experts;
+        while (lo < hi) {  // searchsorted(ends, slot, right=True)
+            int mid = (lo + hi) / 2;
+            if (ends[mid] <= slot) lo = mid + 1;
+            else hi = mid;
+        }
+        int e = lo < experts - 1 ? lo : experts - 1;
+        int reps = (counts[e] + tile - 1) / tile;
+        int within = slot - (ends[e] - reps);
+        int count = counts[e] - within * tile;
+        items[slot * 3] = e;
+        items[slot * 3 + 1] = starts[e] + within * tile;
+        items[slot * 3 + 2] = count < 0 ? 0 : (count > tile ? tile : count);
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(kRouteSeg) tf_route_scatter(const int* picks, int pairs, int segs, int experts,
+                                                                         const int* offs, int* members) {
+    __shared__ int pk[kRouteSeg];
+    const int from = blockIdx.x * kRouteSeg;
+    const int t = threadIdx.x;
+    const int p = from + t;
+    pk[t] = p < pairs ? picks[p] : -1;
+    __syncthreads();
+    if (p >= pairs) return;
+    const int e = pk[t];
+    int before = 0;
+    for (int q = 0; q < t; ++q) before += pk[q] == e;
+    members[offs[static_cast<long long>(segs) * experts + e] + offs[static_cast<long long>(blockIdx.x) * experts + e] + before] = p;
+}
+
 // moe_router_kernel's logits with a wave's expert row read once for 8 token rows; each logit keeps its bits.
 __device__ __forceinline__ float router_sum(float x) {
 #pragma unroll
