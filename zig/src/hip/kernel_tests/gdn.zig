@@ -467,6 +467,26 @@ test "a held window and its keep give the bits of today's window: its outputs, a
             defer gpa.free(held);
             try std.testing.expectEqualSlices(u32, @ptrCast(in.state), @ptrCast(held));
         }
+        // a window of one row takes the plain scan, which stores its state: the snapshot's bits and the same outputs
+        if (rows == 1) for (0..layers) |z| {
+            const in = ins[z];
+            var bufs: [5]DeviceBuffer = undefined;
+            for (&bufs, [_][]f32{ in.q, in.k, in.v, in.gate, in.beta }) |*b, a| b.* = try t.upload(a);
+            defer for (&bufs) |*b| b.free();
+            var state = try t.upload(in.state);
+            defer state.free();
+            var y = try t.alloc(vy_bytes);
+            defer y.free();
+            try y.fill8(0);
+            try run(t, sh, bufs[0], bufs[1], bufs[2], bufs[3], bufs[4], state, y, 0, 1);
+            try t.stream.synchronize();
+            const got_y = try rig.download(u8, y);
+            defer gpa.free(got_y);
+            try std.testing.expectEqualSlices(u8, want_y[z], got_y);
+            const stored = try rig.download(u8, state);
+            defer gpa.free(stored);
+            try std.testing.expectEqualSlices(u8, want_snaps[z][0..state_bytes], stored);
+        };
         // the keep of every count a window of `rows` can keep: kept 1 is a full reject (the pending token alone)
         const packed_in = try gpa.alloc(f32, layers * in_stride);
         defer gpa.free(packed_in);

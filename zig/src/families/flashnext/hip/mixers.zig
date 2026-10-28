@@ -184,9 +184,16 @@ fn recur(
     var off: usize = 0;
     for (segs) |g| {
         const n = g.tokens.len;
-        if (window) {
-            // the window holds the state: its rows' outputs only, from the inputs its keep reads again
-            const in = g.c.inputs(index);
+        // a window's k, v, gate and beta are in the stream's window inputs (linear's conv and split wrote them there)
+        const in: cache.WindowInputs = if (window) g.c.inputs(index) else .{
+            .k = k + off * kw * 4,
+            .v = v + off * vw * 4,
+            .gate = gate + off * d.value_heads * 4,
+            .beta = beta + off * d.value_heads * 4,
+        };
+        if (window and n > 1) {
+            // the window holds the state: its rows' outputs only, from the inputs its keep reads again (a window of one
+            // row keeps it: the plain scan below stores the state, and its keep runs nothing)
             try o.gatedDeltaHold(q + off * kw * 4, in.k, in.v, in.gate, in.beta, g.c.linearAt(index).state, y + off * vw * 4, n, d.key_heads, d.value_heads, d.key_dim, d.value_dim);
             off += n;
             continue;
@@ -215,10 +222,10 @@ fn recur(
         }
         try o.gatedDelta(
             q + off * kw * 4,
-            k + off * kw * 4,
-            v + off * vw * 4,
-            gate + off * d.value_heads * 4,
-            beta + off * d.value_heads * 4,
+            in.k,
+            in.v,
+            in.gate,
+            in.beta,
             g.c.linearAt(index).state,
             y + off * vw * 4,
             n,

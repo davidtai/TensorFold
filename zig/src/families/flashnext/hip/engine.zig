@@ -269,7 +269,8 @@ pub const Engine = struct {
         if (kept == 0 or kept > tokens.len) return error.BadKeep;
         const l = c.layout;
         const s = e.stream.handle;
-        try c.keepStates(&e.lib, kept, e.stream);
+        // a window of one row stored its states (mixers.recur): nothing to run
+        if (tokens.len > 1) try c.keepStates(&e.lib, kept, e.stream);
         try c.startAt(if (kept < tokens.len) kept - 1 else null, e.stream);
         const row = l.tail_bytes / l.tail_rows;
         try hip.runtime.check(e.driver.api.hipMemcpyDtoDAsync(
