@@ -114,6 +114,7 @@ pub const Launcher = struct {
     const Decode = struct {
         router: [2]Function, // fp16, bf16
         router_select: [2]Function, // fp16, bf16 x; bf16 rows
+        router_select_one: [2]Function, // fp16, bf16 x; bf16 rows; one row
         tail: Function,
         conv_split: Function,
         rms2: Function,
@@ -184,7 +185,7 @@ pub const Launcher = struct {
         l.fuse = choices.fuse;
         l.inexact = choices.inexact;
         l.wide = choices.wide;
-        l.dec = .{ .router = .{ try dec.function("tf_router_decode_f16"), try dec.function("tf_router_decode_bf16") }, .router_select = .{ try dec.function("tf_router_select_f16"), try dec.function("tf_router_select_bf16") }, .tail = try dec.function("tf_tail"), .conv_split = try dec.function("tf_conv_split"), .rms2 = try dec.function("tf_rms2"), .gnorm_out = try dec.function("tf_gnorm_out"), .select = try dec.function("tf_select_decode"), .select_rows = try dec.function("tf_select_rows") };
+        l.dec = .{ .router = .{ try dec.function("tf_router_decode_f16"), try dec.function("tf_router_decode_bf16") }, .router_select = .{ try dec.function("tf_router_select_f16"), try dec.function("tf_router_select_bf16") }, .router_select_one = .{ try dec.function("tf_router_select_one_f16"), try dec.function("tf_router_select_one_bf16") }, .tail = try dec.function("tf_tail"), .conv_split = try dec.function("tf_conv_split"), .rms2 = try dec.function("tf_rms2"), .gnorm_out = try dec.function("tf_gnorm_out"), .select = try dec.function("tf_select_decode"), .select_rows = try dec.function("tf_select_rows") };
         l.plan = .{
             .kv_write = try pl.function("tf_plan_kv_write"),
             .kv_write_act = try pl.function("tf_plan_kv_write_act"),

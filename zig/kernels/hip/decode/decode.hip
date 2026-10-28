@@ -43,7 +43,9 @@ __device__ __forceinline__ float4 router_weights(const void* w, int at) {
 // logits[r, e] = x[r] . rows[e], 16 rows a block, a wave an expert; d is a multiple of 4, weight rows 16-byte aligned
 // (8-byte for ROWS16: bf16 rows, the same values as the fp32 rows widened from them, so the same logits).
 // `staged`: x's rows of this block are already in shared memory at `x` (router_select's few rows), not global memory.
-template <int KIND, bool ROWS16 = false>
+// ROWS: the most rows a call takes; STEPS: the loads a lane keeps in flight (a lane sums the elements 4 * lane + 128 m in
+// m's order whatever STEPS is, so a logit's bits do not depend on it).
+template <int KIND, bool ROWS16 = false, int ROWS = kRouterRows, int STEPS = kRouterSteps>
 __device__ void router_decode(const void* x, const void* rows, float* logits, int r, int d, int e, bool staged = false) {
     const int lane = threadIdx.x & 31;
     const int expert = blockIdx.x * kRouterWaves + (threadIdx.x >> 5);
@@ -52,25 +54,25 @@ __device__ void router_decode(const void* x, const void* rows, float* logits, in
     const int first = blockIdx.y * kRouterRows;
     if (!staged) x = static_cast<const uint16_t*>(x) + static_cast<long long>(first) * d;
     logits += static_cast<long long>(first) * e;
-    r = r - first < kRouterRows ? r - first : kRouterRows;
+    r = r - first < ROWS ? r - first : ROWS;
     const void* w = ROWS16 ? static_cast<const void*>(static_cast<const uint16_t*>(rows) + static_cast<long long>(expert) * d)
                            : static_cast<const void*>(static_cast<const float*>(rows) + static_cast<long long>(expert) * d);
-    float acc[kRouterRows];
+    float acc[ROWS];
 #pragma unroll
-    for (int k = 0; k < kRouterRows; ++k) acc[k] = 0.f;
-    for (int base = 0; base < d; base += kRouterSteps * 128) {
-        float4 wv[kRouterSteps];
+    for (int k = 0; k < ROWS; ++k) acc[k] = 0.f;
+    for (int base = 0; base < d; base += STEPS * 128) {
+        float4 wv[STEPS];
 #pragma unroll
-        for (int s = 0; s < kRouterSteps; ++s) {
+        for (int s = 0; s < STEPS; ++s) {
             const int at = base + (lane + 32 * s) * 4;
             wv[s] = at < d ? router_weights<ROWS16>(w, at) : make_float4(0.f, 0.f, 0.f, 0.f);
         }
 #pragma unroll
-        for (int k = 0; k < kRouterRows; ++k) {
+        for (int k = 0; k < ROWS; ++k) {
             if (k >= r) continue;
             const uint16_t* xr = static_cast<const uint16_t*>(x) + static_cast<long long>(k) * d;
 #pragma unroll
-            for (int s = 0; s < kRouterSteps; ++s) {
+            for (int s = 0; s < STEPS; ++s) {
                 const int at = base + (lane + 32 * s) * 4;
                 if (at >= d) continue;
                 const float4 xv = widen4<KIND>(*reinterpret_cast<const uint2*>(xr + at));
@@ -82,7 +84,7 @@ __device__ void router_decode(const void* x, const void* rows, float* logits, in
         }
     }
 #pragma unroll
-    for (int k = 0; k < kRouterRows; ++k) {
+    for (int k = 0; k < ROWS; ++k) {
         float v = acc[k];
 #pragma unroll
         for (int mask = 16; mask > 0; mask >>= 1) v += __shfl_xor(v, mask, 32);
@@ -722,6 +724,165 @@ __device__ void router_select(const void* x, const void* rows, float* logits, in
 }
 
 }  // namespace
+
+// One row's pick in two levels by the last block: each wave the top `top_k` of its quarter of the experts (KPER logits a
+// lane, wave butterflies, no block barrier), then wave 0 the top `top_k` of the waves' candidates (2 a lane). The order
+// (value descending, index ascending) is total without NaN, so the picks are select_row's in its order; lane 0's
+// arithmetic is thread 0's, in its order. A NaN logit anywhere: the whole block takes select_row. Then the 1-row plan.
+template <int KPER>
+__device__ void select_one(const float* logits, int* pick, float* wts, int* items, int* members, int capacity, int experts,
+                           int top_k) {
+    __shared__ float cand_v[kRouterWaves * 16];
+    __shared__ int cand_i[kRouterWaves * 16];
+    __shared__ int any_nan;
+    const int lane = threadIdx.x & 31, wave = threadIdx.x >> 5;
+    const int quarter = (experts + kRouterWaves - 1) / kRouterWaves;
+    const int lo = wave * quarter, hi = lo + quarter < experts ? lo + quarter : experts;
+    const int slots = top_k + 1;
+    if (threadIdx.x == 0) any_nan = 0;
+    __syncthreads();
+    float v[KPER];
+    unsigned taken = 0;
+    bool nan = false;
+#pragma unroll
+    for (int j = 0; j < KPER; ++j) {
+        const int i = lo + lane + 32 * j;
+        v[j] = i < hi ? __hip_atomic_load(logits + i, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) : 0.f;
+        nan |= i < hi && v[j] != v[j];
+    }
+    if (__any(nan) && lane == 0) any_nan = 1;
+    __syncthreads();
+    if (any_nan) {
+        select_row(logits, 0, pick, wts, items, members, capacity, experts, top_k);
+        return;
+    }
+    // level 1: the wave's top top_k (fewer when its quarter is smaller), candidate k at wave * 16 + k
+    const int mine = hi - lo < top_k ? hi - lo : top_k;
+    for (int k = 0; k < mine; ++k) {
+        float bv = 0.f;
+        int bi = 0x7fffffff;
+#pragma unroll
+        for (int j = 0; j < KPER; ++j) {
+            const int i = lo + lane + 32 * j;
+            if (i < hi && !((taken >> j) & 1u) && (bi == 0x7fffffff || v[j] > bv || (v[j] == bv && i < bi))) {
+                bv = v[j];
+                bi = i;
+            }
+        }
+#pragma unroll
+        for (int mask = 16; mask > 0; mask >>= 1) {
+            const float ov = __shfl_xor(bv, mask, 32);
+            const int oi = __shfl_xor(bi, mask, 32);
+            if (oi != 0x7fffffff && (bi == 0x7fffffff || ov > bv || (ov == bv && oi < bi))) {
+                bv = ov;
+                bi = oi;
+            }
+        }
+        if (((bi - lo) & 31) == lane) taken |= 1u << ((bi - lo) >> 5);
+        if (lane == 0) {
+            cand_v[wave * 16 + k] = bv;
+            cand_i[wave * 16 + k] = bi;
+        }
+    }
+    if (lane == 0)
+        for (int k = mine; k < 16; ++k) cand_i[wave * 16 + k] = 0x7fffffff;
+    __syncthreads();
+    if (wave != 0) return;
+    // level 2: wave 0 over the candidates, slots lane and lane + 32
+    float c[2];
+    int ci[2];
+#pragma unroll
+    for (int j = 0; j < 2; ++j) {
+        c[j] = cand_v[lane + 32 * j];
+        ci[j] = cand_i[lane + 32 * j];
+    }
+    float mine_v = 0.f;
+    int mine_i = 0;
+    for (int k = 0; k < top_k; ++k) {
+        float bv = 0.f;
+        int bi = 0x7fffffff;
+#pragma unroll
+        for (int j = 0; j < 2; ++j) {
+            if (ci[j] != 0x7fffffff && (bi == 0x7fffffff || c[j] > bv || (c[j] == bv && ci[j] < bi))) {
+                bv = c[j];
+                bi = ci[j];
+            }
+        }
+#pragma unroll
+        for (int mask = 16; mask > 0; mask >>= 1) {
+            const float ov = __shfl_xor(bv, mask, 32);
+            const int oi = __shfl_xor(bi, mask, 32);
+            if (oi != 0x7fffffff && (bi == 0x7fffffff || ov > bv || (ov == bv && oi < bi))) {
+                bv = ov;
+                bi = oi;
+            }
+        }
+#pragma unroll
+        for (int j = 0; j < 2; ++j)
+            if (ci[j] == bi) ci[j] = 0x7fffffff;  // taken: an expert is one candidate
+        if (lane == k) {
+            mine_v = bv;
+            mine_i = bi;
+        }
+    }
+    const float top = __shfl(mine_v, 0, 32);
+    float total = 0.f;
+    for (int k = 0; k < top_k; ++k) total += expf(__shfl(mine_v, k, 32) - top);
+    if (lane < top_k) {
+        pick[lane] = mine_i;
+        wts[lane] = round_bf16_f(expf(mine_v - top) / total);
+    }
+    if (lane == 0) {
+        const float gate = round_bf16_f(__hip_atomic_load(logits + experts, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT));
+        pick[top_k] = experts;
+        wts[top_k] = round_bf16_f(1.f / (1.f + expf(-gate)));
+    }
+    if (items != nullptr) {
+        // select_row's 1-row plan: slot k < slots is pick k alone (lane k holds pick k; slots <= 17), the rest empty
+        for (int k = lane; k < capacity; k += 32) {
+            const bool real = k < slots;
+            items[3 * k] = real ? (k < top_k ? mine_i : experts) : 0;
+            items[3 * k + 1] = real ? k : 0;
+            items[3 * k + 2] = real ? 1 : 0;
+            if (real) members[k] = k;
+        }
+    }
+}
+
+// A decode row's router logits and pick in one launch (tf_router_select's 1-row case): the sums with 20 loads a lane in
+// flight and one row's accumulator (the same logits), then select_one by the last block to finish.
+template <int KIND>
+__device__ void router_select_one(const void* x, const void* rows, float* logits, int d, int e, int* pick, float* wts,
+                                  int* items, int* members, int capacity, int top_k, unsigned* done) {
+    __shared__ bool last;
+    const int expert = blockIdx.x * kRouterWaves + (threadIdx.x >> 5);
+    if (expert < e) router_decode<KIND, true, 1, 20>(x, rows, logits, 1, d, e);
+    __threadfence();
+    __syncthreads();
+    if (threadIdx.x == 0) last = atomicAdd(done, 1u) == gridDim.x - 1;
+    __syncthreads();
+    if (!last) return;
+    __threadfence();
+    if (e - 1 <= kRouterWaves * 32 * 4 && top_k <= 16) {
+        select_one<4>(logits, pick, wts, items, members, capacity, e - 1, top_k);
+    } else {
+        select_row(logits, 0, pick, wts, items, members, capacity, e - 1, top_k);
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) *done = 0u;
+}
+
+extern "C" __global__ void __launch_bounds__(32 * kRouterWaves)
+    tf_router_select_one_f16(const void* x, const void* rows, float* logits, int d, int e, int* pick, float* wts,
+                             int* items, int* members, int capacity, int top_k, unsigned* done) {
+    router_select_one<1>(x, rows, logits, d, e, pick, wts, items, members, capacity, top_k, done);
+}
+
+extern "C" __global__ void __launch_bounds__(32 * kRouterWaves)
+    tf_router_select_one_bf16(const void* x, const void* rows, float* logits, int d, int e, int* pick, float* wts,
+                              int* items, int* members, int capacity, int top_k, unsigned* done) {
+    router_select_one<2>(x, rows, logits, d, e, pick, wts, items, members, capacity, top_k, done);
+}
 
 extern "C" __global__ void __launch_bounds__(32 * kRouterWaves)
     tf_router_select_f16(const void* x, const void* rows, float* logits, int r, int d, int e, int* pick, float* wts,

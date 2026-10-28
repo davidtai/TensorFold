@@ -61,6 +61,24 @@ pub fn routerSelect(l: *const Launcher, x: C, kind: c_int, rows16: C, logits: F,
     if (e - 1 > 1024 or top_k < 1 or top_k > 31) return false;
     // the plan in the launch: one row, or 2 to 8 rows of at most plan_pairs pairs (route_plan's pair a thread)
     if (items != null and r != 1 and (r > 8 or r * (top_k + 1) > plan_pairs or tile < 1)) return false;
+    if (r == 1 and e - 1 <= 512 and top_k <= 16) {
+        // one row: tf_router_select_one (the sums at 20 loads a lane in flight, the pick in two levels), the same bytes
+        var o: Args = .{};
+        try o.add(ad(x));
+        try o.add(ad(rows16));
+        try o.add(ad(logits));
+        try o.add(d);
+        try o.add(e);
+        try o.add(ad(pick));
+        try o.add(ad(wts));
+        try o.add(ad(items));
+        try o.add(ad(members));
+        try o.add(capacity);
+        try o.add(top_k);
+        try o.add(done);
+        try l.go(l.dec.router_select_one[if (kind == 1) 0 else 1], dim(cdiv(e, 4), 1, 1), dim(128, 1, 1), 0, s, &o);
+        return true;
+    }
     var a: Args = .{};
     try a.add(ad(x));
     try a.add(ad(rows16));
