@@ -184,6 +184,55 @@ tf_fn_idx_scores(const float* q, const void* pooled, const int* complete, float*
     }
 }
 
+// tf_fn_idx_scores for Flash Next's 4 x 128 index heads at a verify window's rows: a wave's 8 rows' and 4 heads' dots
+// are all formed before their butterflies, so the rows' chains overlap instead of running one after another (a row
+// cost 6.2 us). Each dot is tf_fn_idx_scores's (lane partials over d = lane + 32 i, i = 0..3, from 0; xor 16, 8, 4, 2,
+// 1), the heads' relu sum in head order, then / sqrt(128): the same scores, bit for bit. Rows past `rows` repeat the
+// last row's dots and store nothing.
+extern "C" __global__ void __launch_bounds__(kFnThreads)
+tf_fn_idx_scores8(const float* q, const void* pooled, const int* complete, float* scores, int kind, int rows,
+                  int blocks, long long stride, int top) {
+    constexpr int R = 8, H = 4, D = 128, I = D / 32;
+    const int lane = threadIdx.x & 31;
+    const int b = blockIdx.x * kFnWaves + (threadIdx.x >> 5);
+    const int r0 = blockIdx.y * R, r1 = min(rows, r0 + R);
+    bool wanted = false;  // a graph launches over a bound of blocks: those no row scores read nothing
+    for (int r = r0; r < r1; ++r) wanted = wanted || (complete[r] > top && b < complete[r]);
+    if (b >= blocks || !wanted) return;
+    float key[I];
+#pragma unroll
+    for (int i = 0; i < I; ++i) key[i] = load(pooled, kind, static_cast<long long>(b) * D + lane + 32 * i);
+    float dot[R][H];
+#pragma unroll
+    for (int j = 0; j < R; ++j) {
+        const int r = min(r0 + j, rows - 1);
+#pragma unroll
+        for (int h = 0; h < H; ++h) {
+            const float* qh = q + (static_cast<long long>(r) * H + h) * D;
+            float x = 0.f;
+#pragma unroll
+            for (int i = 0; i < I; ++i) x += qh[lane + 32 * i] * key[i];
+            dot[j][h] = x;
+        }
+    }
+#pragma unroll
+    for (int mask = 16; mask > 0; mask >>= 1)
+#pragma unroll
+        for (int j = 0; j < R; ++j)
+#pragma unroll
+            for (int h = 0; h < H; ++h) dot[j][h] += __shfl_xor(dot[j][h], mask, 32);
+    const float norm = sqrtf(static_cast<float>(D));
+#pragma unroll
+    for (int j = 0; j < R; ++j) {
+        const int r = r0 + j;
+        if (r >= r1 || complete[r] <= top || b >= complete[r]) continue;
+        float total = 0.f;
+#pragma unroll
+        for (int h = 0; h < H; ++h) total += fmaxf(dot[j][h], 0.f);
+        if (lane == 0) scores[r * stride + b] = total / norm;
+    }
+}
+
 // A prompt slice's scores for 4 heads of 128 dims: 128 threads score 32 rows x 64 blocks, 4 lanes a score. Lane p of a
 // row's 4 holds q (all heads) and the block's key at d = p + 4 m: the dims tf_fn_idx_scores's lanes p + 4 j held. Each
 // virtual lane's products add in its order, its butterfly's xor 16, 8 and 4 pair the same lanes in registers and xor 2
@@ -356,10 +405,13 @@ __device__ int fn_scan(int v, int* waves, int* total) {
 }
 
 // Block r: past top complete blocks, the top best (ties: lower id) in block order, then the tail; else keys < ends.
+// Four 8-bit radix passes; each pass's cut is the highest bin whose count from bin 255 down reaches `need`, found by
+// the block's suffix sum over the 256 bins (a walk down them by one thread cost 15 us of 24 a launch).
 extern "C" __global__ void __launch_bounds__(kSelectThreads)
 tf_fn_idx_select(const float* scores, long long stride, const int* complete, const int* ends, int* keys,
                  long long key_stride, int* count, int* sparse, int top, int ratio) {
     __shared__ int hist[256];
+    __shared__ int suf[256];
     __shared__ int waves[kSelectWaves];
     __shared__ unsigned cut_s;
     __shared__ int need_s;
@@ -383,11 +435,32 @@ tf_fn_idx_select(const float* scores, long long stride, const int* complete, con
             if ((k & mask) == prefix) atomicAdd(&hist[(k >> shift) & 255u], 1);
         }
         __syncthreads();
-        if (t == 0) {
-            int above = 0, bin = 255;
-            while (above + hist[bin] < need) above += hist[bin--];
-            cut_s = prefix | (static_cast<unsigned>(bin) << shift);
-            need_s = need - above;
+        // suf[i]: the count in bins 255 - i .. 255 (8 waves of 32 bins: a wave's scan, then the waves above it)
+        if (t < 256) {
+            const int lane = t & 31;
+            int x = hist[255 - t];
+#pragma unroll
+            for (int off = 1; off < 32; off <<= 1) {
+                const int y = __shfl_up(x, off, 32);
+                if (lane >= off) x += y;
+            }
+            if (lane == 31) waves[t >> 5] = x;
+            suf[t] = x;
+        }
+        __syncthreads();
+        if (t < 256) {
+            int add = 0;
+            for (int w = 0; w < (t >> 5); ++w) add += waves[w];
+            suf[t] += add;
+        }
+        __syncthreads();
+        // the cut: the one i with suf[i] >= need and the bins above it under need (the bins hold at least need)
+        if (t < 256) {
+            const int above = t > 0 ? suf[t - 1] : 0;
+            if (suf[t] >= need && above < need) {
+                cut_s = prefix | (static_cast<unsigned>(255 - t) << shift);
+                need_s = need - above;
+            }
         }
         __syncthreads();
         prefix = cut_s;

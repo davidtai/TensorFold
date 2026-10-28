@@ -364,8 +364,9 @@ pub fn sparse(
     const q32 = try o.arena.of(f32, rows * d.heads * hd);
     const iq = try o.arena.of(f32, rows * d.index_heads * di);
     const graphed = o.window and staged != null;
+    const prep = prepWrites(graphed, rows, segs.len, segs[0].c.pooled, segs[0].pos, d.index_ratio, m.act);
     // at device positions the first segment's prep launch also takes q and the index q (tf_fn_qsa_prep)
-    if (!graphed) try o.qkRope(
+    if (!prep) try o.qkRope(
         qg,
         d.heads * 2 * hd,
         2 * hd,
@@ -381,7 +382,7 @@ pub fn sparse(
         null,
         0,
     );
-    if (!graphed) try o.qkRope(idx, width, di, s.iq_norm, d.eps, rows, d.index_heads, di, d.rotary, d.theta, dev_pos, iq, null, 0);
+    if (!prep) try o.qkRope(idx, width, di, s.iq_norm, d.eps, rows, d.index_heads, di, d.rotary, d.theta, dev_pos, iq, null, 0);
     // numerics=inexact, on the matrix cores: a prompt's rows attend in one pass, a few rows in parts; both write the
     // gated rows. numerics=exact: every row in parts on tf_fn_sparse_parts, then tf_attn_gate (3d219d21's bits)
     const path = attention(o.inexact(), promptFits(m, d), graphed, rows);
@@ -396,7 +397,7 @@ pub fn sparse(
         const cap = g.c.layout.cap;
         const pos = g.pos;
         const at_pos = dev_pos + off * 4;
-        if (graphed) {
+        if (prep) {
             // q and the index q (the first segment's launch), k, v, the raw index key and the pools in one launch
             const first = off == 0;
             const rope = hip.launches.flashnext.QsaRope;
@@ -468,6 +469,30 @@ pub fn sparse(
 
 /// Rows from which a call's attention takes the prompt kernel: below, the tile runs in parts for a wider grid.
 const prompt_rows = 16;
+
+/// Whether a call's q, index q, keys, values and index keys go through tf_fn_qsa_prep (one launch, the bytes of the
+/// eager writes: kernel test "QSA decode prep"): a graphed window always; an eager call (the MTP head's step) of one
+/// segment under prompt_rows rows whose cache has pooled every block before its first row, so the blocks its rows
+/// complete are all the pools due (writeKeys also pools blocks a cache fell behind on); 16-bit activations.
+/// `pooled`, `pos`: the first segment's cache's pooled blocks and first row.
+pub fn prepWrites(graphed: bool, rows: usize, segs: usize, pooled: usize, pos: usize, ratio: usize, act: model.Kind) bool {
+    if (graphed) return true;
+    if (act == .f32 or rows == 0 or rows >= prompt_rows or segs != 1) return false;
+    return pooled == pos / ratio;
+}
+
+test "QSA writes: a graphed window always takes the prep launch; an eager call only when its pools are all its rows'" {
+    // graphed: always (its caches are pooled through every window's prep)
+    try std.testing.expect(prepWrites(true, 8, 1, 0, 4000, 4, .bf16));
+    // the MTP head's step: one row, its cache pooled to its first row (pos 4001: 1,000 blocks)
+    try std.testing.expect(prepWrites(false, 1, 1, 1000, 4001, 4, .bf16));
+    try std.testing.expect(prepWrites(false, 1, 1, 1000, 4003, 4, .bf16));
+    // a cache behind its row's blocks (writeKeys pools 999 too), a prompt's rows, two segments, fp32 rows: eager
+    try std.testing.expect(!prepWrites(false, 1, 1, 999, 4001, 4, .bf16));
+    try std.testing.expect(!prepWrites(false, 16, 1, 1000, 4001, 4, .bf16));
+    try std.testing.expect(!prepWrites(false, 2, 2, 1000, 4001, 4, .bf16));
+    try std.testing.expect(!prepWrites(false, 1, 1, 1000, 4001, 4, .f32));
+}
 
 /// Which kernels a call's sparse attention takes: tf_fn_sparse_parts + tf_attn_gate (the exact path), the matrix-core
 /// tile in parts with the gate in the merge, or the prompt tile in one pass with the gate fused.

@@ -36,6 +36,7 @@ pub const Fns = struct {
     qsa_prep: Function,
     idx_scores: Function,
     idx_scores_quad: Function,
+    idx_scores8: Function, // a verify window's 5-15 rows: 8 rows' dots a wave at once, the same scores
     idx_scores_mma: Function, // a prompt slice's scores on the gfx11 matrix cores (numerics=inexact)
     idx_select: Function,
     sparse_parts: [2]Function, // groups of up to 6 and up to 12 query heads
@@ -61,6 +62,7 @@ pub const Fns = struct {
             .qsa_prep = try m.function("tf_fn_qsa_prep"),
             .idx_scores = try m.function("tf_fn_idx_scores"),
             .idx_scores_quad = try m.function("tf_fn_idx_scores_quad"),
+            .idx_scores8 = try m.function("tf_fn_idx_scores8"),
             .idx_scores_mma = try m.function("tf_fn_idx_scores_mma"),
             .idx_select = try m.function("tf_fn_idx_select"),
             .sparse_parts = .{ try m.function("tf_fn_sparse_parts6"), try m.function("tf_fn_sparse_parts12") },
@@ -445,6 +447,9 @@ pub fn qsaPrep(l: *const Launcher, a: QsaPrep, s: S) Error!void {
 /// Every row's score of each of `blocks` pooled blocks it has complete, for rows past `top` complete blocks.
 /// Rows from which the block scores take tf_fn_idx_scores_quad (fewer: a verify window's, a wave a block).
 pub const quad_rows = 16;
+/// Rows from which (to quad_rows) Flash Next's block scores take tf_fn_idx_scores8, 8 rows' dots at once: at 1-4 rows
+/// the plain kernel is as fast or faster (W4 QD-4b at 17.7K depth: 4 rows 30.4 against 28.7 us, 8 rows 60.6 against 31.0).
+pub const scores8_rows = 5;
 
 pub fn idxScores(
     l: *const Launcher,
@@ -468,6 +473,12 @@ pub fn idxScores(
         var b: Args = .{};
         inline for (.{ ad(q), ad(pooled), ad(complete), ad(scores), kind, rows, blocks, stride, top }) |v| try b.add(v);
         return l.go(l.fnx.idx_scores_quad, dim(cdiv(blocks, 64), cdiv(rows, 32), 1), dim(128, 1, 1), 0, s, &b);
+    }
+    // a verify window's rows of the same heads: a wave's 8 rows' dots at once, the same sums (indexer.hpp)
+    if (rows >= scores8_rows and heads == 4 and dims == 128) {
+        var c: Args = .{};
+        inline for (.{ ad(q), ad(pooled), ad(complete), ad(scores), kind, rows, blocks, stride, top }) |v| try c.add(v);
+        return l.go(l.fnx.idx_scores8, dim(cdiv(blocks, threads / 32), cdiv(rows, 8), 1), dim(threads, 1, 1), 0, s, &c);
     }
     var a: Args = .{};
     inline for (.{
