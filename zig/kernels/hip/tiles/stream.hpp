@@ -303,5 +303,21 @@ __device__ inline void stream_tile(typename Dec::Args& a, const Sides& sides, in
     }
 }
 
+// A routed plan of 5 to 8 rows as a work list (one launch, its own kernel): block z walks the items z, z + gridDim.z,
+// ... (tf_moe_route puts the live items first; a dead one costs its count's load) and each item's row blocks of R
+// rows, so no block is dispatched for a dead item or a dead row block. A row's sums are the same as on the grid.
+template <class Dec, class Act, class T, class Epi, int R, int CB>
+__device__ inline void stream_list(const typename Dec::Args& a, int pair_cols, float limit, int lpc_log2, int gshift,
+                                   int items) {
+    const int bx = static_cast<int>(blockIdx.x);
+    for (int z = static_cast<int>(blockIdx.z); z < items; z += static_cast<int>(gridDim.z)) {
+        typename Dec::Args b = a;
+        if (!Dec::take_item(b, z)) continue;
+        for (int by = 0; by * R < b.m; ++by) {
+            stream_body<Dec, Act, T, Epi, R, CB, true>(b, lpc_log2, gshift, bx, by, pair_cols, limit);
+        }
+    }
+}
+
 }  // namespace rocm
 }  // namespace tf

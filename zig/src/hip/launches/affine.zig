@@ -102,6 +102,8 @@ pub const stream_pair_code_words = 8;
 /// The widest columns a lane of a routed plain product (the experts' down) by row tile (stream_rows): on gfx1151 the
 /// 4-bit down at K 640 takes 4 at the 2-row tile (8 lost 8 % at 4-8 rows); 1 and 4 rows keep the waves rule
 pub const stream_routed_cb_top = [stream_rows.len]c_int{ 8, 4, 4 };
+/// The blocks on z of a routed work list (stream_list): each walks about live items / 16 of the plan's items
+pub const stream_list_blocks = 16;
 /// The columns below which one row of a plain product takes one column a lane (Flash Next's in-proj 16,480 and
 /// attention 13,952 do; lm_head 248,320 and the draft readout 79,591 keep the waves rule)
 pub const stream_one_col_n = 20_000;
@@ -146,6 +148,9 @@ pub const Kernels = struct {
     /// The same tile with Nemotron's relu^2 as its epilogue, and with two such products in one launch.
     relu2: [bit_widths.len][stream_rows.len][stream_cbs.len]?Function,
     relu2_pair: [bit_widths.len][stream_rows.len][stream_cbs.len]?Function,
+    /// The 5- to 8-row routed work lists at 4-bit (stream.hpp stream_list): [0] the SwiGLU pair at CB 2, [1] the plain
+    /// product at CB 4, both on the 4-row tile.
+    stream_list: [2]Function,
     /// Off keeps the decode tiles before the stream tile (the policy's reference switch).
     stream_on: bool,
     /// A test's forced columns a lane (a stream_cbs value; 0: the rule), where the shape takes it.
@@ -217,6 +222,10 @@ pub const Kernels = struct {
 
     fn resolve(k: *Kernels, comptime dot: []const u8, comptime shape: []const u8, m: Module) Error!void {
         @setEvalBranchQuota(400_000);
+        k.stream_list = .{
+            try m.function(std.fmt.comptimePrint("_ZN2tf4rocm23affine_dot2_stream_listINS0_{s}ELi4ELi4ELi2ELb1EEEvNS0_6AffineENS0_11StreamSidesEiii", .{dot})),
+            try m.function(std.fmt.comptimePrint("_ZN2tf4rocm23affine_dot2_stream_listINS0_{s}ELi4ELi4ELi4ELb0EEEvNS0_6AffineENS0_11StreamSidesEiii", .{dot})),
+        };
         inline for (bit_widths, 0..) |bits, b| {
             k.block[b] = try m.function(std.fmt.comptimePrint("_ZN2tf4rocm17affine_dot2_blockINS0_{s}ELi{d}EEEvNS0_6AffineE", .{ dot, bits }));
             if (k.matrix) k.wmma_gemm[b] = try m.function(std.fmt.comptimePrint("_ZN2tf4rocm16affine_wmma_gemmILi{d}EEEvNS0_6AffineE", .{bits}));
@@ -434,6 +443,25 @@ pub const Kernels = struct {
         // dispatched together and read its codes once from DRAM (y holds at most 65,535 blocks, else rows stay on y)
         const row_blocks = cdiv(a.m, stream_rows[ri]);
         sides.row_blocks = if (row_blocks > 1 and blocks <= 65535) @intCast(row_blocks) else 0;
+        // 5 to 8 rows of a routed 4-bit plan on the 4-row tile (the gate+up pair at CB 2, the down at CB 4, wide-aligned):
+        // the work list, so no block is dispatched for a dead item or a dead row block
+        const list_cb: c_int = if (pair_div == 2) 2 else 4;
+        if (a.route.items != 0 and !relu2 and sides.count == 0 and a.m > 4 and a.bits == 4 and ri == 2 and
+            stream_cbs[pick] == list_cb and ((a.words | @as(u64, @intCast(@divExact(a.k * a.bits, 8)))) & 15) == 0)
+        {
+            var la: hl.Args = .{};
+            try la.add(a);
+            try la.add(sides);
+            try la.add(@as(c_int, lpc_log2));
+            try la.add(@as(c_int, switch (a.group) {
+                32 => 0,
+                64 => 1,
+                else => 2,
+            }));
+            try la.add(items);
+            const lf = k.stream_list[if (pair_div == 2) 0 else 1];
+            return go(r, lf, .{ .x = blocks, .y = 1, .z = @intCast(@min(items, stream_list_blocks)) }, .{ .x = 32 * stream_waves }, s, &la);
+        }
         var args: hl.Args = .{};
         try args.add(a);
         try args.add(sides);

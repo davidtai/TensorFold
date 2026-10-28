@@ -375,7 +375,8 @@ test "the routed gate and up with its activation in one launch is no further fro
 /// same pairs with every pair its own item (each pass then on the 1-row tile): the same bytes. Flash Next's gate+up
 /// with its activation (`down` false: 640 x 2 columns, K 2560) or its down (`down` true: 2560 columns, K 640, x a row
 /// a pair), 4-bit group 32; rows x 11 (row, slot) pairs over 11 + 5.5 (rows - 1) experts, round-robin, or over
-/// `unique` experts when given (4 rows an expert at unique 11 x rows / 4); the plan ends in 9 dead items, as tf_moe_route's.
+/// `unique` experts when given (4 rows an expert at unique 11 x rows / 4); the plan ends in 9 dead items, as tf_moe_route's;
+/// and at a.m = the window's rows, the engine's launch (the work list at 5 to 8 rows).
 fn windowBytes(t: *Rig, rng: *rig.Rng, down: bool, rows: usize, unique_in: ?usize) !void {
     const n: usize = if (down) 2560 else 2 * 640;
     const k: usize = if (down) 640 else 2560;
@@ -428,12 +429,13 @@ fn windowBytes(t: *Rig, rng: *rig.Rng, down: bool, rows: usize, unique_in: ?usiz
     const out_bytes = if (down) pairs * n * 4 else pairs * (n / 2) * 2;
     var want: ?[]u8 = null;
     defer if (want) |w| gpa.free(w);
-    // the CBs on the grouped plan, then the rule's CB on the plan of single items (a.m 1: every pass a 1-row tile)
-    for ([_]c_int{ 0, 1, 2, 4, 8, -1 }) |cb| {
+    // the CBs on the grouped plan, then the rule's CB on the plan of single items (a.m 1: every pass a 1-row tile),
+    // then the grouped plan at a.m = the window's rows, as the engine launches it (5 to 8 rows: the work list)
+    for ([_]c_int{ 0, 1, 2, 4, 8, -1, -2 }) |cb| {
         var out = try t.alloc(out_bytes);
         defer out.free();
-        const split = cb < 0;
-        var a = m.arg(t, at(x), if (split) 1 else most, if (down) at(out) else 0);
+        const split = cb == -1;
+        var a = m.arg(t, at(x), if (split) 1 else if (cb == -2) rows else most, if (down) at(out) else 0);
         if (!down) a.out16 = at(out);
         a.route = .{ .items = at(if (split) dev_single else dev_items), .members = at(dev_members), .x_div = if (down) 1 else slots };
         const n_items: c_int = @intCast(if (split) pairs + dead else unique + dead);
@@ -453,7 +455,7 @@ test "the routed gate+up and down write the same bytes at every columns a lane a
     defer t.close();
     var rng: rig.Rng = .{ .state = 0x9E3779B97F4A7C15 };
     for ([_]bool{ false, true }) |down| {
-        for ([_]usize{ 1, 2, 4, 8 }) |rows| try windowBytes(t, &rng, down, rows, null);
+        for ([_]usize{ 1, 2, 4, 5, 8 }) |rows| try windowBytes(t, &rng, down, rows, null);
         // 4 rows an expert: the 4-row tile
         try windowBytes(t, &rng, down, 4, 11);
         try windowBytes(t, &rng, down, 8, 22);
