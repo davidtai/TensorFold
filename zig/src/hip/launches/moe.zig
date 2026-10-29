@@ -36,7 +36,7 @@ pub fn routerWith(l: *const Launcher, x: C, kind: c_int, rows: CF, logits: F, r:
     try a.add(e);
     const k: usize = if (kind == 1) 0 else 1;
     if (small) return l.go(l.op.router_small[k], dim(cdiv(e, 8), cdiv(r, 32), 1), dim(256, 1, 1), 0, s, &a);
-    try l.go(l.op.router_tile[k], dim(cdiv(e, 64), cdiv(r, 64), 1), dim(256, 1, 1), 0, s, &a);
+    try l.go(l.op.router_tile[k], dim(cdiv(e, 64), cdiv(r, 128), 1), dim(256, 1, 1), 0, s, &a);
 }
 
 /// A lane round's router at any row count; false (nothing launched) where the shape keeps the other kernels.
@@ -115,7 +115,7 @@ pub fn tf_moe_router(l: *const Launcher, x: C, kind: c_int, rows: CF, logits: F,
     if (l.fuse and r <= 16 and @rem(d, 4) == 0 and ad(rows) % 16 == 0 and ad(x) % 8 == 0) {
         return l.go(l.dec.router[k], dim(cdiv(e, 4), 1, 1), dim(128, 1, 1), 0, s, &a);
     }
-    if (r >= 64 and @rem(d, 32) == 0) return l.go(l.op.router_tile[k], dim(cdiv(e, 64), cdiv(r, 64), 1), dim(256, 1, 1), 0, s, &a);
+    if (r >= 64 and @rem(d, 32) == 0) return l.go(l.op.router_tile[k], dim(cdiv(e, 64), cdiv(r, 128), 1), dim(256, 1, 1), 0, s, &a);
     try l.go(l.op.router_rows[k], dim(cdiv(e, 8), cdiv(r, 8), 1), dim(256, 1, 1), 0, s, &a);
 }
 

@@ -214,52 +214,59 @@ __device__ void router_rows(const void* x, const float* rows, float* logits, int
     }
 }
 
-// The router's logits for many rows: a 64 x 64 tile of (row, expert) a block, 4 x 4 a thread, in fp32.
+// The router's logits for many rows: a 128 x 64 tile of (row, expert) a block, 8 x 4 a thread, in fp32. Each logit is
+// one fmaf chain over k in order from 0 (the same bits however the tile is cut).
+constexpr int kRouterTileRows = 128;
+constexpr int kRouterTileExperts = 64;
+
 template <int KIND>
 __device__ void router_tile(const void* x, const float* rows, float* logits, int r, int d, int e) {
-    constexpr int kTile = 64, kStep = 32, kLd = kTile + 4;
-    __shared__ alignas(16) float xs[kStep][kLd];
-    __shared__ alignas(16) float ws[kStep][kLd];
-    const int row0 = blockIdx.y * kTile, expert0 = blockIdx.x * kTile;
+    constexpr int RT = 8, CT = 4, TR = 16 * RT, TC = 16 * CT, kStep = 32;
+    static_assert(TR == kRouterTileRows && TC == kRouterTileExperts, "the launch's tile");
+    __shared__ alignas(16) float xs[kStep][TR + 4];
+    __shared__ alignas(16) float ws[kStep][TC + 4];
+    const int row0 = blockIdx.y * TR, expert0 = blockIdx.x * TC;
     const int ty = threadIdx.x / 16, tx = threadIdx.x % 16;
-    // the staging: activation row ar at steps ak .. ak + 7, router rows wr and wr + 32 at steps wk .. wk + 3
-    const int ar = threadIdx.x / 4, ak = (threadIdx.x % 4) * 8;
-    const int wr = threadIdx.x / 8, wk = (threadIdx.x % 8) * 4;
     const uint16_t* xh = static_cast<const uint16_t*>(x);
-    float acc[4][4] = {};
+    float acc[RT][CT] = {};
     for (int base = 0; base < d; base += kStep) {
-        uint4 xv = {0, 0, 0, 0};
-        if (row0 + ar < r) xv = *reinterpret_cast<const uint4*>(xh + static_cast<long long>(row0 + ar) * d + base + ak);
-        float4 w0 = {0, 0, 0, 0}, w1 = {0, 0, 0, 0};
-        if (expert0 + wr < e) w0 = *reinterpret_cast<const float4*>(rows + static_cast<long long>(expert0 + wr) * d + base + wk);
-        if (expert0 + wr + 32 < e)
-            w1 = *reinterpret_cast<const float4*>(rows + static_cast<long long>(expert0 + wr + 32) * d + base + wk);
         __syncthreads();
-        const uint16_t* h = reinterpret_cast<const uint16_t*>(&xv);
+        // the staging: 8 activations of a row a load, 4 router weights of an expert a load
+        for (int q = threadIdx.x; q < TR * kStep / 8; q += 256) {
+            const int rr = q / (kStep / 8), kk = (q % (kStep / 8)) * 8;
+            uint4 v = {0, 0, 0, 0};
+            if (row0 + rr < r) v = *reinterpret_cast<const uint4*>(xh + static_cast<long long>(row0 + rr) * d + base + kk);
+            const uint16_t* h = reinterpret_cast<const uint16_t*>(&v);
 #pragma unroll
-        for (int j = 0; j < 8; ++j) xs[ak + j][ar] = KIND == 1 ? __half2float(__ushort_as_half(h[j])) : bf16_to_float(h[j]);
-        const float a0[4] = {w0.x, w0.y, w0.z, w0.w}, a1[4] = {w1.x, w1.y, w1.z, w1.w};
-#pragma unroll
-        for (int j = 0; j < 4; ++j) ws[wk + j][wr] = a0[j], ws[wk + j][wr + 32] = a1[j];
+            for (int j = 0; j < 8; ++j) xs[kk + j][rr] = KIND == 1 ? __half2float(__ushort_as_half(h[j])) : bf16_to_float(h[j]);
+        }
+        for (int q = threadIdx.x; q < TC * kStep / 4; q += 256) {
+            const int cc = q / (kStep / 4), kk = (q % (kStep / 4)) * 4;
+            float4 v = {0, 0, 0, 0};
+            if (expert0 + cc < e) v = *reinterpret_cast<const float4*>(rows + static_cast<long long>(expert0 + cc) * d + base + kk);
+            ws[kk][cc] = v.x, ws[kk + 1][cc] = v.y, ws[kk + 2][cc] = v.z, ws[kk + 3][cc] = v.w;
+        }
         __syncthreads();
-#pragma unroll
+#pragma unroll 4
         for (int i = 0; i < kStep; ++i) {
-            const float4 a = *reinterpret_cast<const float4*>(&xs[i][4 * ty]);
-            const float4 b = *reinterpret_cast<const float4*>(&ws[i][4 * tx]);
-            const float av[4] = {a.x, a.y, a.z, a.w}, bv[4] = {b.x, b.y, b.z, b.w};
+            float av[RT], bv[CT];
 #pragma unroll
-            for (int u = 0; u < 4; ++u)
+            for (int u = 0; u < RT; ++u) av[u] = xs[i][ty * RT + u];
 #pragma unroll
-                for (int w = 0; w < 4; ++w) acc[u][w] = fmaf(av[u], bv[w], acc[u][w]);
+            for (int w = 0; w < CT; ++w) bv[w] = ws[i][tx * CT + w];
+#pragma unroll
+            for (int u = 0; u < RT; ++u)
+#pragma unroll
+                for (int w = 0; w < CT; ++w) acc[u][w] = fmaf(av[u], bv[w], acc[u][w]);
         }
     }
 #pragma unroll
-    for (int u = 0; u < 4; ++u) {
-        const int row = row0 + 4 * ty + u;
+    for (int u = 0; u < RT; ++u) {
+        const int row = row0 + ty * RT + u;
         if (row >= r) continue;
 #pragma unroll
-        for (int w = 0; w < 4; ++w) {
-            const int expert = expert0 + 4 * tx + w;
+        for (int w = 0; w < CT; ++w) {
+            const int expert = expert0 + tx * CT + w;
             if (expert < e) logits[static_cast<long long>(row) * e + expert] = acc[u][w];
         }
     }
