@@ -149,7 +149,7 @@ fn expertParts(o: Ops, kind: Kind, r: Routed, x: Tensor, rows: usize, logits: u6
         const planned = rows <= 8 and try o.moeRouterSelect(x, r.rows16, r.done, logits, pick, wts, .{ .items = items, .members = members }, cap, rows, ex.dims, r.rows, r.top_k, tile);
         if (!planned) {
             if (!try o.moeRouterSelect(x, r.rows16, r.done, logits, pick, wts, null, 0, rows, ex.dims, r.rows, r.top_k, 0)) {
-                try o.moeRouter(x, r.rows32, logits, rows, ex.dims, r.rows);
+                try o.moeRouterPrompt(x, r.rows32, r.rows16, logits, rows, ex.dims, r.rows);
                 try o.moeSelect(logits, pick, wts, null, 0, rows, r.count(), r.top_k);
             }
             try o.moeRoute(pick, pairs, r.rows, tile, members, items, cap);

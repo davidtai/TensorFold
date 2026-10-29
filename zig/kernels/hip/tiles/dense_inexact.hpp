@@ -46,7 +46,9 @@ __device__ __forceinline__ u32x4 dequant8(uint32_t w, float s, float b) {
 }  // namespace dense_inexact
 
 // K: the product's K (a multiple of 64). bf16 x and tables, plain products; fp32 out, or bf16 (nearest even) with out16.
-template <int K>
+// BF16W: a.words are the weights already in bf16, (n, K) row major (a router's rows): a thread copies its 32 bf16 a
+// window (4 loads) where the affine weights dequantize 32 codes; the windows, LDS and WMMA chain are the same.
+template <int K, bool BF16W = false>
 __device__ __forceinline__ void wmma_dense_inexact_tile(const Affine& a) {
 #if TF_DEVICE_WMMA_GFX11
     using namespace dense_inexact;
@@ -86,6 +88,9 @@ __device__ __forceinline__ void wmma_dense_inexact_tile(const Affine& a) {
     uint4 wreg;
     uint16_t sreg;
     uint16_t breg;
+    // BF16W: the column's 32 bf16 of window w at 16-byte loads 8 w + 4 wg ..
+    const u32x4* w16src = reinterpret_cast<const u32x4*>(reinterpret_cast<const __bf16*>(a.words) + static_cast<long long>(col) * K) + wg * 4;
+    u32x4 w16reg[BF16W ? 4 : 1];
     // unconditional loads (a window past the last repeats it): no vmcnt(0) at the stash
     auto load = [&](int w) {
         const int wl = w < kWindows ? w : kWindows - 1;
@@ -94,9 +99,14 @@ __device__ __forceinline__ void wmma_dense_inexact_tile(const Affine& a) {
 #pragma unroll
             for (int v = 0; v < 4; ++v) xreg[i][v] = xsrc[i][wl * 8 + v];
         }
-        wreg = wsrc[2 * wl];
-        sreg = ssrc[2 * wl];
-        breg = bsrc[2 * wl];
+        if constexpr (BF16W) {
+#pragma unroll
+            for (int v = 0; v < 4; ++v) w16reg[v] = w16src[wl * 8 + v];
+        } else {
+            wreg = wsrc[2 * wl];
+            sreg = ssrc[2 * wl];
+            breg = bsrc[2 * wl];
+        }
     };
     auto stash = [&]() {
 #pragma unroll
@@ -105,12 +115,17 @@ __device__ __forceinline__ void wmma_dense_inexact_tile(const Affine& a) {
 #pragma unroll
             for (int v = 0; v < 4; ++v) xd[v] = xreg[i][v];
         }
-        const float s = __uint_as_float(static_cast<uint32_t>(sreg) << 16);
-        const float b = __uint_as_float(static_cast<uint32_t>(breg) << 16);
-        const uint32_t wv[4] = {wreg.x, wreg.y, wreg.z, wreg.w};
         u32x4* wd = reinterpret_cast<u32x4*>(ws + wcol * kLd + wg * 32);
+        if constexpr (BF16W) {
 #pragma unroll
-        for (int v = 0; v < 4; ++v) wd[v] = dequant8(wv[v], s, b);
+            for (int v = 0; v < 4; ++v) wd[v] = w16reg[v];
+        } else {
+            const float s = __uint_as_float(static_cast<uint32_t>(sreg) << 16);
+            const float b = __uint_as_float(static_cast<uint32_t>(breg) << 16);
+            const uint32_t wv[4] = {wreg.x, wreg.y, wreg.z, wreg.w};
+#pragma unroll
+            for (int v = 0; v < 4; ++v) wd[v] = dequant8(wv[v], s, b);
+        }
     };
     // wave (wm, wn): rows 64 wm.., columns 64 wn..; a lane: column lane % 16, rows 2 i + lane / 16
     const int wm = wave & 3;

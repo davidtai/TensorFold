@@ -25,6 +25,15 @@ pub fn moeRouter(o: Ops, x: Tensor, rows32: u64, logits: u64, r: usize, d: usize
     try o.l.tf_moe_router(p(x.ptr), @backingInt(x.kind), f(rows32), f(logits), int(r), int(d), int(e), o.stream);
 }
 
+/// A prompt's router logits: under numerics=inexact, bf16 x and the router's bf16 rows on the matrix cores (the sums'
+/// order changes, so near-tie picks may change); otherwise, and where that tile cannot, moeRouter's fp32 rows.
+pub fn moeRouterPrompt(o: Ops, x: Tensor, rows32: u64, rows16: u64, logits: u64, r: usize, d: usize, e: usize) Error!void {
+    if (o.prefill and o.inexact() and rows16 != 0 and x.kind == .bf16 and r >= 64) {
+        if (try o.l.affine.routerInexactGo(o.l.r, x.ptr, rows16, logits, int(r), int(e), int(d), o.stream)) return;
+    }
+    try moeRouter(o, x, rows32, logits, r, d, e);
+}
+
 /// The router's logits from bf16 rows and the pick of each row in one launch (decode, up to 16 rows), the plan too with
 /// `plan` (one row); false where the two launches run instead (prefill, no bf16 rows, the reference kernels).
 /// `tile`: the plan's pairs an item for 2 to 8 rows (tf_moe_route's), 0 for one row's own plan.

@@ -980,6 +980,54 @@ test "numerics=inexact: the dense tile with bf16-dequantized weights is within 4
     try promptDenseInexact(t, &rng, 1024, 1024, 2560);
 }
 
+test "numerics=inexact: a prompt's router logits on the matrix cores sit within fp32 sum rounding of float64 (513 x 2560)" {
+    const t = try Rig.open(1 << 20);
+    defer t.close();
+    if (t.on.affine.router_inexact == null or !t.bf16) return error.SkipZigTest;
+    var rng: rig.Rng = .{ .state = 0x510E527FADE682D1 };
+    const d: usize = 2560;
+    const e: usize = 513;
+    for ([_]usize{ 300, 64, 257 }) |rows| {
+        const hx = try gpa.alloc(u16, rows * d);
+        defer gpa.free(hx);
+        for (hx) |*v| v.* = rig.bf16Bits(rng.unit() * 2.0);
+        const hw = try gpa.alloc(u16, e * d);
+        defer gpa.free(hw);
+        for (hw) |*v| v.* = rig.bf16Bits(rng.unit() / 8.0);
+        var x = try t.upload(hx);
+        defer x.free();
+        var w = try t.upload(hw);
+        defer w.free();
+        var out = try t.alloc(rows * e * 4);
+        defer out.free();
+        try std.testing.expect(try t.on.affine.routerInexactGo(&t.r, at(x), at(w), at(out), @intCast(rows), @intCast(e), @intCast(d), t.stream.handle));
+        try t.stream.synchronize();
+        const got = try rig.download(f32, out);
+        defer gpa.free(got);
+        // every expert of every 7th row and the last: |got - sum| within 2^-14 of sum |x w| (2,560 fp32 adds in a chain
+        // of 16-wide WMMA steps), and an exact product a term (bf16 x bf16 fits fp32)
+        const wide = struct {
+            fn of(b: u16) f64 {
+                return @as(f32, @bitCast(@as(u32, b) << 16));
+            }
+        }.of;
+        for (0..rows) |r| if (r % 7 == 0 or r + 1 == rows) for (0..e) |c| {
+            var want: f64 = 0;
+            var mag: f64 = 0;
+            for (0..d) |k| {
+                const term = wide(hx[r * d + k]) * wide(hw[c * d + k]);
+                want += term;
+                mag += @abs(term);
+            }
+            const err = @abs(@as(f64, got[r * e + c]) - want);
+            if (err > mag * std.math.pow(f64, 2, -14) + 1e-30) {
+                std.debug.print("router inexact rows={d} ({d}, {d}): {e} where float64 gives {e} (sum |terms| {e})\n", .{ rows, r, c, got[r * e + c], want, mag });
+                return error.TestUnexpectedResult;
+            }
+        };
+    }
+}
+
 test "numerics=inexact: Flash Next's prompt expert tiles with bf16-dequantized weights are within 2-3 bf16 steps of the exact bytes" {
     const t = try Rig.open(1 << 20);
     defer t.close();

@@ -100,6 +100,13 @@ __global__ void __launch_bounds__(dense_inexact::kThreads) affine_wmma_dense_ine
     wmma_dense_inexact_tile<K>(a);
 }
 
+// numerics=inexact: a prompt's MoE router logits, x (m, K) bf16 times the router's bf16 rows (a.words: (n, K)), fp32
+// out, on the inexact dense tile (the weights copied, not dequantized). The sums' order is the WMMA chain's.
+template <int K>
+__global__ void __launch_bounds__(dense_inexact::kThreads) affine_wmma_router(Affine a) {
+    wmma_dense_inexact_tile<K, true>(a);
+}
+
 // ---- the decode stream tile ----
 
 // Up to four products sharing x, K, width and group in one launch; side s owns blocks [first[s], first[s + 1]).

@@ -362,6 +362,7 @@ template __global__ void affine_wmma_dense<6144>(Affine);
 template __global__ void affine_wmma_dense<10240>(Affine);
 template __global__ void affine_wmma_dense_inexact<2560>(Affine);
 template __global__ void affine_wmma_dense_inexact<6144>(Affine);
+template __global__ void affine_wmma_router<2560>(Affine);
 #else
 #define TF_WMMA(BITS)
 #endif

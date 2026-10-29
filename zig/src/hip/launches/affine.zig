@@ -206,6 +206,8 @@ pub const Kernels = struct {
     hc_gate_fill: ?Function,
     /// The same at each of inexact_ks with the codes dequantized to bf16 (tiles/dense_inexact.hpp); numerics=inexact.
     dense_inexact: [inexact_ks.len]?Function,
+    /// A prompt's MoE router (bf16 rows, K 2560) on the same tile, the weights copied (numerics=inexact).
+    router_inexact: ?Function,
     kp: [bit_widths.len][kp_tiles.len]Function,
     span: [2]Function,
     fold: Function,
@@ -250,6 +252,7 @@ pub const Kernels = struct {
         inline for (inexact_ks, 0..) |dk, i| {
             k.dense_inexact[i] = if (k.matrix) try tiles_obj.function(std.fmt.comptimePrint(r ++ "25affine_wmma_dense_inexactILi{d}EEEvNS0_6AffineE", .{dk})) else null;
         }
+        k.router_inexact = if (k.matrix) try tiles_obj.function(r ++ "18affine_wmma_routerILi2560EEEvNS0_6AffineE") else null;
         return k;
     }
 
@@ -707,6 +710,20 @@ pub const Kernels = struct {
     }
 
     /// numerics=inexact: a prompt's plain product with the codes dequantized to bf16 in the tile.
+    /// The K affine_wmma_router compiles.
+    pub const router_inexact_k = 2560;
+
+    /// logits (m, n) fp32 = x (m, 2560) bf16 . rows16 (n, 2560) bf16 on the inexact dense tile; false where it cannot.
+    pub fn routerInexactGo(k: *const Kernels, r: *const runtime.Runtime, x: u64, rows16: u64, logits: u64, m: c_int, n: c_int, d: c_int, s: abi.Stream) Error!bool {
+        const f = k.router_inexact orelse return false;
+        if (d != router_inexact_k or x % 16 != 0 or rows16 % 16 != 0) return false;
+        const a: Arg = .{ .x = x, .words = rows16, .scale = .{ .p = 0, .kind = 0 }, .bias = .{ .p = 0, .kind = 0 }, .out = logits, .m = m, .n = n, .k = d, .bits = 16, .group = 32, .fp16 = 0 };
+        var args: hl.Args = .{};
+        try args.add(a);
+        try go(r, f, .{ .x = cdiv(n, 128) * cdiv(m, 256) }, .{ .x = 256 }, s, &args);
+        return true;
+    }
+
     pub fn denseInexactGo(k: *const Kernels, r: *const runtime.Runtime, a: Arg, s: abi.Stream) Error!void {
         const f = k.dense_inexact[inexactIndex(a.k) orelse return refuse("inexact dense K")] orelse return refuse("inexact dense tile");
         var args: hl.Args = .{};
