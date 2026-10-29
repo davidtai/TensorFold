@@ -658,6 +658,15 @@ const own_records = [_]Record{
         },
     },
     .{
+        .launch = .{ .name = "prompt expert down inexact bf16-slot tile 4-bit", .symbol = "_ZN2tf4rocm30affine_wmma_moe_down_inexact16ILi4EEEvNS0_6AffineE", .image = "affine_tiles", .threads = 256, .served = limits.gfx11_only },
+        .usage = .{
+            .{ .vgprs = 0, .sgprs = 0, .lds = 0, .private = 0, .bound = 256, .wave = 32 },
+            .{ .vgprs = 197, .sgprs = 31, .lds = 36864, .private = 0, .bound = 256, .wave = 32 },
+            .{ .vgprs = 196, .sgprs = 31, .lds = 36864, .private = 0, .bound = 256, .wave = 32 },
+            .{ .vgprs = 0, .sgprs = 0, .lds = 0, .private = 0, .bound = 256, .wave = 32 },
+        },
+    },
+    .{
         .launch = .{ .name = "Flash Next prompt sparse attention tile", .symbol = "tf_fn_sparse_prompt", .image = "flashnext", .threads = 128, .served = limits.gfx11_only },
         .usage = .{
             .{ .vgprs = 0, .sgprs = 0, .lds = 0, .private = 0, .bound = 128, .wave = 32 },
