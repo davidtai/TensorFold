@@ -364,10 +364,34 @@ pub fn affineRoutedAct(o: Ops, x: Tensor, w: Affine, items: u64, count: usize, m
         if (!try z.affine.moeGateUp(z.r, arg, int(count), limit, o.stream)) return error.BadShape;
         return .{ .ptr = arg.out16, .kind = x.kind };
     }
+    if (!routedActTakes(o, x, w, rows)) return null;
+    const out = try o.arena.take(pairs * (w.n / 2) * 2);
+    if (!try routedActDecode(o, x, w, items, count, members, x_div, rows, limit, out)) return null;
+    return .{ .ptr = out, .kind = x.kind };
+}
+
+/// Whether a decode window's routed gate+up with its activation takes the pair tile into a given buffer (B-5).
+pub fn projectRoutedActTakes(o: Ops, x: Tensor, proj: Projection, rows: usize) bool {
+    const w = switch (proj.handle) {
+        .mlx => |h| affineOf(proj, h),
+        .dense => return false,
+    };
+    if (!o.fused() or o.prefill or x.kind == .f32 or w.n % 2 != 0) return false;
+    return routedActTakes(o, x, w, rows);
+}
+
+/// Whether a decode window's routed gate+up with its activation takes the pair tile (affineRoutedAct's decode rule).
+fn routedActTakes(o: Ops, x: Tensor, w: Affine, rows: usize) bool {
     var shape = shapeOf(o, x, w, rows);
     shape.pairs = true;
-    if (z.affine.choose(.routed_act, .decode, shape) == null) return null;
-    const out = try o.arena.take(pairs * (w.n / 2) * 2);
+    return o.l.affine.choose(.routed_act, .decode, shape) != null;
+}
+
+/// affineRoutedAct's decode launch into `out` (pairs x n / 2 of x's kind): `count` items of the plan. False where the
+/// pair tile does not take it (nothing launched).
+fn routedActDecode(o: Ops, x: Tensor, w: Affine, items: u64, count: usize, members: u64, x_div: usize, rows: usize, limit: f32, out: u64) Error!bool {
+    const z = o.l;
+    const kind = w.tables.table();
     const arg: affine_launch.Arg = .{
         .x = x.ptr,
         .words = w.words,
@@ -383,8 +407,21 @@ pub fn affineRoutedAct(o: Ops, x: Tensor, w: Affine, items: u64, count: usize, m
         .route = .{ .items = items, .members = members, .x_div = int(x_div) },
         .out16 = out,
     };
-    if (!try z.affine.pairRun(z.r, arg, limit, int(count), o.stream)) return null;
-    return .{ .ptr = out, .kind = x.kind };
+    return z.affine.pairRun(z.r, arg, limit, int(count), o.stream);
+}
+
+/// A decode window's routed gate+up with its activation into a given `out` (B-5: the shared expert's item on the side
+/// stream and the routed items on the main stream write one act buffer, each pair's rows once). False where the pair
+/// tile does not take the shape (nothing launched).
+pub fn projectRoutedActInto(o: Ops, x: Tensor, proj: Projection, items: u64, count: usize, members: u64, x_div: usize, rows: usize, limit: f32, out: u64) Error!bool {
+    const w = switch (proj.handle) {
+        .mlx => |h| affineOf(proj, h),
+        .dense => return false,
+    };
+    if (!o.fused() or o.prefill or x.kind == .f32 or w.n % 2 != 0) return false;
+    try w.check();
+    if (!routedActTakes(o, x, w, rows)) return false;
+    return routedActDecode(o, x, w, items, count, members, x_div, rows, limit, out);
 }
 
 /// matmul_routed: every item (expert, first, count) in one launch over stacked weights; out (pairs, N) fp32.

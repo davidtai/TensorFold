@@ -4,6 +4,7 @@ const std = @import("std");
 const ops = @import("ops/ops.zig");
 
 const Ops = ops.Ops;
+const counting = @import("launches/util.zig").counting;
 const Tensor = ops.Tensor;
 const Kind = ops.Kind;
 const Projection = ops.Projection;
@@ -34,6 +35,9 @@ pub const Routed = struct {
     rows16: u64 = 0,
     /// A u32, zero between launches, that the one-launch router and pick counts its finished blocks in.
     done: u64 = 0,
+    /// B-5: int32 [8][3] then [8]: for r = 1..8 rows the shared expert's one-item plan (shared id, 0, r) and its members
+    /// (row j's shared pair, j * slots + top_k); 0: the shared expert stays in the routed launches.
+    shared_plan: u64 = 0,
 
     /// Routed experts, the shared one not counted.
     pub fn count(r: Routed) usize {
@@ -83,7 +87,7 @@ pub fn run(o: Ops, kind: Kind, r: Routed, x: Tensor, rows: usize, prefill: bool)
     const logits = try o.arena.of(f32, rows * r.rows);
     const pick = try o.arena.of(i32, size * slots);
     const wts = try o.arena.of(f32, size * slots);
-    const items = try o.arena.of(i32, cap * 3);
+    const items = try o.arena.of(i32, (cap + 1) * 3);
     const members = try o.arena.of(i32, size * slots);
     const count: usize = cap;
     var tile: usize = undefined;
@@ -122,14 +126,27 @@ pub fn parts(o: Ops, kind: Kind, r: Routed, x: Tensor, rows: usize) ops.Error!Pa
     const logits = try o.arena.of(f32, rows * r.rows);
     const pick = try o.arena.of(i32, size * slots);
     const wts = try o.arena.of(f32, size * slots);
-    const items = try o.arena.of(i32, cap * 3);
+    const items = try o.arena.of(i32, (cap + 1) * 3);
     const members = try o.arena.of(i32, size * slots);
     const p = try expertParts(o, kind, r, x, rows, logits, pick, wts, items, members, cap);
     return .{ .y = p.y, .wts = wts, .slots = slots };
 }
 
+/// The shared expert's plan for `rows` rows in `plan` (Routed.shared_plan's layout), written once at load.
+pub fn sharedPlanWords(top_k: usize, shared: usize) [8 * 3 + 8]i32 {
+    var w: [8 * 3 + 8]i32 = undefined;
+    for (0..8) |i| {
+        w[i * 3] = @intCast(shared);
+        w[i * 3 + 1] = 0;
+        w[i * 3 + 2] = @intCast(i + 1);
+        w[24 + i] = @intCast(i * (top_k + 1) + top_k);
+    }
+    return w;
+}
+
 /// Select, plan, gate and up, the activation and down: the rows' slots before the combine.
 fn expertParts(o: Ops, kind: Kind, r: Routed, x: Tensor, rows: usize, logits: u64, pick: u64, wts: u64, items: u64, members: u64, cap: usize) ops.Error!struct { y: u64 } {
+    if (try apartParts(o, kind, r, x, rows, logits, pick, wts, items, members, cap)) |y| return .{ .y = y };
     const ex = r.experts;
     const slots = r.top_k + 1;
     const pairs = rows * slots;
@@ -225,4 +242,42 @@ test "the routed products take the decode tile below 64 rows and in a lane round
     try std.testing.expectEqual(@as(usize, BLOCK_ROWS), tileFor(o, 2048));
     try std.testing.expectEqual(@as(usize, LANE_ROWS), tileFor(round, BLOCK_FROM));
     try std.testing.expectEqual(@as(usize, LANE_ROWS), tileFor(round, 2048));
+}
+
+/// B-5: a decode window's MoE with the shared expert's gate+up on the side stream (Ops.fork / join), beside the router:
+/// its one-item static plan (Routed.shared_plan), the same pair tile at the same rows, into the act buffer the routed
+/// items write, so every pair's act rows, the down and the combine are as in expertParts. The routed gate+up leaves the
+/// shared item out: at 1 row it is the plan's last item (select_row's k = top_k); at 2 to 8 rows the router's plan puts
+/// it in the extra slot `cap` (route_plan's `apart`), and the down takes it there. Null (nothing launched) where the
+/// shape keeps expertParts.
+fn apartParts(o: Ops, kind: Kind, r: Routed, x: Tensor, rows: usize, logits: u64, pick: u64, wts: u64, items: u64, members: u64, cap: usize) ops.Error!?u64 {
+    const ex = r.experts;
+    const slots = r.top_k + 1;
+    const pairs = rows * slots;
+    if (r.shared_plan == 0 or !o.window or o.prefill or !o.fused() or o.side.stream == null or o.side.ring == null) return null;
+    if (rows < 1 or rows > LANE_ROWS or kind == .f32 or x.kind == .f32) return null;
+    const tile: usize = if (rows == 1) 1 else tileFor(o, rows);
+    if (rows > tile or !o.routedActTakes(x, ex.fused, rows)) return null;
+    const act = try o.arena.take(pairs * ex.width * kind.size());
+    const plan_items = r.shared_plan + (rows - 1) * 3 * 4;
+    const plan_members = r.shared_plan + 24 * 4;
+    // the side branch starts here (x is written); the router, its pick and plan run on the main stream meanwhile
+    try o.fork();
+    const planned = try o.moeRouterSelect(x, r.rows16, r.done, logits, pick, wts, .{ .items = items, .members = members, .apart = rows > 1 }, cap, rows, ex.dims, r.rows, r.top_k, if (rows == 1) 0 else tile);
+    if (!planned) {
+        // nothing was launched: an empty branch, and expertParts takes the call
+        try o.join();
+        return null;
+    }
+    // the dry run (the counting stream) counts the side launch as one of its own
+    var side = o;
+    if (o.stream != counting) side.stream = o.side.stream;
+    if (!try side.projectRoutedActInto(x, ex.fused, plan_items, 1, plan_members, slots, rows, ex.limit, act)) return error.BadShape;
+    // the routed items: at 1 row the plan's first top_k (the shared expert is its last item), at 2-8 rows slots 0..cap
+    const routed = if (rows == 1) slots - 1 else cap;
+    if (!try o.projectRoutedActInto(x, ex.fused, items, routed, members, slots, rows, ex.limit, act)) return error.BadShape;
+    // the down reads the shared expert's act rows: the branch joins here
+    try o.join();
+    const all = if (rows == 1) slots else cap + 1;
+    return try o.projectRouted(.{ .ptr = act, .kind = kind }, ex.down, items, all, members, pairs, 1, rows);
 }

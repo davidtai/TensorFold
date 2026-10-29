@@ -189,6 +189,11 @@ const Loader = struct {
             // a decode step's router and pick in one launch read the bf16 rows (the same values as rows32)
             .rows16 = (try u.tensor(r.router)).ptr,
             .done = (try u.tensor(.{ .dtype = .u32, .rank = 1, .shape = .{ 1, 1, 1, 1, 1 }, .bytes = &[_]u8{ 0, 0, 0, 0 } })).ptr,
+            // B-5: the shared expert's one-item plans at 1-8 rows and their members (a single rank's whole experts)
+            .shared_plan = if (r.remap == null) blk: {
+                const words = hip.moe.sharedPlanWords(r.top_k, r.router.shape[0] - 1);
+                break :blk (try u.tensor(.{ .dtype = .i32, .rank = 1, .shape = .{ words.len, 1, 1, 1, 1 }, .bytes = std.mem.sliceAsBytes(&words) })).ptr;
+            } else 0,
             .experts = .{
                 .fused = try quant.view(try quant.upload(u, r.experts.fused), true),
                 .down = try quant.view(try quant.upload(u, r.experts.down), true),

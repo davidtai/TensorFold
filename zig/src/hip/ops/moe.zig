@@ -37,9 +37,9 @@ pub fn moeRouterPrompt(o: Ops, x: Tensor, rows32: u64, rows16: u64, logits: u64,
 /// The router's logits from bf16 rows and the pick of each row in one launch (decode, up to 16 rows), the plan too with
 /// `plan` (one row); false where the two launches run instead (prefill, no bf16 rows, the reference kernels).
 /// `tile`: the plan's pairs an item for 2 to 8 rows (tf_moe_route's), 0 for one row's own plan.
-pub fn moeRouterSelect(o: Ops, x: Tensor, rows16: u64, done: u64, logits: u64, pick: u64, wts: u64, plan: ?struct { items: u64, members: u64 }, capacity: usize, r: usize, d: usize, e: usize, top_k: usize, tile: usize) Error!bool {
+pub fn moeRouterSelect(o: Ops, x: Tensor, rows16: u64, done: u64, logits: u64, pick: u64, wts: u64, plan: ?struct { items: u64, members: u64, apart: bool = false }, capacity: usize, r: usize, d: usize, e: usize, top_k: usize, tile: usize) Error!bool {
     if (o.prefill or rows16 == 0) return false;
-    return o.l.routerSelect(p(x.ptr), @backingInt(x.kind), @ptrFromInt(rows16), f(logits), i(pick), f(wts), if (plan) |pl| i(pl.items) else null, if (plan) |pl| i(pl.members) else null, int(capacity), int(r), int(d), int(e), int(top_k), int(tile), done, o.stream);
+    return o.l.routerSelect(p(x.ptr), @backingInt(x.kind), @ptrFromInt(rows16), f(logits), i(pick), f(wts), if (plan) |pl| i(pl.items) else null, if (plan) |pl| i(pl.members) else null, int(capacity), int(r), int(d), int(e), int(top_k), int(tile), done, if (plan) |pl| pl.apart else false, o.stream);
 }
 
 /// The pick rule per row; with `plan` (one row) it also writes the plan's items and members.

@@ -56,11 +56,14 @@ pub fn routerWindow(l: *const Launcher, x: C, kind: c_int, rows: CF, logits: F, 
 /// A decode call's router logits from bf16 rows and the pick of each row (tf_select_decode's) in one launch, the plan too
 /// when `items` is given: one row's own, or for 2 to 8 rows tf_moe_route's at `tile` pairs an item; false (nothing
 /// launched) where the shape keeps the router and the pick apart. `done` is a u32 that is zero between launches.
-pub fn routerSelect(l: *const Launcher, x: C, kind: c_int, rows16: C, logits: F, pick: I, wts: F, items: I, members: I, capacity: c_int, r: c_int, d: c_int, e: c_int, top_k: c_int, tile: c_int, done: u64, s: S) Error!bool {
+/// `apart` (B-5, 2 to 8 rows with a plan, at most `tile` rows): the plan leaves the shared expert (the last of `e`) out of
+/// slots 0..capacity and writes its one item to slot `capacity` (`items` holds capacity + 1).
+pub fn routerSelect(l: *const Launcher, x: C, kind: c_int, rows16: C, logits: F, pick: I, wts: F, items: I, members: I, capacity: c_int, r: c_int, d: c_int, e: c_int, top_k: c_int, tile: c_int, done: u64, apart: bool, s: S) Error!bool {
     if (!l.fuse or done == 0 or r < 1 or r > 16 or @rem(d, 4) != 0 or ad(rows16) % 8 != 0 or ad(x) % 8 != 0) return false;
     if (e - 1 > 1024 or top_k < 1 or top_k > 31) return false;
     // the plan in the launch: one row, or 2 to 8 rows of at most plan_pairs pairs (route_plan's pair a thread)
     if (items != null and r != 1 and (r > 8 or r * (top_k + 1) > plan_pairs or tile < 1)) return false;
+    if (apart and (items == null or r < 2 or r > tile)) return invalid("router select apart");
     var a: Args = .{};
     try a.add(ad(x));
     try a.add(ad(rows16));
@@ -78,6 +81,7 @@ pub fn routerSelect(l: *const Launcher, x: C, kind: c_int, rows16: C, logits: F,
     const sh = routerShared(ad(x), r, d, e, items != null);
     try a.add(@as(c_int, @intFromBool(sh.staged)));
     try a.add(done);
+    try a.add(@as(c_int, @intFromBool(apart)));
     try l.go(l.dec.router_select[if (kind == 1) 0 else 1], dim(cdiv(e, 4), 1, 1), dim(128, 1, 1), sh.bytes, s, &a);
     return true;
 }

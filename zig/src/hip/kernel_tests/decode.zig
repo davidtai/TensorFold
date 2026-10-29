@@ -118,7 +118,10 @@ fn tails(t: *Rig, rng: *rig.Rng, rows: usize, width: usize, slots: usize) !void 
 
 /// The router over bf16 rows and the pick in one launch against tf_moe_router over the widened rows and tf_select_decode
 /// (and tf_moe_route for 2 to 8 rows): the same logits, picks, weights and plan, byte for byte; `ties` copies expert rows
-/// so logits tie. The plan of 2 to 8 rows is the window's (tile 8, the decode tile's rows).
+/// so logits tie. The plan of 2 to 8 rows is the window's (tile 8, the decode tile's rows). B-5: at 2 to 8 rows the one
+/// launch with `apart` gives the same logits, picks, weights and members (every pair's index, so the down and the combine
+/// read the same rows), the same routed items in the same slots with the shared expert's item out of them, and that item
+/// in the extra slot `cap`.
 fn routerSelect(t: *Rig, rng: *rig.Rng, rows: usize, d: usize, e: usize, top_k: usize, ties: bool) !void {
     const slots = top_k + 1;
     const cap: usize = 16 * slots + 16 * slots / 8;
@@ -140,10 +143,12 @@ fn routerSelect(t: *Rig, rng: *rig.Rng, rows: usize, d: usize, e: usize, top_k: 
     defer w32.free();
     var done = try t.upload(@as([]const u32, &.{0}));
     defer done.free();
-    const sizes = [_]usize{ rows * e * 4, rows * slots * 4, rows * slots * 4, cap * 12, rows * slots * 4 };
-    var got: [3][5][]u8 = undefined;
-    // 0: the two launches; 1 and 2: the one launch twice (its block counter is zero again after each)
-    for (0..3) |v| {
+    const sizes = [_]usize{ rows * e * 4, rows * slots * 4, rows * slots * 4, (cap + 1) * 12, rows * slots * 4 };
+    var got: [4][5][]u8 = undefined;
+    const apart = rows >= 2 and rows <= 8;
+    const runs: usize = if (apart) 4 else 3;
+    // 0: the two launches; 1 and 2: the one launch twice (its block counter is zero again after each); 3: B-5's apart plan
+    for (0..runs) |v| {
         var bufs: [5]@import("../memory.zig").DeviceBuffer = undefined;
         for (&bufs, sizes) |*b, n| {
             b.* = try t.alloc(n);
@@ -164,13 +169,45 @@ fn routerSelect(t: *Rig, rng: *rig.Rng, rows: usize, d: usize, e: usize, top_k: 
             try t.on.tf_moe_select(@ptrFromInt(at(bufs[0])), @ptrFromInt(at(bufs[1])), @ptrFromInt(at(bufs[2])), if (one) items else null, if (one) members else null, @intCast(cap), @intCast(rows), @intCast(e - 1), @intCast(top_k), s);
             if (planned and !one) try t.on.tf_moe_route(@ptrFromInt(at(bufs[1])), @intCast(rows * slots), @intCast(e), @intCast(tile), members, items, @intCast(cap), s);
         } else {
-            try std.testing.expect(try t.on.routerSelect(p(x), t.kind(), p(w16), @ptrFromInt(at(bufs[0])), @ptrFromInt(at(bufs[1])), @ptrFromInt(at(bufs[2])), items, members, @intCast(cap), @intCast(rows), @intCast(d), @intCast(e), @intCast(top_k), @intCast(tile), at(done), s));
+            try std.testing.expect(try t.on.routerSelect(p(x), t.kind(), p(w16), @ptrFromInt(at(bufs[0])), @ptrFromInt(at(bufs[1])), @ptrFromInt(at(bufs[2])), items, members, @intCast(cap), @intCast(rows), @intCast(d), @intCast(e), @intCast(top_k), @intCast(tile), at(done), v == 3, s));
         }
         try t.stream.synchronize();
         for (&got[v], bufs) |*g, b| g.* = try rig.download(u8, b);
     }
-    defer for (&got) |*g| for (g) |b| gpa.free(b);
+    defer for (got[0..runs]) |*g| for (g) |b| gpa.free(b);
+    if (apart) {
+        // logits, picks, weights and members: the same bytes
+        for ([_]usize{ 0, 1, 2, 4 }) |k| if (!std.mem.eql(u8, got[0][k], got[3][k])) {
+            std.debug.print("router+pick apart rows={d} ties={}: buffer {d} differs\n", .{ rows, ties, k });
+            return error.TestUnexpectedResult;
+        };
+        const want: []align(1) const i32 = std.mem.bytesAsSlice(i32, got[0][3]);
+        const have: []align(1) const i32 = std.mem.bytesAsSlice(i32, got[3][3]);
+        const shared: i32 = @intCast(e - 1);
+        var n: usize = 0; // have's live routed items so far
+        var shared_item: ?[3]i32 = null;
+        for (0..cap) |slot| {
+            const item = [3]i32{ want[3 * slot], want[3 * slot + 1], want[3 * slot + 2] };
+            if (item[2] <= 0) continue;
+            if (item[0] == shared) {
+                shared_item = item;
+                continue;
+            }
+            try std.testing.expectEqualSlices(i32, &item, have[3 * n ..][0..3]);
+            n += 1;
+        }
+        for (n..cap) |slot| try std.testing.expectEqual(@as(i32, 0), have[3 * slot + 2]);
+        try std.testing.expectEqualSlices(i32, &shared_item.?, have[3 * cap ..][0..3]);
+    }
     for (1..3) |v| for (0..5) |k| {
+        if (k == 3 and v != 0) {
+            // the extra slot is B-5's; the plan's capacity slots compare as before
+            if (!std.mem.eql(u8, got[0][k][0 .. cap * 12], got[v][k][0 .. cap * 12])) {
+                std.debug.print("router+pick rows={d} ties={} run {d}: buffer {d} differs\n", .{ rows, ties, v, k });
+                return error.TestUnexpectedResult;
+            }
+            continue;
+        }
         if (!std.mem.eql(u8, got[0][k], got[v][k])) {
             std.debug.print("router+pick rows={d} ties={} run {d}: buffer {d} differs\n", .{ rows, ties, v, k });
             return error.TestUnexpectedResult;
@@ -305,7 +342,7 @@ fn servedPlan(t: *Rig, rng: *rig.Rng, rows: usize, slots: usize, cap: usize, pic
             try t.on.tf_moe_select(@ptrFromInt(at(bufs[0])), @ptrFromInt(at(bufs[1])), @ptrFromInt(at(bufs[2])), if (one) it else null, if (one) mem else null, @intCast(cap), @intCast(rows), @intCast(e - 1), @intCast(top_k), s);
             if (!one) try t.on.tf_moe_route(@ptrFromInt(at(bufs[1])), @intCast(rows * slots), @intCast(e), @intCast(tile), mem, it, @intCast(cap), s);
         } else {
-            try std.testing.expect(try t.on.routerSelect(p(x), t.kind(), p(w16), @ptrFromInt(at(bufs[0])), @ptrFromInt(at(bufs[1])), @ptrFromInt(at(bufs[2])), it, mem, @intCast(cap), @intCast(rows), @intCast(d), @intCast(e), @intCast(top_k), @intCast(tile), at(done), s));
+            try std.testing.expect(try t.on.routerSelect(p(x), t.kind(), p(w16), @ptrFromInt(at(bufs[0])), @ptrFromInt(at(bufs[1])), @ptrFromInt(at(bufs[2])), it, mem, @intCast(cap), @intCast(rows), @intCast(d), @intCast(e), @intCast(top_k), @intCast(tile), at(done), false, s));
         }
         try t.stream.synchronize();
         for (&got[v], bufs) |*g, b| g.* = try rig.download(u8, b);
