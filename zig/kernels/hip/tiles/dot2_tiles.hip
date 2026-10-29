@@ -386,9 +386,8 @@ template __global__ void affine_wmma_dense_inexact<6144>(Affine);
 template __global__ void affine_dot2_stream_list<Dot, 4, 4, 2, true>(Affine, StreamSides, int, int, int);
 template __global__ void affine_dot2_stream_list<Dot, 4, 4, 4, false>(Affine, StreamSides, int, int, int);
 
-// the held-codes plain tile (D-27) at 4-bit: 2 and 4 rows at the waves rule's columns, 8 rows at CB 2 and 4
+// the held-codes plain tile (D-27) at 4-bit: 4 rows at the waves rule's columns, 8 rows at CB 2 and 4
 #define TF_HELD(R, CB) template __global__ void affine_dot2_stream_held<Dot, 4, R, CB>(Affine, StreamSides, int, int);
-TF_HELD(2, 1) TF_HELD(2, 2) TF_HELD(2, 4) TF_HELD(2, 8)
 TF_HELD(4, 1) TF_HELD(4, 2) TF_HELD(4, 4)
 TF_HELD(8, 2) TF_HELD(8, 4)
 

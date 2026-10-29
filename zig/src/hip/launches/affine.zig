@@ -109,31 +109,33 @@ pub const stream_list_blocks = 16;
 pub const stream_one_col_n = 20_000;
 
 /// Where an unrouted plain product takes the held-codes tile (D-27; stream bench bench14 on gfx1151, the bytes of
-/// today's tile): 4-bit at 2 to 4 rows on the rule's columns (`cb`, row tile `ri`); at 5 to 8 rows in one 8-row pass,
+/// today's tile): 4-bit at 3 and 4 rows on the rule's columns (`cb`, the 4-row tile); at 5 to 8 rows in one 8-row pass,
 /// at CB 4 from held_wide_n columns (Flash Next's in-proj 16,480 and lm_head) and at CB 2 over (held_narrow_lo,
-/// held_narrow_hi] (out-proj and attention out, 2,560). Attention in (13,952) and hc down keep two 4-row passes.
+/// held_narrow_hi] (out-proj and attention out, 2,560). Attention in (13,952) and hc down keep two 4-row passes, and
+/// 2 rows keep the 2-row tile (served, the held 2-row tile was 5-7 us slower on in-proj and attention in: spec79).
 pub const HeldPick = struct { r: usize, c: usize, rows: c_int };
 pub const held_wide_n = 16_000;
 pub const held_narrow_lo = 1_000;
 pub const held_narrow_hi = 4_096;
-pub fn heldPick(bits: c_int, m: c_int, total_n: c_int, cb: c_int, ri: usize) ?HeldPick {
-    if (bits != 4 or m < 2 or m > 8) return null;
+pub fn heldPick(bits: c_int, m: c_int, total_n: c_int, cb: c_int) ?HeldPick {
+    if (bits != 4 or m < 3 or m > 8) return null;
     const ci = std.mem.indexOfScalar(c_int, &stream_cbs, cb) orelse return null;
-    if (m <= 4) return .{ .r = ri - 1, .c = ci, .rows = stream_rows[ri] };
-    if (total_n >= held_wide_n) return .{ .r = 2, .c = 2, .rows = 8 };
-    if (total_n > held_narrow_lo and total_n <= held_narrow_hi) return .{ .r = 2, .c = 1, .rows = 8 };
+    if (m <= 4) return if (cb <= 4) .{ .r = 0, .c = ci, .rows = 4 } else null;
+    if (total_n >= held_wide_n) return .{ .r = 1, .c = 2, .rows = 8 };
+    if (total_n > held_narrow_lo and total_n <= held_narrow_hi) return .{ .r = 1, .c = 1, .rows = 8 };
     return null;
 }
 
-test "heldPick: the held tile at 2 to 4 rows on the rule's columns, at 5 to 8 rows by width" {
-    try std.testing.expectEqual(@as(?HeldPick, null), heldPick(4, 1, 16480, 1, 0));
-    try std.testing.expectEqual(@as(?HeldPick, .{ .r = 0, .c = 3, .rows = 2 }), heldPick(4, 2, 248320, 8, 1));
-    try std.testing.expectEqual(@as(?HeldPick, .{ .r = 1, .c = 0, .rows = 4 }), heldPick(4, 3, 2560, 1, 2));
-    try std.testing.expectEqual(@as(?HeldPick, .{ .r = 2, .c = 2, .rows = 8 }), heldPick(4, 6, 16480, 4, 2));
-    try std.testing.expectEqual(@as(?HeldPick, .{ .r = 2, .c = 1, .rows = 8 }), heldPick(4, 8, 2560, 1, 2));
-    try std.testing.expectEqual(@as(?HeldPick, null), heldPick(4, 5, 13952, 4, 2));
-    try std.testing.expectEqual(@as(?HeldPick, null), heldPick(4, 7, 324, 1, 2));
-    try std.testing.expectEqual(@as(?HeldPick, null), heldPick(8, 3, 2560, 1, 2));
+test "heldPick: the held tile at 3 and 4 rows on the rule's columns, at 5 to 8 rows by width" {
+    try std.testing.expectEqual(@as(?HeldPick, null), heldPick(4, 1, 16480, 1));
+    try std.testing.expectEqual(@as(?HeldPick, null), heldPick(4, 2, 248320, 8));
+    try std.testing.expectEqual(@as(?HeldPick, .{ .r = 0, .c = 0, .rows = 4 }), heldPick(4, 3, 2560, 1));
+    try std.testing.expectEqual(@as(?HeldPick, .{ .r = 0, .c = 2, .rows = 4 }), heldPick(4, 4, 16480, 4));
+    try std.testing.expectEqual(@as(?HeldPick, .{ .r = 1, .c = 2, .rows = 8 }), heldPick(4, 6, 16480, 4));
+    try std.testing.expectEqual(@as(?HeldPick, .{ .r = 1, .c = 1, .rows = 8 }), heldPick(4, 8, 2560, 1));
+    try std.testing.expectEqual(@as(?HeldPick, null), heldPick(4, 5, 13952, 4));
+    try std.testing.expectEqual(@as(?HeldPick, null), heldPick(4, 7, 324, 1));
+    try std.testing.expectEqual(@as(?HeldPick, null), heldPick(8, 3, 2560, 1));
 }
 
 /// The K-parallel tiles of a short prompt: cb columns a lane set, r rows a pass over up to rb row blocks.
@@ -183,9 +185,9 @@ pub const Kernels = struct {
     stream_on: bool,
     /// A test's forced columns a lane (a stream_cbs value; 0: the rule), where the shape takes it.
     stream_cb_force: c_int,
-    /// The held-codes plain tile at 4-bit (stream.hpp stream_body's HELD) by rows (2, 4, 8) and columns a lane
+    /// The held-codes plain tile at 4-bit (stream.hpp stream_body's HELD) by rows (4, 8) and columns a lane
     /// (stream_cbs; null where not built): `heldPick` says which products take it.
-    held: [3][stream_cbs.len]?Function,
+    held: [2][stream_cbs.len]?Function,
     block: [bit_widths.len]Function,
     gemm: [bit_widths.len]Function,
     wmma_gemm: [bit_widths.len]Function,
@@ -253,9 +255,9 @@ pub const Kernels = struct {
 
     fn resolve(k: *Kernels, comptime dot: []const u8, comptime shape: []const u8, m: Module) Error!void {
         @setEvalBranchQuota(400_000);
-        inline for (.{ 2, 4, 8 }, 0..) |rows, r| {
+        inline for (.{ 4, 8 }, 0..) |rows, r| {
             inline for (stream_cbs, 0..) |cb, c| {
-                k.held[r][c] = if ((rows < 8 and cb * rows <= 16) or (rows == 8 and (cb == 2 or cb == 4)))
+                k.held[r][c] = if ((rows == 4 and cb <= 4) or (rows == 8 and (cb == 2 or cb == 4)))
                     try m.function(std.fmt.comptimePrint("_ZN2tf4rocm23affine_dot2_stream_heldINS0_{s}ELi4ELi{d}ELi{d}EEEvNS0_6AffineENS0_11StreamSidesEii", .{ dot, rows, cb }))
                 else
                     null;
@@ -469,7 +471,7 @@ pub const Kernels = struct {
             pick = i;
         }
         if (a.route.items == 0 and pair_div == 1 and !relu2) {
-            if (heldPick(a.bits, a.m, total_n, stream_cbs[pick], ri)) |hp| {
+            if (heldPick(a.bits, a.m, total_n, stream_cbs[pick])) |hp| {
                 if (k.held[hp.r][hp.c]) |f| return heldGo(r, f, a, sides_in, total_n, items, s, lpc_log2, hp.rows, stream_cbs[hp.c]);
             }
         }
