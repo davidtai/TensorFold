@@ -436,7 +436,13 @@ extern "C" __global__ void tf_fn_sparse_merge_gate(const float* parts_o, const f
 //        64 dims (32 lanes x 4 bytes over 512 bytes: 4 lines, against 8 loads of 32 lines); each lane then holds dims
 //        2 lane, 2 lane + 1 of all 32 cells, written to vt as two rows of 16-byte stores (no 2-byte transpose).
 // LDS, launch and outputs are tf_fn_sparse_prompt_hi's.
-template <bool KCO, bool VT, bool PARTS = false, bool LO = false>
+// W2 Q4 arms (w2/proto-q4, never merged; picks come in aligned 4-token blocks, 100 % of the served lists):
+//   V16 (Q4-1): QL-3's V layout read with 16-byte loads: a lane (dim pair) takes a picked block's 4 tokens at once,
+//        8 loads a chunk of 4 lines each (QL-3: 32 four-byte loads), then QL-3's 16-byte stores to vt.
+//   KBLK (Q4-2): K in the cache in 4-token blocks of 16-dim groups: block b, group dg holds the 4 tokens' 16 dims
+//        (128 bytes): element ((g cap / 4 + b) 16 + dg) 64 + (key % 4) 16 + d % 16. The same 16 loads a chunk, a lane
+//        a key as today, 4 lines a load against 16.
+template <bool KCO, bool VT, bool PARTS = false, bool LO = false, bool V16 = false, bool KBLK = false>
 __device__ void w4_sparse_ql(const float* __restrict__ q, const uint16_t* __restrict__ k, const uint16_t* __restrict__ v,
                              const int* __restrict__ ids, long long id_stride, const int* __restrict__ count,
                              const int* __restrict__ sparse, const uint16_t* qg, void* out, float* parts_ms,
@@ -504,6 +510,18 @@ __device__ void w4_sparse_ql(const float* __restrict__ q, const uint16_t* __rest
                 const int kr = __shfl(key, 4 * i + (lane >> 3), 32);
                 kc[i] = *reinterpret_cast<const uint4*>(k + head_base + static_cast<long long>(kr) * kPromptDims + dim0 + 8 * (lane & 7));
             }
+        } else if constexpr (KBLK) {
+#pragma unroll
+            for (int nt = 0; nt < 2; ++nt) {
+                const int kr = __shfl(key, nt * 16 + col, 32);
+                const uint16_t* kb = k + head_base + static_cast<long long>(kr >> 2) * (kPromptDims * 4) + (kr & 3) * 16;
+#pragma unroll
+                for (int kk = 0; kk < 4; ++kk) {
+                    const uint4* src = reinterpret_cast<const uint4*>(kb + (dim0 / 16 + kk) * 64);
+                    kx[nt][kk][0] = src[0];
+                    kx[nt][kk][1] = src[1];
+                }
+            }
         } else {
 #pragma unroll
             for (int nt = 0; nt < 2; ++nt) {
@@ -518,7 +536,18 @@ __device__ void w4_sparse_ql(const float* __restrict__ q, const uint16_t* __rest
         }
         uint4 vx[8];
         uint32_t vw[32];
-        if constexpr (VT) {
+        if constexpr (V16) {
+            const uint4* v4 = reinterpret_cast<const uint4*>(v) + head_base / 8 + dim0 / 2 + lane;
+#pragma unroll
+            for (int gi = 0; gi < 8; ++gi) {
+                const int kb = __shfl(key, 4 * gi, 32);
+                const uint4 w = v4[static_cast<long long>(kb >> 2) * 128];
+                vw[4 * gi] = w.x;
+                vw[4 * gi + 1] = w.y;
+                vw[4 * gi + 2] = w.z;
+                vw[4 * gi + 3] = w.w;
+            }
+        } else if constexpr (VT) {
             const uint32_t* v4 = reinterpret_cast<const uint32_t*>(v) + head_base / 2 + (dim0 / 2 + lane) * 4;
 #pragma unroll
             for (int c = 0; c < 32; ++c) {
@@ -556,7 +585,7 @@ __device__ void w4_sparse_ql(const float* __restrict__ q, const uint16_t* __rest
             for (int i = 0; i < 8; ++i) S.part[wave][2 * i + half][nt * 16 + col] = s[i];
         }
         if constexpr (KCO) wave_order();  // the stage's reads before vt is rewritten
-        if constexpr (VT) {
+        if constexpr (VT || V16) {
             uint32_t ra[16], rb[16];
 #pragma unroll
             for (int i = 0; i < 16; ++i) {
@@ -689,6 +718,18 @@ W4_QL_KERNEL(w4_sparse_ql10, true, false)
 W4_QL_KERNEL(w4_sparse_ql3, false, true)
 W4_QL_KERNEL(w4_sparse_ql3k, true, true)
 #undef W4_QL_KERNEL
+#define W2_Q4_KERNEL(NAME, V16, KBLK)                                                                                   \
+    extern "C" __global__ void __launch_bounds__(kPromptThreads)                                                        \
+    NAME(const float* q, const void* k, const void* v, const int* ids, long long id_stride, const int* count,           \
+         const int* sparse, const void* qg, void* out, long long cap, float scale) {                                    \
+        w4_sparse_ql<false, false, false, false, V16, KBLK>(q, static_cast<const uint16_t*>(k),                         \
+            static_cast<const uint16_t*>(v), ids, id_stride, count, sparse, static_cast<const uint16_t*>(qg), out,      \
+            nullptr, cap, scale);                                                                                       \
+    }
+W2_Q4_KERNEL(w2_sparse_q41, true, false)
+W2_Q4_KERNEL(w2_sparse_q42, false, true)
+W2_Q4_KERNEL(w2_sparse_q412, true, true)
+#undef W2_Q4_KERNEL
 
 // The decode tile (tf_fn_sparse_tile_parts: parts, p v over hi + lo) on today's V layout and on QL-3's.
 #define W4_QL_PARTS(NAME, VT)                                                                                           \
@@ -701,6 +742,17 @@ W4_QL_KERNEL(w4_sparse_ql3k, true, true)
 W4_QL_PARTS(w4_sparse_tile_parts_ref, false)
 W4_QL_PARTS(w4_sparse_tile_parts_ql3, true)
 #undef W4_QL_PARTS
+#define W2_Q4_PARTS(NAME, V16, KBLK)                                                                                    \
+    extern "C" __global__ void __launch_bounds__(kPromptThreads)                                                        \
+    NAME(const float* q, const void* k, const void* v, const int* ids, long long id_stride, const int* count,           \
+         const int* sparse, float* parts_o, float* parts_ms, long long cap, float scale) {                              \
+        w4_sparse_ql<false, false, true, true, V16, KBLK>(q, static_cast<const uint16_t*>(k),                           \
+            static_cast<const uint16_t*>(v), ids, id_stride, count, sparse, nullptr, parts_o, parts_ms, cap, scale);     \
+    }
+W2_Q4_PARTS(w2_sparse_tile_parts_q41, true, false)
+W2_Q4_PARTS(w2_sparse_tile_parts_q42, false, true)
+W2_Q4_PARTS(w2_sparse_tile_parts_q412, true, true)
+#undef W2_Q4_PARTS
 
 // kv_write (tf_kv_write) into QL-3's V layout: element (r, h, j) of the (len, kv_heads, 256) bf16 rows at slot pos0 + r
 extern "C" __global__ void w4_kv_write_ql3(const uint16_t* src, uint16_t* cache, int len, int kv_heads, int total, int pos0) {
@@ -711,6 +763,18 @@ extern "C" __global__ void w4_kv_write_ql3(const uint16_t* src, uint16_t* cache,
     const int r = static_cast<int>(i / (static_cast<long long>(kPromptDims) * kv_heads));
     const long long slot = pos0 + r;
     const long long to = (((static_cast<long long>(h) * (total / 4) + slot / 4) * (kPromptDims / 2) + j / 2) * 4 + slot % 4) * 2 + j % 2;
+    cache[to] = src[i];
+}
+
+// kv_write into Q4-2's K layout: element (r, h, j) of the (len, kv_heads, 256) bf16 rows at slot pos0 + r
+extern "C" __global__ void w2_kv_write_kblk(const uint16_t* src, uint16_t* cache, int len, int kv_heads, int total, int pos0) {
+    const long long i = gid();
+    if (i >= static_cast<long long>(len) * kv_heads * kPromptDims) return;
+    const int j = static_cast<int>(i % kPromptDims);
+    const int h = static_cast<int>((i / kPromptDims) % kv_heads);
+    const int r = static_cast<int>(i / (static_cast<long long>(kPromptDims) * kv_heads));
+    const long long slot = pos0 + r;
+    const long long to = ((static_cast<long long>(h) * (total / 4) + slot / 4) * 16 + j / 16) * 64 + (slot % 4) * 16 + j % 16;
     cache[to] = src[i];
 }
 
