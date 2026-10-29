@@ -295,7 +295,7 @@ __device__ __forceinline__ void wmma_moe_tile(Affine a, float limit) {
 // PC-1's one chunk the 64-row down dequantized each item twice; MG-2 runs it at 128 rows (mlx_tiles.hpp). Down's
 // epilogue stages each wave's sums in LDS and stores 16-byte row segments (DL-4d): served at one chunk it was 23 % of a
 // block's life, store issue with 64 dword stores a lane (w2/diag-phase).
-template <class S, int AHEAD, int BM, int WR>
+template <class S, int AHEAD, int BM, int WR, bool OUT16 = false>
 __device__ __forceinline__ void wmma_moe_inexact_tile(Affine a, float limit) {
 #if TF_DEVICE_WMMA_GFX11
     using moe_tile::kBN;
@@ -440,6 +440,38 @@ __device__ __forceinline__ void wmma_moe_inexact_tile(Affine a, float limit) {
                         reinterpret_cast<uint16_t*>(a.out16)[orow * S::kNI + 64 * bx + lines[j]] = v.data;
                     }
                 }
+            }
+        } else if constexpr (OUT16) {
+            // F-2: the sums rounded to bf16 (out16, a prompt's slots under numerics=inexact), 16 bytes a lane
+            constexpr int kCols = kNT * 16;      // a wave's sums a row
+            constexpr int kChunks = kCols / 8;   // 16-byte chunks a row
+            constexpr int kStride = kCols + 8;   // a staged row, in bf16
+            static_assert(16 * kChunks % 32 == 0 && 8 * 16 * kStride * 2 <= BM * kLdw * 4, "epilogue staging");
+            uint16_t* stage = reinterpret_cast<uint16_t*>(xs) + wave * 16 * kStride;
+            const int col0 = S::col(bx, lines[0] - rl);  // the wave's first hidden column
+#pragma unroll
+            for (int mt = 0; mt < kMT; ++mt) {
+#pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    uint16_t* srow = stage + (2 * i + rh) * kStride + rl;
+#pragma unroll
+                    for (int j = 0; j < kNT; ++j) srow[16 * j] = hip_bfloat16(acc[mt][j][i]).data;
+                }
+                __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront");
+                __builtin_amdgcn_wave_barrier();
+                __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront");
+#pragma unroll
+                for (int c = 0; c < 16 * kChunks / 32; ++c) {
+                    const int idx = 32 * c + lane;
+                    const int r = idx / kChunks, q = idx % kChunks;
+                    const u32x4 v = *reinterpret_cast<const u32x4*>(stage + r * kStride + 8 * q);
+                    const int row = wm * WR + mt * 16 + r;
+                    if (row < rows_left)
+                        *reinterpret_cast<u32x4*>(reinterpret_cast<uint16_t*>(a.out16) + out_row(a, h0 + row) * S::kN + col0 + 8 * q) = v;
+                }
+                __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront");
+                __builtin_amdgcn_wave_barrier();
+                __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront");
             }
         } else {
             // down's epilogue through LDS (DL-4d): the loop's last window ended with lds_barrier after its fragment

@@ -198,6 +198,8 @@ pub const Kernels = struct {
     /// Both with the codes dequantized to bf16 (numerics=inexact).
     moe_gu_inexact: ?Function,
     moe_down_inexact: ?Function,
+    /// The inexact down with its slots rounded to bf16 into out16 (F-2).
+    moe_down_inexact16: ?Function,
     /// A prompt's plain 4-bit group-32 products at each of dense_ks (tiles/dense_gemm.hpp); gfx11.
     dense: [dense_ks.len]?Function,
     /// hc up (K 320) on the dense tile with tf_fn_hc_mix in its epilogue (tf_affine_dense_hcmix); gfx11.
@@ -244,6 +246,7 @@ pub const Kernels = struct {
         k.moe_down = if (k.matrix) try tiles_obj.function(r ++ "20affine_wmma_moe_downILi4EEEvNS0_6AffineE") else null;
         k.moe_gu_inexact = if (k.matrix) try tiles_obj.function(r ++ "26affine_wmma_moe_gu_inexactILi4EEEvNS0_6AffineEf") else null;
         k.moe_down_inexact = if (k.matrix) try tiles_obj.function(r ++ "28affine_wmma_moe_down_inexactILi4EEEvNS0_6AffineE") else null;
+        k.moe_down_inexact16 = if (k.matrix) try tiles_obj.function(r ++ "30affine_wmma_moe_down_inexact16ILi4EEEvNS0_6AffineE") else null;
         k.dense_hcmix = if (k.matrix) try tiles_obj.function("tf_affine_dense_hcmix") else null;
         k.hc_gate_fill = if (k.matrix) try tiles_obj.function("tf_hc_gate_fill") else null;
         inline for (dense_ks, 0..) |dk, i| {
@@ -664,11 +667,16 @@ pub const Kernels = struct {
 
     /// A prompt's routed down of that shape into `a.out` (fp32, pairs x n): the bytes of the matrix tile. False, nothing
     /// launched, for any other shape or with the matrix off.
+    /// With out16 set (and out 0) the inexact tile writes the slots rounded to bf16 (numerics=inexact, F-2): false unless
+    /// it runs.
     pub fn moeDown(k: *const Kernels, r: *const runtime.Runtime, a: Arg, items: c_int, s: abi.Stream) Error!bool {
-        if (!k.moeDownTakes(a, items) or a.out == 0 or a.out16 != 0) return false;
+        if (!k.moeDownTakes(a, items)) return false;
+        const half = a.out16 != 0;
+        if (half and (a.out != 0 or !k.inexact or k.moe_down_inexact16 == null)) return false;
+        if (!half and a.out == 0) return false;
         var args: hl.Args = .{};
         try args.add(a);
-        const f = if (k.inexact) k.moe_down_inexact orelse k.moe_down.? else k.moe_down.?;
+        const f = if (half) k.moe_down_inexact16.? else if (k.inexact) k.moe_down_inexact orelse k.moe_down.? else k.moe_down.?;
         try go(r, f, .{ .x = moe_down_shape.blocks, .z = @intCast(items) }, .{ .x = 256 }, s, &args);
         return true;
     }

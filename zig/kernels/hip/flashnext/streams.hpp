@@ -174,15 +174,18 @@ tf_fn_hc_norm_v(const uint16_t* h, const uint16_t* branch, const uint16_t* injec
 // branch, the same lanes and the same sums. The bytes of moe_combine_kernel then tf_fn_hc_norm_v, without the branch's
 // write and its reads back.
 constexpr int kNormMoeVMost = 4;
-extern "C" __global__ void __launch_bounds__(kNormMoeVMost * kNormVThreads)
-tf_fn_hc_norm_moe_v(const uint16_t* h, const float* y, const float* wts, const uint16_t* inject, uint16_t* h_out,
-                    uint16_t* x_out, const float* scale, int streams, float eps, int slots) {
+__device__ __forceinline__ float slot_value(const float* y, long long i) { return y[i]; }
+__device__ __forceinline__ float slot_value(const uint16_t* y, long long i) { return bf16_to_float(y[i]); }
+template <typename T>
+__device__ __forceinline__ void hc_norm_moe_v_body(const uint16_t* h, const T* y, const float* wts, const uint16_t* inject,
+                                                   uint16_t* h_out, uint16_t* x_out, const float* scale, int streams,
+                                                   float eps, int slots) {
     __shared__ float br[kNormVDims];
     __shared__ float scratch[kNormMoeVMost][kNormThreads / 32];
     const int r = blockIdx.y, tid = threadIdx.x;
     for (int d = tid; d < kNormVDims; d += streams * kNormVThreads) {
         float acc = 0.f;
-        for (int k = 0; k < slots; ++k) acc += y[(static_cast<long long>(r) * slots + k) * kNormVDims + d] * wts[r * slots + k];
+        for (int k = 0; k < slots; ++k) acc += slot_value(y, (static_cast<long long>(r) * slots + k) * kNormVDims + d) * wts[r * slots + k];
         br[d] = rounded(acc, 2);
     }
     __syncthreads();
@@ -242,6 +245,19 @@ tf_fn_hc_norm_moe_v(const uint16_t* h, const float* y, const float* wts, const u
         *reinterpret_cast<uint4*>(h_out + base + d0) = uint4{ho[0], ho[1], ho[2], ho[3]};
         *reinterpret_cast<uint4*>(x_out + base + d0) = uint4{xo[0], xo[1], xo[2], xo[3]};
     }
+}
+
+extern "C" __global__ void __launch_bounds__(kNormMoeVMost * kNormVThreads)
+tf_fn_hc_norm_moe_v(const uint16_t* h, const float* y, const float* wts, const uint16_t* inject, uint16_t* h_out,
+                    uint16_t* x_out, const float* scale, int streams, float eps, int slots) {
+    hc_norm_moe_v_body(h, y, wts, inject, h_out, x_out, scale, streams, eps, slots);
+}
+
+// the same over bf16 slots (F-2: the inexact down's prompt slots rounded to bf16), each widened before its product
+extern "C" __global__ void __launch_bounds__(kNormMoeVMost * kNormVThreads)
+tf_fn_hc_norm_moe_v16(const uint16_t* h, const uint16_t* y, const float* wts, const uint16_t* inject, uint16_t* h_out,
+                      uint16_t* x_out, const float* scale, int streams, float eps, int slots) {
+    hc_norm_moe_v_body(h, y, wts, inject, h_out, x_out, scale, streams, eps, slots);
 }
 
 // tf_fn_hc_mix over bf16 activations, 8 neighbouring outputs a thread (16-byte loads of g and x), the same bits.

@@ -25,6 +25,7 @@ pub const Fns = struct {
     hc_norm_moe: Function,
     hc_norm_v: Function, // bf16 streams of 2,560, one rank: 128 threads a block, 16-byte accesses, the same bits
     hc_norm_moe_v: Function, // hc_norm_v with the MoE combine as the branch, a block a row (a prompt's rows, F-1)
+    hc_norm_moe_v16: Function, // the same over bf16 slots (F-2)
     hc_gates: Function,
     rms_wide: Function,
     hc_mix: Function,
@@ -52,6 +53,7 @@ pub const Fns = struct {
             .hc_norm_moe = try m.function("tf_fn_hc_norm_moe"),
             .hc_norm_v = try m.function("tf_fn_hc_norm_v"),
             .hc_norm_moe_v = try m.function("tf_fn_hc_norm_moe_v"),
+            .hc_norm_moe_v16 = try m.function("tf_fn_hc_norm_moe_v16"),
             .hc_gates = try m.function("tf_fn_hc_gates"),
             .rms_wide = try m.function("tf_fn_rms_wide"),
             .hc_mix = try m.function("tf_fn_hc_mix"),
@@ -146,6 +148,28 @@ pub fn hcNormMoeV(
     var a: Args = .{};
     inline for (.{ ad(h), ad(y), ad(wts), ad(inject), ad(h_out), ad(x_out), ad(scale), streams, eps, slots }) |v| try a.add(v);
     try l.go(l.fnx.hc_norm_moe_v, dim(1, rows, 1), dim(128 * streams, 1, 1), 0, s, &a);
+}
+
+/// hcNormMoeV over bf16 slots `y` (F-2: the inexact down's prompt slots), each widened before its product.
+pub fn hcNormMoeV16(
+    l: *const Launcher,
+    h: C,
+    y: C,
+    wts: CF,
+    inject: C,
+    h_out: P,
+    x_out: P,
+    scale: CF,
+    rows: c_int,
+    streams: c_int,
+    eps: f32,
+    slots: c_int,
+    s: S,
+) Error!void {
+    if (streams < 1 or streams > 4 or slots < 1) return util.invalid("hcNormMoeV16");
+    var a: Args = .{};
+    inline for (.{ ad(h), ad(y), ad(wts), ad(inject), ad(h_out), ad(x_out), ad(scale), streams, eps, slots }) |v| try a.add(v);
+    try l.go(l.fnx.hc_norm_moe_v16, dim(1, rows, 1), dim(128 * streams, 1, 1), 0, s, &a);
 }
 
 /// hcNorm with the branch as `world` fp32 shares `stride` values apart (a tensor-parallel gather), summed in order.

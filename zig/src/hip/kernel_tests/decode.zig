@@ -806,6 +806,22 @@ fn promptExperts(t: *Rig, rng: *rig.Rng, down: bool, rows: usize, experts: usize
         // a rounding of the activation on each side (3 u)
         const u: f64 = 1.0 / 512.0;
         try std.testing.expect(rel <= @as(f64, if (down) 2.0 else 3.0) * u);
+        if (down) {
+            // F-2: the inexact down's bf16 slots (out16) are its fp32 slots rounded as tf_cast rounds them
+            var halves = [2]@import("../memory.zig").DeviceBuffer{ try t.alloc(pairs * n * 2), try t.alloc(pairs * n * 2) };
+            defer for (&halves) |*b| b.free();
+            try halves[1].fill8(0xA5);
+            try t.on.tf_cast(@ptrFromInt(at(sums[1])), 0, @ptrFromInt(at(halves[0])), 2, @intCast(pairs * n), t.stream.handle);
+            a.out = 0;
+            a.out16 = at(halves[1]);
+            try std.testing.expect(try chosen.moeDown(&t.r, a, @intCast(count), t.stream.handle));
+            try t.stream.synchronize();
+            const w16 = try rig.download(u16, halves[0]);
+            defer gpa.free(w16);
+            const g16 = try rig.download(u16, halves[1]);
+            defer gpa.free(g16);
+            try std.testing.expectEqualSlices(u16, w16, g16);
+        }
         return;
     }
     var differ: usize = 0;

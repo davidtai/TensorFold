@@ -197,6 +197,21 @@ pub fn projectRouted(o: Ops, x: Tensor, proj: Projection, items: u64, count: usi
     }
 }
 
+/// projectRouted for a prompt's expert down whose slots only the fused combine and HC norm reads (F-2): under
+/// numerics=inexact Flash Next's inexact down writes them rounded to bf16 into out16, halving their write and read;
+/// fp32 for any other shape, numerics or row count.
+pub fn projectRoutedDown(o: Ops, x: Tensor, proj: Projection, items: u64, count: usize, members: u64, pairs: usize, rows: usize) Error!Tensor {
+    if (o.prefill and o.inexact() and proj.handle == .mlx) {
+        const w = affineOf(proj, proj.handle.mlx);
+        try w.check();
+        const out = try o.arena.take(pairs * w.n * 2);
+        const kind = w.tables.table();
+        const arg: affine_launch.Arg = .{ .x = x.ptr, .words = w.words, .scale = .{ .p = w.scale, .kind = kind }, .bias = .{ .p = w.bias, .kind = kind }, .out = 0, .out16 = out, .m = int(rows), .n = int(w.n), .k = int(w.k), .bits = int(w.bits), .group = int(w.group), .fp16 = @intFromBool(x.kind == .f16), .route = .{ .items = items, .members = members, .x_div = 1 } };
+        if (try o.l.affine.moeDown(o.l.r, arg, int(count), o.stream)) return .{ .ptr = out, .kind = .bf16 };
+    }
+    return .{ .ptr = try projectRouted(o, x, proj, items, count, members, pairs, 1, rows), .kind = .f32 };
+}
+
 /// gather_rows: `n` embedding rows of a table of any format with a row gather, by device ids, dequantized into `out`.
 pub fn embedRows(o: Ops, table: Projection, ids: u64, n: usize, out: Tensor) Error!void {
     switch (table.handle) {

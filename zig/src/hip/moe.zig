@@ -106,9 +106,9 @@ pub fn run(o: Ops, kind: Kind, r: Routed, x: Tensor, rows: usize, prefill: bool)
         try o.moeCombine(y, wts, .{ .ptr = share, .kind = .f32 }, rows, slots, ex.dims);
         return .{ .ptr = share, .kind = .f32 };
     }
-    const p = try expertParts(o, kind, r, x, rows, logits, pick, wts, items, members, cap);
+    const p = try expertParts(o, kind, r, x, rows, logits, pick, wts, items, members, cap, false);
     const out = try o.arena.take(rows * ex.dims * kind.size());
-    try o.moeCombine(p.y, wts, .{ .ptr = out, .kind = kind }, rows, slots, ex.dims);
+    try o.moeCombine(p.y.ptr, wts, .{ .ptr = out, .kind = kind }, rows, slots, ex.dims);
     return .{ .ptr = out, .kind = kind };
 }
 
@@ -116,6 +116,19 @@ pub fn run(o: Ops, kind: Kind, r: Routed, x: Tensor, rows: usize, prefill: bool)
 pub const Parts = struct { y: u64, wts: u64, slots: usize };
 
 pub fn parts(o: Ops, kind: Kind, r: Routed, x: Tensor, rows: usize) ops.Error!Parts {
+    const t = try partsOf(o, kind, r, x, rows, false);
+    return .{ .y = t.y.ptr, .wts = t.wts, .slots = t.slots };
+}
+
+/// parts for a prompt whose slots only the fused combine and HC norm reads (F-2): y in bf16 where the inexact down takes
+/// it (numerics=inexact), else fp32; y's kind says which.
+pub const PartsOf = struct { y: Tensor, wts: u64, slots: usize };
+
+pub fn partsHalf(o: Ops, kind: Kind, r: Routed, x: Tensor, rows: usize) ops.Error!PartsOf {
+    return partsOf(o, kind, r, x, rows, true);
+}
+
+fn partsOf(o: Ops, kind: Kind, r: Routed, x: Tensor, rows: usize, half: bool) ops.Error!PartsOf {
     const slots = r.top_k + 1;
     const size = if (r.exact) rows else bucket(rows);
     const cap = capacity(size * slots, r.rows);
@@ -124,12 +137,12 @@ pub fn parts(o: Ops, kind: Kind, r: Routed, x: Tensor, rows: usize) ops.Error!Pa
     const wts = try o.arena.of(f32, size * slots);
     const items = try o.arena.of(i32, cap * 3);
     const members = try o.arena.of(i32, size * slots);
-    const p = try expertParts(o, kind, r, x, rows, logits, pick, wts, items, members, cap);
+    const p = try expertParts(o, kind, r, x, rows, logits, pick, wts, items, members, cap, half);
     return .{ .y = p.y, .wts = wts, .slots = slots };
 }
 
 /// Select, plan, gate and up, the activation and down: the rows' slots before the combine.
-fn expertParts(o: Ops, kind: Kind, r: Routed, x: Tensor, rows: usize, logits: u64, pick: u64, wts: u64, items: u64, members: u64, cap: usize) ops.Error!struct { y: u64 } {
+fn expertParts(o: Ops, kind: Kind, r: Routed, x: Tensor, rows: usize, logits: u64, pick: u64, wts: u64, items: u64, members: u64, cap: usize, half: bool) ops.Error!struct { y: Tensor } {
     const ex = r.experts;
     const slots = r.top_k + 1;
     const pairs = rows * slots;
@@ -165,8 +178,8 @@ fn expertParts(o: Ops, kind: Kind, r: Routed, x: Tensor, rows: usize, logits: u6
         try o.moeAct(both, t, pairs, ex.width, ex.limit);
         break :blk t;
     };
-    const y = try o.projectRouted(act_t, ex.down, items, count, members, pairs, 1, @min(tile, rows));
-    return .{ .y = y };
+    if (half) return .{ .y = try o.projectRoutedDown(act_t, ex.down, items, count, members, pairs, @min(tile, rows)) };
+    return .{ .y = .{ .ptr = try o.projectRouted(act_t, ex.down, items, count, members, pairs, 1, @min(tile, rows)), .kind = .f32 } };
 }
 
 test "buffer sizes follow moe.run and max_items" {

@@ -758,6 +758,59 @@ test "a prompt's MoE combine inside the HC norm, a block a row (F-1): moe_combin
     }
 }
 
+test "a prompt's MoE combine inside the HC norm over bf16 slots (F-2): tf_fn_hc_norm_moe_v's bytes over the slots widened" {
+    const t = try Rig.open(64 << 20);
+    defer t.close();
+    if (!t.bf16) return; // the 16-byte kernels are bf16 only
+    var rng: rig.Rng = .{ .state = 0x4D2 };
+    const s = 4;
+    const d = 2560;
+    const slots = 11;
+    const st = t.stream.handle;
+    for ([_]usize{ 1, 7, 64, 300 }) |rows| {
+        const y16 = try gpa.alloc(u16, rows * slots * d);
+        defer gpa.free(y16);
+        for (y16) |*v| v.* = rig.bf16Bits(rng.unit() * 2.0);
+        const y32 = try gpa.alloc(f32, y16.len);
+        defer gpa.free(y32);
+        for (y32, y16) |*w, v| w.* = @bitCast(@as(u32, v) << 16);
+        const wh = try gpa.alloc(f32, rows * slots);
+        defer gpa.free(wh);
+        for (wh) |*v| v.* = rng.unit() * 0.5;
+        const hh = try acts(t, &rng, rows * s * d, 3.0);
+        defer gpa.free(hh);
+        const ih = try acts(t, &rng, rows * s, 2.0);
+        defer gpa.free(ih);
+        const sh = try gpa.alloc(f32, s * d);
+        defer gpa.free(sh);
+        for (sh) |*v| v.* = 1.0 + rng.unit() * 0.25;
+        var ya = try t.upload(y32);
+        defer ya.free();
+        var yb = try t.upload(y16);
+        defer yb.free();
+        var w = try t.upload(wh);
+        defer w.free();
+        var inject = try t.upload(ih);
+        defer inject.free();
+        var scale = try t.upload(sh);
+        defer scale.free();
+        var h = [_]DeviceBuffer{ try t.upload(hh), try t.upload(hh) };
+        defer for (&h) |*b| b.free();
+        var x = [_]DeviceBuffer{ try t.alloc(rows * s * d * 2), try t.alloc(rows * s * d * 2) };
+        defer for (&x) |*b| b.free();
+        try t.on.fn_hc_norm_moe_v(@ptrFromInt(at(h[0])), @ptrFromInt(at(ya)), @ptrFromInt(at(w)), @ptrFromInt(at(inject)), @ptrFromInt(at(h[0])), @ptrFromInt(at(x[0])), @ptrFromInt(at(scale)), @intCast(rows), s, 1e-6, slots, st);
+        try t.on.fn_hc_norm_moe_v16(@ptrFromInt(at(h[1])), @ptrFromInt(at(yb)), @ptrFromInt(at(w)), @ptrFromInt(at(inject)), @ptrFromInt(at(h[1])), @ptrFromInt(at(x[1])), @ptrFromInt(at(scale)), @intCast(rows), s, 1e-6, slots, st);
+        try t.stream.synchronize();
+        for ([_][2]DeviceBuffer{ h, x }) |pair| {
+            const a = try rig.download(u16, pair[0]);
+            defer gpa.free(a);
+            const b = try rig.download(u16, pair[1]);
+            defer gpa.free(b);
+            try std.testing.expectEqualSlices(u16, a, b);
+        }
+    }
+}
+
 test "hyper-connection norm and mix, 16-byte kernels: the per-element kernels' bytes at 1 to 300 rows" {
     const t = try Rig.open(64 << 20);
     defer t.close();

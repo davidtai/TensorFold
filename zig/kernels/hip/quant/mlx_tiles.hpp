@@ -72,6 +72,14 @@ __global__ void __launch_bounds__(moe_tile::kThreads) affine_wmma_moe_down_inexa
     wmma_moe_inexact_tile<MoeDown, 2, 128, 64>(a, 0.f);
 }
 
+// the same with the slots rounded to bf16 into out16 (F-2: a prompt's slots under numerics=inexact, read by
+// tf_fn_hc_norm_moe_v16)
+template <int BITS>
+__global__ void __launch_bounds__(moe_tile::kThreads) affine_wmma_moe_down_inexact16(Affine a) {
+    static_assert(BITS == 4, "4-bit codes");
+    wmma_moe_inexact_tile<MoeDown, 2, 128, 64, true>(a, 0.f);
+}
+
 // ---- a prompt's plain 4-bit group-32 products at Qwen3.8-Flash-Next's K (tiles/dense_gemm.hpp, gfx11 matrix cores) ----
 
 // K 2560 (the trunk's input projections), 6144 (out), 10240 (hc down), 320 (hc up); the bytes of affine_wmma_gemm
