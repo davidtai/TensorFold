@@ -145,7 +145,7 @@ pub fn hcNormMoeV(
     if (streams < 1 or streams > 4 or slots < 1) return util.invalid("hcNormMoeV");
     var a: Args = .{};
     inline for (.{ ad(h), ad(y), ad(wts), ad(inject), ad(h_out), ad(x_out), ad(scale), streams, eps, slots }) |v| try a.add(v);
-    try l.go(l.fnx.hc_norm_moe_v, dim(1, rows, 1), dim(@intCast(128 * streams), 1, 1), 0, s, &a);
+    try l.go(l.fnx.hc_norm_moe_v, dim(1, rows, 1), dim(128 * streams, 1, 1), 0, s, &a);
 }
 
 /// hcNorm with the branch as `world` fp32 shares `stride` values apart (a tensor-parallel gather), summed in order.
