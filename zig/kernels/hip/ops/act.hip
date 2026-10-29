@@ -49,6 +49,62 @@ __global__ void __launch_bounds__(kRmsThreads) rms_kernel(const T* __restrict__ 
     }
 }
 
+// rms_kernel with a thread's values loaded together and the one wave's sum 16 LDS reads at a time (add_rms_body's): the
+// same sums in the same order. (W2 H-2 bench)
+template <typename T>
+__global__ void __launch_bounds__(kRmsThreads) rms_kernel_ahead(const T* __restrict__ x, const float* __restrict__ weight,
+                                                               T* __restrict__ y, int width, float eps) {
+    constexpr int kPer = kRmsWidth / kRmsThreads;
+    __shared__ float row_v[kRmsWidth];
+    __shared__ float inv_s;
+    const int row = blockIdx.x;
+    const T* in = x + static_cast<long long>(row) * width;
+    float a[kPer];
+#pragma unroll
+    for (int k = 0; k < kPer; ++k) {
+        const int i = threadIdx.x + k * kRmsThreads;
+        a[k] = i < width ? widen(in[i]) : 0.f;
+    }
+#pragma unroll
+    for (int k = 0; k < kPer; ++k) {
+        const int i = threadIdx.x + k * kRmsThreads;
+        if (i < width) row_v[i] = a[k];
+    }
+    __syncthreads();
+    if (threadIdx.x < 32) {
+        constexpr int kLoads = 16;
+        float sum = 0.f;
+        int i = threadIdx.x;
+        for (; i + (kLoads - 1) * 32 < width; i += kLoads * 32) {
+            float v[kLoads];
+#pragma unroll
+            for (int k = 0; k < kLoads; ++k) v[k] = row_v[i + 32 * k];
+#pragma unroll
+            for (int k = 0; k < kLoads; ++k) sum += v[k] * v[k];
+        }
+        for (; i < width; i += 32) sum += row_v[i] * row_v[i];
+        const float inv = rsqrtf(warp_sum(sum) / static_cast<float>(width) + eps);
+        if (threadIdx.x == 0) inv_s = inv;
+    }
+    __syncthreads();
+    const float inv = inv_s;
+    T* out = y + static_cast<long long>(row) * width;
+    float w[kPer];
+#pragma unroll
+    for (int k = 0; k < kPer; ++k) {
+        const int i = threadIdx.x + k * kRmsThreads;
+        w[k] = (weight != nullptr && i < width) ? weight[i] : 1.f;
+    }
+#pragma unroll
+    for (int k = 0; k < kPer; ++k) {
+        const int i = threadIdx.x + k * kRmsThreads;
+        if (i >= width) break;
+        float value = a[k] * inv;
+        if (weight != nullptr) value *= w[k];
+        narrow(value, out + i);
+    }
+}
+
 // tf_add's rounding of a sum: fp16 to nearest even, bf16 as c10::BFloat16 (NaN to 0x7fc0).
 __device__ inline __half add_round(float v, const __half*) { return __float2half_rn(v); }
 __device__ inline hip_bfloat16 add_round(float v, const hip_bfloat16*) {
@@ -358,6 +414,8 @@ template __global__ void rms_kernel<__half>(const __half* __restrict__ x, const 
     __half* __restrict__ y, int width, float eps);
 template __global__ void rms_kernel<hip_bfloat16>(const hip_bfloat16* __restrict__ x, const float* __restrict__ weight,
     hip_bfloat16* __restrict__ y, int width, float eps);
+template __global__ void rms_kernel_ahead<hip_bfloat16>(const hip_bfloat16* __restrict__ x,
+    const float* __restrict__ weight, hip_bfloat16* __restrict__ y, int width, float eps);
 template __global__ void moe_router_kernel<__half>(const __half* __restrict__ x, const float* __restrict__ rows,
     float* __restrict__ logits, int d, int e);
 template __global__ void moe_router_kernel<hip_bfloat16>(const hip_bfloat16* __restrict__ x,

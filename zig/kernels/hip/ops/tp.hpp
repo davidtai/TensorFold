@@ -82,3 +82,69 @@ extern "C" __global__ void tf_token_prob(const uint16_t* logits, int kind, int n
         out[blockIdx.x] = chosen / shared[0];
     }
 }
+
+namespace {
+
+constexpr int kProbAhead = 16;
+
+// tf_token_prob's second pass for lane t of a row (t, t + 256, ... in its order), kProbAhead loads in flight.
+__device__ __forceinline__ float prob_lane_sum(const uint16_t* row, int kind, int n, float peak, int t) {
+    float total = 0.f;
+    int i = t;
+    for (; i + (kProbAhead - 1) * kProbThreads < n; i += kProbAhead * kProbThreads) {
+        uint16_t v[kProbAhead];
+#pragma unroll
+        for (int k = 0; k < kProbAhead; ++k) v[k] = row[i + k * kProbThreads];
+#pragma unroll
+        for (int k = 0; k < kProbAhead; ++k) total += expf(widen(v[k], kind) - peak);
+    }
+    for (; i < n; i += kProbThreads) total += expf(widen(row[i], kind) - peak);
+    return total;
+}
+
+}  // namespace
+
+// tf_token_prob when `id` is the row's tf_argmax: the row's max is row[id] (a NaN anywhere is the argmax, as the max
+// pass gave NaN), so only the sum pass runs, in tf_token_prob's lanes, order and tree. One block a row. (W2 H-2 bench)
+extern "C" __global__ void __launch_bounds__(kProbThreads)
+    tf_token_prob_peak(const uint16_t* logits, int kind, int n, const int* id, float* out) {
+    const uint16_t* row = logits + static_cast<long long>(blockIdx.x) * n;
+    __shared__ float shared[kProbThreads];
+    const float peak = widen(row[id[blockIdx.x]], kind);
+    shared[threadIdx.x] = prob_lane_sum(row, kind, n, peak, threadIdx.x);
+    __syncthreads();
+    for (int stride = kProbThreads / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) shared[threadIdx.x] += shared[threadIdx.x + stride];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) out[blockIdx.x] = expf(widen(row[id[blockIdx.x]], kind) - peak) / shared[0];
+}
+
+// tf_token_prob_peak with a row's 256 lanes over 8 one-wave blocks (grid 8 x rows): each lane's sum as there, into
+// `parts` (256 a row); the row's last block (`tickets`, zero at rest, put back to zero) runs the same tree. (W2 H-2)
+extern "C" __global__ void __launch_bounds__(32) tf_token_prob_lanes(const uint16_t* logits, int kind, int n,
+                                                                     const int* id, float* out, float* parts,
+                                                                     unsigned* tickets) {
+    const int r = blockIdx.y;
+    const uint16_t* row = logits + static_cast<long long>(r) * n;
+    const float peak = widen(row[id[r]], kind);
+    const int t = blockIdx.x * 32 + threadIdx.x;
+    parts[r * kProbThreads + t] = prob_lane_sum(row, kind, n, peak, t);
+    __threadfence();
+    __shared__ unsigned ticket;
+    if (threadIdx.x == 0) ticket = atomicAdd(&tickets[r], 1u);
+    __syncthreads();
+    if (ticket != gridDim.x - 1) return;
+    __threadfence();
+    __shared__ float shared[kProbThreads];
+    for (int k = threadIdx.x; k < kProbThreads; k += 32) shared[k] = __hip_atomic_load(&parts[r * kProbThreads + k], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    __syncthreads();
+    for (int stride = kProbThreads / 2; stride > 0; stride >>= 1) {
+        for (int k = threadIdx.x; k < stride; k += 32) shared[k] += shared[k + stride];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        out[r] = expf(widen(row[id[r]], kind) - peak) / shared[0];
+        tickets[r] = 0;
+    }
+}

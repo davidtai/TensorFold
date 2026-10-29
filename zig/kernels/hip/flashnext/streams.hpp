@@ -311,6 +311,32 @@ tf_fn_rms_wide(const void* x, const float* scale, void* y, int kind, int width, 
     }
 }
 
+// tf_fn_rms_wide with each thread's values held (widths up to kWidePer * 256), loads issued together: the same sums in
+// the same order. (W2 H-2 bench)
+constexpr int kWidePer = 48;
+extern "C" __global__ void __launch_bounds__(kFnThreads)
+tf_fn_rms_wide_held(const void* x, const float* scale, void* y, int kind, int width, float eps) {
+    __shared__ float scratch[kFnWaves];
+    const long long base = static_cast<long long>(blockIdx.x) * width;
+    float v[kWidePer];
+#pragma unroll
+    for (int j = 0; j < kWidePer; ++j) {
+        const int i = threadIdx.x + j * kFnThreads;
+        v[j] = i < width ? load(x, kind, base + i) : 0.f;
+    }
+    float sum = 0.f;
+#pragma unroll
+    for (int j = 0; j < kWidePer; ++j) {
+        if (threadIdx.x + j * kFnThreads < width) sum += v[j] * v[j];
+    }
+    const float rinv = rsqrtf(fn_block_sum(sum, scratch) / static_cast<float>(width) + eps);
+#pragma unroll
+    for (int j = 0; j < kWidePer; ++j) {
+        const int i = threadIdx.x + j * kFnThreads;
+        if (i < width) store(y, kind, base + i, (v[j] * rinv) * scale[i]);
+    }
+}
+
 // mixed[r, d] = mean over the streams (in order) of round(sigmoid(round(g)) * x): g the up projection's fp32 sums.
 extern "C" __global__ void tf_fn_hc_mix(const void* g, int gkind, const void* x, void* mixed, int kind, int rows,
                                         int streams, int dims) {
