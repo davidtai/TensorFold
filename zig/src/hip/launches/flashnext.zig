@@ -24,6 +24,7 @@ pub const Fns = struct {
     hc_norm: Function,
     hc_norm_moe: Function,
     hc_norm_v: Function, // bf16 streams of 2,560, one rank: 128 threads a block, 16-byte accesses, the same bits
+    hc_norm_moe_v: Function, // hc_norm_v with the MoE combine as the branch, a block a row (a prompt's rows, F-1)
     hc_gates: Function,
     rms_wide: Function,
     hc_mix: Function,
@@ -50,6 +51,7 @@ pub const Fns = struct {
             .hc_norm = try m.function("tf_fn_hc_norm"),
             .hc_norm_moe = try m.function("tf_fn_hc_norm_moe"),
             .hc_norm_v = try m.function("tf_fn_hc_norm_v"),
+            .hc_norm_moe_v = try m.function("tf_fn_hc_norm_moe_v"),
             .hc_gates = try m.function("tf_fn_hc_gates"),
             .rms_wide = try m.function("tf_fn_rms_wide"),
             .hc_mix = try m.function("tf_fn_hc_mix"),
@@ -120,6 +122,30 @@ pub fn hcNormMoe(
     var a: Args = .{};
     inline for (.{ ad(h), ad(y), ad(wts), ad(inject), ad(h_out), ad(x_out), ad(scale), kind, streams, dims, eps, slots }) |v| try a.add(v);
     try l.go(l.fnx.hc_norm_moe, dim(streams, rows, 1), dim(1024, 1, 1), 0, s, &a);
+}
+
+/// hcNormMoe for a prompt's bf16 streams of 2,560 on one rank (F-1): a block a row, the combine once into LDS, then
+/// tf_fn_hc_norm_v's body for each stream; the bytes of moe_combine_kernel into bf16 and then hcNorm. The caller checks
+/// the shape (bf16, 2,560 dims, one rank).
+pub fn hcNormMoeV(
+    l: *const Launcher,
+    h: C,
+    y: CF,
+    wts: CF,
+    inject: C,
+    h_out: P,
+    x_out: P,
+    scale: CF,
+    rows: c_int,
+    streams: c_int,
+    eps: f32,
+    slots: c_int,
+    s: S,
+) Error!void {
+    if (streams < 1 or streams > 4 or slots < 1) return util.invalid("hcNormMoeV");
+    var a: Args = .{};
+    inline for (.{ ad(h), ad(y), ad(wts), ad(inject), ad(h_out), ad(x_out), ad(scale), streams, eps, slots }) |v| try a.add(v);
+    try l.go(l.fnx.hc_norm_moe_v, dim(1, rows, 1), dim(@intCast(128 * streams), 1, 1), 0, s, &a);
 }
 
 /// hcNorm with the branch as `world` fp32 shares `stride` values apart (a tensor-parallel gather), summed in order.

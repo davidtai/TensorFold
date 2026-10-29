@@ -425,6 +425,10 @@ pub fn run(ops: Ops, m: *const model.Model, host: *Host, segs: []const Seg, wind
             // a window's MoE combine inside the next HC norm: the experts' rows and weights, one launch for both
             const p = try hip.moe.parts(o, m.act, layer.moe, mixed2, rows);
             try o.l.fn_hc_norm_moe(@ptrFromInt(h.ptr), @ptrFromInt(p.y), @ptrFromInt(p.wts), @ptrFromInt(inject.ptr), @ptrFromInt(h.ptr), @ptrFromInt(x.ptr), @ptrFromInt(next), @backingInt(m.act), @intCast(rows), @intCast(d.streams), @intCast(d.hidden), d.eps, @intCast(p.slots), o.stream);
+        } else if (m.tp == null and m.act == .bf16 and d.hidden == 2560 and d.streams <= 4) {
+            // a prompt's MoE combine inside the next HC norm, a block a row (F-1): the combined rows never written
+            const p = try hip.moe.parts(o, m.act, layer.moe, mixed2, rows);
+            try o.l.fn_hc_norm_moe_v(@ptrFromInt(h.ptr), @ptrFromInt(p.y), @ptrFromInt(p.wts), @ptrFromInt(inject.ptr), @ptrFromInt(h.ptr), @ptrFromInt(x.ptr), @ptrFromInt(next), @intCast(rows), @intCast(d.streams), d.eps, @intCast(p.slots), o.stream);
         } else {
             const y = try hip.moe.run(o, m.act, layer.moe, mixed2, rows, !window);
             try hcBranch(o, m, h, y, inject, x, next, rows);

@@ -168,6 +168,82 @@ tf_fn_hc_norm_v(const uint16_t* h, const uint16_t* branch, const uint16_t* injec
     }
 }
 
+// tf_fn_hc_norm_v with the MoE's combine as the branch, for a prompt's rows (F-1): one block a row, `streams` groups of
+// 128 threads. The block sums row r's `slots` fp32 expert rows y[r, k, :] times wts[r, k] in slot order once, rounded to
+// bf16 as moe_combine_kernel writes them, into LDS; group s then runs tf_fn_hc_norm_v's body for stream s with that
+// branch, the same lanes and the same sums. The bytes of moe_combine_kernel then tf_fn_hc_norm_v, without the branch's
+// write and its reads back.
+constexpr int kNormMoeVMost = 4;
+extern "C" __global__ void __launch_bounds__(kNormMoeVMost * kNormVThreads)
+tf_fn_hc_norm_moe_v(const uint16_t* h, const float* y, const float* wts, const uint16_t* inject, uint16_t* h_out,
+                    uint16_t* x_out, const float* scale, int streams, float eps, int slots) {
+    __shared__ float br[kNormVDims];
+    __shared__ float scratch[kNormMoeVMost][kNormThreads / 32];
+    const int r = blockIdx.y, tid = threadIdx.x;
+    for (int d = tid; d < kNormVDims; d += streams * kNormVThreads) {
+        float acc = 0.f;
+        for (int k = 0; k < slots; ++k) acc += y[(static_cast<long long>(r) * slots + k) * kNormVDims + d] * wts[r * slots + k];
+        br[d] = rounded(acc, 2);
+    }
+    __syncthreads();
+    const int s = tid / kNormVThreads, lane = tid % kNormVThreads;
+    const long long base = (static_cast<long long>(r) * streams + s) * kNormVDims;
+    const float inj = bf16_to_float(inject[static_cast<long long>(r) * streams + s]);
+    float v[3][8];
+    float part[8];
+#pragma unroll
+    for (int e = 0; e < 8; ++e) part[e] = 0.f;
+#pragma unroll
+    for (int j = 0; j < 3; ++j) {
+        const int d0 = 8 * lane + j * kNormThreads;
+        if (d0 >= kNormVDims) break;
+        const uint4 hv = *reinterpret_cast<const uint4*>(h + base + d0);
+        const uint32_t hw[4] = {hv.x, hv.y, hv.z, hv.w};
+#pragma unroll
+        for (int e = 0; e < 8; ++e) {
+            float x = bf16_to_float(static_cast<uint16_t>(hw[e >> 1] >> ((e & 1) * 16)));
+            const float add = rounded(br[d0 + e] * inj, 2);
+            x = rounded(x + add, 2);
+            v[j][e] = x;
+            part[e] += x * x;
+        }
+    }
+    // tf_fn_hc_norm_v's tree: xor 16 (lane ^ 2), xor 8 (lane ^ 1), then xor 4, 2, 1 inside the lane's 8
+#pragma unroll
+    for (int e = 0; e < 8; ++e) part[e] = part[e] + __shfl_xor(part[e], 2, 32);
+#pragma unroll
+    for (int e = 0; e < 8; ++e) part[e] = part[e] + __shfl_xor(part[e], 1, 32);
+#pragma unroll
+    for (int m = 4; m > 0; m >>= 1) {
+        float next[8];
+#pragma unroll
+        for (int e = 0; e < 8; ++e) next[e] = part[e] + part[e ^ m];
+#pragma unroll
+        for (int e = 0; e < 8; ++e) part[e] = next[e];
+    }
+    if ((lane & 3) == 0) scratch[s][lane >> 2] = part[0];
+    __syncthreads();
+    float total = 0.f;
+    for (int w = 0; w < kNormThreads / 32; ++w) total += scratch[s][w];
+    const float rinv = rsqrtf(total / static_cast<float>(kNormVDims) + eps);
+#pragma unroll
+    for (int j = 0; j < 3; ++j) {
+        const int d0 = 8 * lane + j * kNormThreads;
+        if (d0 >= kNormVDims) break;
+        uint32_t ho[4], xo[4];
+#pragma unroll
+        for (int q = 0; q < 4; ++q) {
+            const float a0 = v[j][2 * q], a1 = v[j][2 * q + 1];
+            ho[q] = static_cast<uint32_t>(float_to_bf16(a0)) | (static_cast<uint32_t>(float_to_bf16(a1)) << 16);
+            const float x0 = (a0 * rinv) * scale[s * kNormVDims + d0 + 2 * q];
+            const float x1 = (a1 * rinv) * scale[s * kNormVDims + d0 + 2 * q + 1];
+            xo[q] = static_cast<uint32_t>(float_to_bf16(x0)) | (static_cast<uint32_t>(float_to_bf16(x1)) << 16);
+        }
+        *reinterpret_cast<uint4*>(h_out + base + d0) = uint4{ho[0], ho[1], ho[2], ho[3]};
+        *reinterpret_cast<uint4*>(x_out + base + d0) = uint4{xo[0], xo[1], xo[2], xo[3]};
+    }
+}
+
 // tf_fn_hc_mix over bf16 activations, 8 neighbouring outputs a thread (16-byte loads of g and x), the same bits.
 extern "C" __global__ void tf_fn_hc_mix8(const void* g, int gkind, const uint16_t* x, uint16_t* mixed, int rows,
                                          int streams, int dims) {
