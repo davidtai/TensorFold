@@ -193,11 +193,13 @@ fn routerSelect(t: *Rig, rng: *rig.Rng, rows: usize, d: usize, e: usize, top_k: 
                 shared_item = item;
                 continue;
             }
-            try std.testing.expectEqualSlices(i32, &item, have[3 * n ..][0..3]);
+            const at_n = [3]i32{ have[3 * n], have[3 * n + 1], have[3 * n + 2] };
+            try std.testing.expectEqualSlices(i32, &item, &at_n);
             n += 1;
         }
         for (n..cap) |slot| try std.testing.expectEqual(@as(i32, 0), have[3 * slot + 2]);
-        try std.testing.expectEqualSlices(i32, &shared_item.?, have[3 * cap ..][0..3]);
+        const at_cap = [3]i32{ have[3 * cap], have[3 * cap + 1], have[3 * cap + 2] };
+        try std.testing.expectEqualSlices(i32, &shared_item.?, &at_cap);
     }
     for (1..3) |v| for (0..5) |k| {
         if (k == 3 and v != 0) {
