@@ -108,6 +108,34 @@ pub const stream_list_blocks = 16;
 /// attention 13,952 do; lm_head 248,320 and the draft readout 79,591 keep the waves rule)
 pub const stream_one_col_n = 20_000;
 
+/// Where an unrouted plain product takes the held-codes tile (D-27; stream bench bench14 on gfx1151, the bytes of
+/// today's tile): 4-bit at 2 to 4 rows on the rule's columns (`cb`, row tile `ri`); at 5 to 8 rows in one 8-row pass,
+/// at CB 4 from held_wide_n columns (Flash Next's in-proj 16,480 and lm_head) and at CB 2 over (held_narrow_lo,
+/// held_narrow_hi] (out-proj and attention out, 2,560). Attention in (13,952) and hc down keep two 4-row passes.
+pub const HeldPick = struct { r: usize, c: usize, rows: c_int };
+pub const held_wide_n = 16_000;
+pub const held_narrow_lo = 1_000;
+pub const held_narrow_hi = 4_096;
+pub fn heldPick(bits: c_int, m: c_int, total_n: c_int, cb: c_int, ri: usize) ?HeldPick {
+    if (bits != 4 or m < 2 or m > 8) return null;
+    const ci = std.mem.indexOfScalar(c_int, &stream_cbs, cb) orelse return null;
+    if (m <= 4) return .{ .r = ri - 1, .c = ci, .rows = stream_rows[ri] };
+    if (total_n >= held_wide_n) return .{ .r = 2, .c = 2, .rows = 8 };
+    if (total_n > held_narrow_lo and total_n <= held_narrow_hi) return .{ .r = 2, .c = 1, .rows = 8 };
+    return null;
+}
+
+test "heldPick: the held tile at 2 to 4 rows on the rule's columns, at 5 to 8 rows by width" {
+    try std.testing.expectEqual(@as(?HeldPick, null), heldPick(4, 1, 16480, 1, 0));
+    try std.testing.expectEqual(@as(?HeldPick, .{ .r = 0, .c = 3, .rows = 2 }), heldPick(4, 2, 248320, 8, 1));
+    try std.testing.expectEqual(@as(?HeldPick, .{ .r = 1, .c = 0, .rows = 4 }), heldPick(4, 3, 2560, 1, 2));
+    try std.testing.expectEqual(@as(?HeldPick, .{ .r = 2, .c = 2, .rows = 8 }), heldPick(4, 6, 16480, 4, 2));
+    try std.testing.expectEqual(@as(?HeldPick, .{ .r = 2, .c = 1, .rows = 8 }), heldPick(4, 8, 2560, 1, 2));
+    try std.testing.expectEqual(@as(?HeldPick, null), heldPick(4, 5, 13952, 4, 2));
+    try std.testing.expectEqual(@as(?HeldPick, null), heldPick(4, 7, 324, 1, 2));
+    try std.testing.expectEqual(@as(?HeldPick, null), heldPick(8, 3, 2560, 1, 2));
+}
+
 /// The K-parallel tiles of a short prompt: cb columns a lane set, r rows a pass over up to rb row blocks.
 pub const KpTile = struct { cb: c_int, r: c_int, waves: c_int, rb: c_int, loop: bool = true };
 pub const kp_tiles = [_]KpTile{
@@ -155,6 +183,9 @@ pub const Kernels = struct {
     stream_on: bool,
     /// A test's forced columns a lane (a stream_cbs value; 0: the rule), where the shape takes it.
     stream_cb_force: c_int,
+    /// The held-codes plain tile at 4-bit (stream.hpp stream_body's HELD) by rows (2, 4, 8) and columns a lane
+    /// (stream_cbs; null where not built): `heldPick` says which products take it.
+    held: [3][stream_cbs.len]?Function,
     block: [bit_widths.len]Function,
     gemm: [bit_widths.len]Function,
     wmma_gemm: [bit_widths.len]Function,
@@ -222,6 +253,14 @@ pub const Kernels = struct {
 
     fn resolve(k: *Kernels, comptime dot: []const u8, comptime shape: []const u8, m: Module) Error!void {
         @setEvalBranchQuota(400_000);
+        inline for (.{ 2, 4, 8 }, 0..) |rows, r| {
+            inline for (stream_cbs, 0..) |cb, c| {
+                k.held[r][c] = if ((rows < 8 and cb * rows <= 16) or (rows == 8 and (cb == 2 or cb == 4)))
+                    try m.function(std.fmt.comptimePrint("_ZN2tf4rocm23affine_dot2_stream_heldINS0_{s}ELi4ELi{d}ELi{d}EEEvNS0_6AffineENS0_11StreamSidesEii", .{ dot, rows, cb }))
+                else
+                    null;
+            }
+        }
         k.stream_list = .{
             try m.function(std.fmt.comptimePrint("_ZN2tf4rocm23affine_dot2_stream_listINS0_{s}ELi4ELi4ELi2ELb1EEEvNS0_6AffineENS0_11StreamSidesEiii", .{dot})),
             try m.function(std.fmt.comptimePrint("_ZN2tf4rocm23affine_dot2_stream_listINS0_{s}ELi4ELi4ELi4ELb0EEEvNS0_6AffineENS0_11StreamSidesEiii", .{dot})),
@@ -429,6 +468,11 @@ pub const Kernels = struct {
             if (cb != k.stream_cb_force or cb * stream_rows[ri] > 16 or cb * a.bits > stream_code_words or (cb < 2 and (pair_div == 2 or relu2))) continue;
             pick = i;
         }
+        if (a.route.items == 0 and pair_div == 1 and !relu2) {
+            if (heldPick(a.bits, a.m, total_n, stream_cbs[pick], ri)) |hp| {
+                if (k.held[hp.r][hp.c]) |f| return heldGo(r, f, a, sides_in, total_n, items, s, lpc_log2, hp.rows, stream_cbs[hp.c]);
+            }
+        }
         const per_block: c_int = stream_waves * (@as(c_int, 32) >> lpc_log2) * @divExact(stream_cbs[pick], pair_div);
         var blocks: c_uint = cdiv(total_n, per_block);
         if (sides.count > 0) {
@@ -478,6 +522,32 @@ pub const Kernels = struct {
         else
             .{ .x = blocks, .y = row_blocks, .z = @intCast(items) };
         try go(r, f, grid, .{ .x = 32 * stream_waves }, s, &args);
+    }
+
+    /// A plain product on the held-codes tile: `rows` rows a block (every row of the launch in one row block at 5-8).
+    fn heldGo(r: *const runtime.Runtime, f: Function, a: Arg, sides_in: StreamSides, total_n: c_int, items: c_int, s: abi.Stream, lpc_log2: u5, rows: c_int, cb: c_int) Error!void {
+        const per_block: c_int = stream_waves * (@as(c_int, 32) >> lpc_log2) * cb;
+        var sides = sides_in;
+        var blocks: c_uint = cdiv(total_n, per_block);
+        if (sides.count > 0) {
+            blocks = 0;
+            for (0..@intCast(sides.count)) |i| {
+                sides.first[i] = @intCast(blocks);
+                blocks += cdiv(sides.n[i], per_block);
+            }
+            sides.first[@intCast(sides.count)] = @intCast(blocks);
+        }
+        sides.row_blocks = 0;
+        var args: hl.Args = .{};
+        try args.add(a);
+        try args.add(sides);
+        try args.add(@as(c_int, lpc_log2));
+        try args.add(@as(c_int, switch (a.group) {
+            32 => 0,
+            64 => 1,
+            else => 2,
+        }));
+        try go(r, f, .{ .x = blocks, .y = cdiv(a.m, rows), .z = @intCast(items) }, .{ .x = 32 * stream_waves }, s, &args);
     }
 
     /// One row on the row tile: a lane owns a group, a wave reads a column's row in one run.
