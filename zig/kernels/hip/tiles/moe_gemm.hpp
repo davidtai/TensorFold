@@ -292,7 +292,9 @@ __device__ __forceinline__ void wmma_moe_tile(Affine a, float limit) {
 // more tiles. BM rows a pass, the same 128 staged weight rows (S::col), waves of WR rows. gfx1151 at 8,192 rows
 // (w2/moe_bench.hip, -DTF_BENCH_INEXACT): gate+up at 128 rows, 64 x 32 waves, 22.6 ms against 25.0 for the exact tile;
 // down at 64 rows, 32 x 32 waves, 12.2 ms against 13.8. Relative RMS against float64 2.4e-3 and 1.7e-3. Served at
-// PC-1's one chunk the 64-row down dequantized each item twice; MG-2 runs it at 128 rows (mlx_tiles.hpp).
+// PC-1's one chunk the 64-row down dequantized each item twice; MG-2 runs it at 128 rows (mlx_tiles.hpp). Down's
+// epilogue stages each wave's sums in LDS and stores 16-byte row segments (DL-4d): served at one chunk it was 23 % of a
+// block's life, store issue with 64 dword stores a lane (w2/diag-phase).
 template <class S, int AHEAD, int BM, int WR>
 __device__ __forceinline__ void wmma_moe_inexact_tile(Affine a, float limit) {
 #if TF_DEVICE_WMMA_GFX11
@@ -417,14 +419,14 @@ __device__ __forceinline__ void wmma_moe_inexact_tile(Affine a, float limit) {
                 (window(std::integral_constant<int, J>{}, w0 + J), ...);
             }(std::make_integer_sequence<int, AHEAD>{});
         }
+        if constexpr (S::kAct) {
 #pragma unroll
-        for (int mt = 0; mt < kMT; ++mt) {
+            for (int mt = 0; mt < kMT; ++mt) {
 #pragma unroll
-            for (int i = 0; i < 8; ++i) {
-                const int row = wm * WR + mt * 16 + 2 * i + rh;
-                if (row >= rows_left) continue;
-                const long long orow = out_row(a, h0 + row);
-                if constexpr (S::kAct) {
+                for (int i = 0; i < 8; ++i) {
+                    const int row = wm * WR + mt * 16 + 2 * i + rh;
+                    if (row >= rows_left) continue;
+                    const long long orow = out_row(a, h0 + row);
                     // moe_act_kernel on the pair's fp32 sums: clamp when limit > 0, g / (1 + exp(-g)) * u, hip_bfloat16
 #pragma unroll
                     for (int j = 0; j < kNT / 2; ++j) {
@@ -437,10 +439,42 @@ __device__ __forceinline__ void wmma_moe_inexact_tile(Affine a, float limit) {
                         const hip_bfloat16 v(g / (1.f + expf(-g)) * u);
                         reinterpret_cast<uint16_t*>(a.out16)[orow * S::kNI + 64 * bx + lines[j]] = v.data;
                     }
-                } else {
-#pragma unroll
-                    for (int j = 0; j < kNT; ++j) a.out[orow * S::kN + S::col(bx, lines[j])] = acc[mt][j][i];
                 }
+            }
+        } else {
+            // down's epilogue through LDS (DL-4d): the loop's last window ended with lds_barrier after its fragment
+            // reads and its stash, so no wave reads xs again in this pass, and the next pass starts with lds_barrier
+            // before its stash. A wave stages each 16-row tile of its kNT x 16 fp32 sums in its own xs region and
+            // stores whole row segments, 16 bytes a lane. Rows past the item are not stored.
+            constexpr int kCols = kNT * 16;      // a wave's sums a row
+            constexpr int kChunks = kCols / 4;   // 16-byte chunks a row
+            constexpr int kStride = kCols + 4;   // a staged row, in floats
+            static_assert(16 * kChunks % 32 == 0 && 8 * 16 * kStride * 4 <= BM * kLdw * 4, "epilogue staging");
+            float* stage = reinterpret_cast<float*>(xs) + wave * 16 * kStride;
+            const int col0 = S::col(bx, lines[0] - rl);  // the wave's first hidden column
+#pragma unroll
+            for (int mt = 0; mt < kMT; ++mt) {
+#pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    float* srow = stage + (2 * i + rh) * kStride + rl;
+#pragma unroll
+                    for (int j = 0; j < kNT; ++j) srow[16 * j] = acc[mt][j][i];
+                }
+                __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront");
+                __builtin_amdgcn_wave_barrier();
+                __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront");
+#pragma unroll
+                for (int c = 0; c < 16 * kChunks / 32; ++c) {
+                    const int idx = 32 * c + lane;
+                    const int r = idx / kChunks, q = idx % kChunks;
+                    const u32x4 v = *reinterpret_cast<const u32x4*>(stage + r * kStride + 4 * q);
+                    const int row = wm * WR + mt * 16 + r;
+                    if (row < rows_left) *reinterpret_cast<u32x4*>(a.out + out_row(a, h0 + row) * S::kN + col0 + 4 * q) = v;
+                }
+                // the next tile's writes come after these reads in the wave's LDS order
+                __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront");
+                __builtin_amdgcn_wave_barrier();
+                __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront");
             }
         }
     }
