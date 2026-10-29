@@ -1,5 +1,7 @@
 #pragma once
 
+#include <type_traits>
+
 #include "../ops/common.hpp"
 #include "common/wmma.hpp"
 
@@ -442,7 +444,20 @@ extern "C" __global__ void tf_fn_sparse_merge_gate(const float* parts_o, const f
 //   KBLK (Q4-2): K in the cache in 4-token blocks of 16-dim groups: block b, group dg holds the 4 tokens' 16 dims
 //        (128 bytes): element ((g cap / 4 + b) 16 + dg) 64 + (key % 4) 16 + d % 16. The same 16 loads a chunk, a lane
 //        a key as today, 4 lines a load against 16.
-template <bool KCO, bool VT, bool PARTS = false, bool LO = false, bool V16 = false, bool KBLK = false>
+// W2 QR-1 arm (w2/proto-qr1, never merged):
+//   VBF: V in the cache in 4-token blocks, a dim's 4 tokens together: element ((g cap / 4 + b) 256 + d) 4 + key % 4.
+//        p.v's B fragments are loaded straight from it (no vt, no transpose, LDS without vt): lane (dim d = 16 j + col)
+//        takes a 16-cell step as 4 eight-byte loads, one a 4-cell group, 16 lanes one 128-byte line. A group whose 4
+//        keys are not one aligned block (a row's tail, a dead cell, a part boundary) takes 4 two-byte loads, a key each;
+//        a dead cell reads key 0, as today. The B values and the WMMA order are today's, so the bytes are.
+struct alignas(16) PromptSmemNoVt {
+    float part[4][16][kPromptChunk + 1];
+    float p[16][kPromptPRow];
+    uint16_t vt[1][1][8];
+    float m[16], l[16], alpha[16];
+};
+
+template <bool KCO, bool VT, bool PARTS = false, bool LO = false, bool V16 = false, bool KBLK = false, bool VBF = false>
 __device__ void w4_sparse_ql(const float* __restrict__ q, const uint16_t* __restrict__ k, const uint16_t* __restrict__ v,
                              const int* __restrict__ ids, long long id_stride, const int* __restrict__ count,
                              const int* __restrict__ sparse, const uint16_t* qg, void* out, float* parts_ms,
@@ -452,7 +467,7 @@ __device__ void w4_sparse_ql(const float* __restrict__ q, const uint16_t* __rest
     using tf::rocm::f32x8;
     using tf::rocm::u32x8;
     using Mma = tf::rocm::WmmaBF16;
-    __shared__ PromptSmem S;
+    __shared__ std::conditional_t<VBF, PromptSmemNoVt, PromptSmem> S;
     const int r = blockIdx.x, g = blockIdx.y;
     const int t = threadIdx.x, lane = t & 31, wave = t >> 5;
     const int col = lane & 15, half = lane >> 4;
@@ -470,8 +485,8 @@ __device__ void w4_sparse_ql(const float* __restrict__ q, const uint16_t* __rest
         __builtin_amdgcn_wave_barrier();
     };
     constexpr int kKsRow = 9;  // KCO stage row: 64 dims + 8, in 16-byte units
-    uint4* ks = reinterpret_cast<uint4*>(&S.vt[wave][0][0]);
-    static_assert(32 * kKsRow * 16 <= sizeof(S.vt[0]), "the K stage fits the wave's vt area");
+    uint4* ks = reinterpret_cast<uint4*>(&S.vt[KCO ? wave : 0][0][0]);
+    static_assert(!KCO || 32 * kKsRow * 16 <= sizeof(S.vt[0]), "the K stage fits the wave's vt area");
 
     bf16x16 qh[4];
 #pragma unroll
@@ -536,7 +551,39 @@ __device__ void w4_sparse_ql(const float* __restrict__ q, const uint16_t* __rest
         }
         uint4 vx[8];
         uint32_t vw[32];
-        if constexpr (V16) {
+        u32x8 vb[2][4];
+        if constexpr (VBF) {
+#pragma unroll
+            for (int ks_ = 0; ks_ < 2; ++ks_) {
+#pragma unroll
+                for (int gi = 0; gi < 4; ++gi) {
+                    const int c = ks_ * 16 + 4 * gi;
+                    const int k0 = __shfl(key, c, 32), k3 = __shfl(key, c + 3, 32);
+                    if ((k0 & 3) == 0 && k3 == k0 + 3) {
+#pragma unroll
+                        for (int j = 0; j < 4; ++j) {
+                            const uint2 w = *reinterpret_cast<const uint2*>(
+                                v + head_base + (static_cast<long long>(k0 >> 2) * kPromptDims + dim0 + j * 16 + col) * 4);
+                            vb[ks_][j][2 * gi] = w.x;
+                            vb[ks_][j][2 * gi + 1] = w.y;
+                        }
+                    } else {
+                        int kt[4];
+#pragma unroll
+                        for (int e = 0; e < 4; ++e) kt[e] = __shfl(key, c + e, 32);
+#pragma unroll
+                        for (int j = 0; j < 4; ++j) {
+                            uint16_t h[4];
+#pragma unroll
+                            for (int e = 0; e < 4; ++e)
+                                h[e] = v[head_base + (static_cast<long long>(kt[e] >> 2) * kPromptDims + dim0 + j * 16 + col) * 4 + (kt[e] & 3)];
+                            vb[ks_][j][2 * gi] = prompt_pack(h[0], h[1]);
+                            vb[ks_][j][2 * gi + 1] = prompt_pack(h[2], h[3]);
+                        }
+                    }
+                }
+            }
+        } else if constexpr (V16) {
             const uint4* v4 = reinterpret_cast<const uint4*>(v) + head_base / 8 + dim0 / 2 + lane;
 #pragma unroll
             for (int gi = 0; gi < 8; ++gi) {
@@ -585,7 +632,8 @@ __device__ void w4_sparse_ql(const float* __restrict__ q, const uint16_t* __rest
             for (int i = 0; i < 8; ++i) S.part[wave][2 * i + half][nt * 16 + col] = s[i];
         }
         if constexpr (KCO) wave_order();  // the stage's reads before vt is rewritten
-        if constexpr (VT || V16) {
+        if constexpr (VBF) {
+        } else if constexpr (VT || V16) {
             uint32_t ra[16], rb[16];
 #pragma unroll
             for (int i = 0; i < 16; ++i) {
@@ -663,9 +711,14 @@ __device__ void w4_sparse_ql(const float* __restrict__ q, const uint16_t* __rest
             const bf16x16 ph = __builtin_bit_cast(bf16x16, hw), pl = __builtin_bit_cast(bf16x16, lw);
 #pragma unroll
             for (int j = 0; j < 4; ++j) {
-                const uint4* src = reinterpret_cast<const uint4*>(&S.vt[wave][j * 16 + col][ks_ * 16]);
-                const uint4 lo = src[0], hi = src[1];
-                const u32x8 w = {lo.x, lo.y, lo.z, lo.w, hi.x, hi.y, hi.z, hi.w};
+                u32x8 w;
+                if constexpr (VBF) {
+                    w = vb[ks_][j];
+                } else {
+                    const uint4* src = reinterpret_cast<const uint4*>(&S.vt[wave][j * 16 + col][ks_ * 16]);
+                    const uint4 lo = src[0], hi = src[1];
+                    w = u32x8{lo.x, lo.y, lo.z, lo.w, hi.x, hi.y, hi.z, hi.w};
+                }
                 const bf16x16 b = __builtin_bit_cast(bf16x16, w);
                 acc[j] = Mma::mma(ph, b, acc[j]);
                 if constexpr (LO) acc[j] = Mma::mma(pl, b, acc[j]);
@@ -730,6 +783,17 @@ W2_Q4_KERNEL(w2_sparse_q41, true, false)
 W2_Q4_KERNEL(w2_sparse_q42, false, true)
 W2_Q4_KERNEL(w2_sparse_q412, true, true)
 #undef W2_Q4_KERNEL
+#define W2_QR_KERNEL(NAME, KBLK)                                                                                        \
+    extern "C" __global__ void __launch_bounds__(kPromptThreads)                                                        \
+    NAME(const float* q, const void* k, const void* v, const int* ids, long long id_stride, const int* count,           \
+         const int* sparse, const void* qg, void* out, long long cap, float scale) {                                    \
+        w4_sparse_ql<false, false, false, false, false, KBLK, true>(q, static_cast<const uint16_t*>(k),                 \
+            static_cast<const uint16_t*>(v), ids, id_stride, count, sparse, static_cast<const uint16_t*>(qg), out,      \
+            nullptr, cap, scale);                                                                                       \
+    }
+W2_QR_KERNEL(w2_sparse_qr1, false)
+W2_QR_KERNEL(w2_sparse_qr12, true)
+#undef W2_QR_KERNEL
 
 // The decode tile (tf_fn_sparse_tile_parts: parts, p v over hi + lo) on today's V layout and on QL-3's.
 #define W4_QL_PARTS(NAME, VT)                                                                                           \
@@ -753,6 +817,16 @@ W2_Q4_PARTS(w2_sparse_tile_parts_q41, true, false)
 W2_Q4_PARTS(w2_sparse_tile_parts_q42, false, true)
 W2_Q4_PARTS(w2_sparse_tile_parts_q412, true, true)
 #undef W2_Q4_PARTS
+#define W2_QR_PARTS(NAME, KBLK)                                                                                         \
+    extern "C" __global__ void __launch_bounds__(kPromptThreads)                                                        \
+    NAME(const float* q, const void* k, const void* v, const int* ids, long long id_stride, const int* count,           \
+         const int* sparse, float* parts_o, float* parts_ms, long long cap, float scale) {                              \
+        w4_sparse_ql<false, false, true, true, false, KBLK, true>(q, static_cast<const uint16_t*>(k),                   \
+            static_cast<const uint16_t*>(v), ids, id_stride, count, sparse, nullptr, parts_o, parts_ms, cap, scale);     \
+    }
+W2_QR_PARTS(w2_sparse_tile_parts_qr1, false)
+W2_QR_PARTS(w2_sparse_tile_parts_qr12, true)
+#undef W2_QR_PARTS
 
 // kv_write (tf_kv_write) into QL-3's V layout: element (r, h, j) of the (len, kv_heads, 256) bf16 rows at slot pos0 + r
 extern "C" __global__ void w4_kv_write_ql3(const uint16_t* src, uint16_t* cache, int len, int kv_heads, int total, int pos0) {
@@ -763,6 +837,18 @@ extern "C" __global__ void w4_kv_write_ql3(const uint16_t* src, uint16_t* cache,
     const int r = static_cast<int>(i / (static_cast<long long>(kPromptDims) * kv_heads));
     const long long slot = pos0 + r;
     const long long to = (((static_cast<long long>(h) * (total / 4) + slot / 4) * (kPromptDims / 2) + j / 2) * 4 + slot % 4) * 2 + j % 2;
+    cache[to] = src[i];
+}
+
+// kv_write into QR-1's V layout: element (r, h, j) of the (len, kv_heads, 256) bf16 rows at slot pos0 + r
+extern "C" __global__ void w2_kv_write_vbf(const uint16_t* src, uint16_t* cache, int len, int kv_heads, int total, int pos0) {
+    const long long i = gid();
+    if (i >= static_cast<long long>(len) * kv_heads * kPromptDims) return;
+    const int j = static_cast<int>(i % kPromptDims);
+    const int h = static_cast<int>((i / kPromptDims) % kv_heads);
+    const int r = static_cast<int>(i / (static_cast<long long>(kPromptDims) * kv_heads));
+    const long long slot = pos0 + r;
+    const long long to = ((static_cast<long long>(h) * (total / 4) + slot / 4) * kPromptDims + j) * 4 + slot % 4;
     cache[to] = src[i];
 }
 
