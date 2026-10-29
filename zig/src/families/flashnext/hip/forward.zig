@@ -438,7 +438,10 @@ pub fn run(ops: Ops, m: *const model.Model, host: *Host, segs: []const Seg, wind
     if (!window) for (segs) |g| {
         g.c.pooled = (g.pos + g.tokens.len) / d.index_ratio;
     };
-    return .{ .mixed = try hcPre(o, m, m.mix, x, rows, null), .streams = h };
+    const out: Out = .{ .mixed = try hcPre(o, m, m.mix, x, rows, null), .streams = h };
+    // PF-1's prefetches (hip.moe.parts on a window of at most prefetch_rows rows) rejoin the stream once, after the last layer
+    if (window and m.tp == null and rows <= hip.moe.prefetch_rows) try o.join();
+    return out;
 }
 
 /// Streams a forward takes at once at most.

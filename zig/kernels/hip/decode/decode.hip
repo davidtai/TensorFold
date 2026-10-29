@@ -788,3 +788,37 @@ extern "C" __global__ void __launch_bounds__(kSelectThreads)
                      int top_k) {
     select_body(logits, pick, wts, items, members, capacity, experts, top_k);
 }
+
+// PF-1: a MoE call's live experts' down codes read into the caches beside its gate and up, so the down finds them there.
+// Reads only: the plan's items (expert, first member, members; members 0 for a dead item), then each live item's expert's
+// `expert_bytes` of codes from `words`, at most `cap_bytes` in all; ids outside [0, experts) are skipped. It writes nothing:
+// the store below never runs (count is never negative) and only keeps the loads.
+constexpr int kPrefetchItems = 64;
+extern "C" __global__ void __launch_bounds__(256)
+    tf_moe_prefetch(const int* items, int count, const uint4* words, long long expert_bytes, int experts,
+                    long long cap_bytes) {
+    __shared__ int ids[kPrefetchItems];
+    __shared__ int live;
+    if (threadIdx.x == 0) live = 0;
+    __syncthreads();
+    // the live items in any order (each block its own list; the order only changes which codes are read first)
+    for (int k = threadIdx.x; k < count; k += blockDim.x) {
+        const int e = items[3 * k];
+        if (items[3 * k + 2] > 0 && e >= 0 && e < experts) {
+            const int at = atomicAdd(&live, 1);
+            if (at < kPrefetchItems) ids[at] = e;
+        }
+    }
+    __syncthreads();
+    const int n_ids = live < kPrefetchItems ? live : kPrefetchItems;
+    const long long per = expert_bytes / 16;
+    long long left = cap_bytes / 16;
+    unsigned acc = 0;
+    for (int k = 0; k < n_ids && left > 0; ++k) {
+        const long long n = per < left ? per : left;
+        const uint4* w = words + static_cast<long long>(ids[k]) * per;
+        for (long long j = blockIdx.x * 256ll + threadIdx.x; j < n; j += gridDim.x * 256ll) acc ^= w[j].x;
+        left -= n;
+    }
+    if (count < 0 && acc == 0x9e3779b9u) *const_cast<int*>(items) = static_cast<int>(acc);
+}
