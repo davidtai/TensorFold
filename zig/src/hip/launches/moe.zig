@@ -82,27 +82,33 @@ pub fn routerSelect(l: *const Launcher, x: C, kind: c_int, rows16: C, logits: F,
     try a.add(@as(c_int, @intFromBool(sh.staged)));
     try a.add(done);
     try a.add(@as(c_int, @intFromBool(apart)));
-    try l.go(l.dec.router_select[if (kind == 1) 0 else 1], dim(cdiv(e, 4), 1, 1), dim(128, 1, 1), sh.bytes, s, &a);
+    try l.go(l.dec.router_select[if (kind == 1) 0 else 1], dim(cdiv(e, select_waves), 1, 1), dim(32 * select_waves, 1, 1), sh.bytes, s, &a);
     return true;
 }
 
-/// The most bytes of x tf_router_select stages: 2 rows of 2560 bf16. On gfx1151, 3 and 4 staged rows (15 and 20 KB a
-/// block) cost more in blocks a WGP than they save in L2 reads (4 rows: 67.8 us staged, 61.5 us not; 2 rows: 50.4 us
-/// staged, 55.1 us not; work/tensorfold-halo/w4/bench/router_bench.hip).
-const STAGED = 2 * 2560 * 2;
+/// decode.hip's kRouterSelectWaves: tf_router_select's waves a block (a wave an expert in its sums).
+const select_waves = 8;
 
-/// decode.hip's kPlanPairs: the pairs route_plan takes in the router launch, a thread each (32 * kRouterWaves).
-const plan_pairs = 128;
+/// The most bytes of x tf_router_select stages: 5 rows of 2560 bf16. At 8 waves a block, staged rows of 1 and 3 to 5
+/// cost less than each wave reading x itself (gfx1151 us a launch, staged / not: 1 row 29.8 / 32.0, 3 rows 36.7 / 42.1,
+/// 5 rows 40.4 / 49.4); from 6 rows (30 KB a block) the blocks a WGP cost more (6 rows 56.6 / 52.9; runq 611,
+/// work/tensorfold-halo/w2/rt). At 4 waves a block staging past 2 rows lost (W4: work/tensorfold-halo/w4/bench).
+const STAGED = 5 * 2560 * 2;
+
+/// The pairs route_plan takes in the router launch, a thread each (32 * kRouterSelectWaves).
+const plan_pairs = 32 * select_waves;
 
 /// tf_router_select's dynamic shared memory: a verify window's rows staged (x 16-byte aligned, d a multiple of 8, at most
 /// STAGED bytes), then for 2 to 8 rows the waves' top lists and a plan's route_plan pool; the larger of the two, since the
-/// second takes it after the first. One row takes none (its pick and plan are in static shared memory).
+/// second takes it after the first. One row's pick and plan are in static shared memory (it may stage its row).
 fn routerShared(x: usize, r: c_int, d: c_int, e: c_int, plan: bool) struct { bytes: u32, staged: bool } {
-    if (r < 2 or r > 8) return .{ .bytes = 0, .staged = false };
+    if (r < 1 or r > 8) return .{ .bytes = 0, .staged = false };
     const staged = @rem(d, 8) == 0 and x % 16 == 0 and r * d * 2 <= STAGED;
     const rows: c_int = if (staged) r * d * 2 else 0;
+    if (r == 1) return .{ .bytes = @intCast(rows), .staged = staged };
     // the waves' top values and indices (32 each a wave), then route_plan's counts, starts and ends, scans and pairs
-    const ints: c_int = if (e - 1 <= 1024) 2 * 32 * 4 + (if (plan) 3 * e + 2 * 128 + plan_pairs else 0) else 0;
+    const threads: c_int = 32 * select_waves;
+    const ints: c_int = if (e - 1 <= 1024) 2 * threads + (if (plan) 3 * e + 2 * threads + plan_pairs else 0) else 0;
     return .{ .bytes = @intCast(@max(rows, ints * 4)), .staged = staged };
 }
 
