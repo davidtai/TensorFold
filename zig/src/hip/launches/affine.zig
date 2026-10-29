@@ -627,9 +627,11 @@ pub const Kernels = struct {
     }
 
     /// The shapes tiles/moe_gemm.hpp compiles (MoeGateUp, MoeDown): Flash Next's expert banks, 4-bit group 32, bf16 x.
-    pub const MoeShape = struct { n: c_int, k: c_int, bits: c_int = 4, group: c_int = 32, blocks: c_uint };
-    pub const moe_gu_shape: MoeShape = .{ .n = 1280, .k = 2560, .blocks = 10 };
-    pub const moe_down_shape: MoeShape = .{ .n = 2560, .k = 640, .blocks = 20 };
+    /// blocks: an item's column blocks on the exact tile (128 staged rows a block); inexact_blocks: on the inexact tile
+    /// (256 staged rows a block, MS-2)
+    pub const MoeShape = struct { n: c_int, k: c_int, bits: c_int = 4, group: c_int = 32, blocks: c_uint, inexact_blocks: c_uint };
+    pub const moe_gu_shape: MoeShape = .{ .n = 1280, .k = 2560, .blocks = 10, .inexact_blocks = 5 };
+    pub const moe_down_shape: MoeShape = .{ .n = 2560, .k = 640, .blocks = 20, .inexact_blocks = 10 };
 
     /// Whether moeGateUp takes the plan `a` of `items` items (its output aside).
     pub fn moeGateUpTakes(k: *const Kernels, a: Arg, items: c_int) bool {
@@ -657,8 +659,9 @@ pub const Kernels = struct {
         try args.add(a);
         try args.add(limit);
         // numerics=inexact: the codes dequantized to bf16 in the tile, other bits
-        const f = if (k.inexact) k.moe_gu_inexact orelse k.moe_gu.? else k.moe_gu.?;
-        try go(r, f, .{ .x = moe_gu_shape.blocks, .z = @intCast(items) }, .{ .x = 256 }, s, &args);
+        const ix = k.inexact and k.moe_gu_inexact != null;
+        const f = if (ix) k.moe_gu_inexact.? else k.moe_gu.?;
+        try go(r, f, .{ .x = if (ix) moe_gu_shape.inexact_blocks else moe_gu_shape.blocks, .z = @intCast(items) }, .{ .x = 256 }, s, &args);
         return true;
     }
 
@@ -668,8 +671,9 @@ pub const Kernels = struct {
         if (!k.moeDownTakes(a, items) or a.out == 0 or a.out16 != 0) return false;
         var args: hl.Args = .{};
         try args.add(a);
-        const f = if (k.inexact) k.moe_down_inexact orelse k.moe_down.? else k.moe_down.?;
-        try go(r, f, .{ .x = moe_down_shape.blocks, .z = @intCast(items) }, .{ .x = 256 }, s, &args);
+        const ix = k.inexact and k.moe_down_inexact != null;
+        const f = if (ix) k.moe_down_inexact.? else k.moe_down.?;
+        try go(r, f, .{ .x = if (ix) moe_down_shape.inexact_blocks else moe_down_shape.blocks, .z = @intCast(items) }, .{ .x = 256 }, s, &args);
         return true;
     }
 

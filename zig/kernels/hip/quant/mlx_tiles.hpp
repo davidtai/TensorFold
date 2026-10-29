@@ -57,31 +57,22 @@ __global__ void __launch_bounds__(moe_tile::kThreads) affine_wmma_moe_down(Affin
     wmma_moe_tile<MoeDown, BITS, 64, MoeDown::kAhead>(a, 0.f);
 }
 
-// numerics=inexact: the same with the codes dequantized to bf16 (gate+up: 128-row passes of 64 x 32 waves)
+// numerics=inexact: the same with the codes dequantized to bf16, in 128 x 256 blocks (MS-2: 8 waves of 64 x 64, 16 tiles
+// a wave, K windows of 32 so 3 blocks fit a WGP): 5 blocks an item, half the 128 x 128 tile's per-block fixed cost a
+// FLOP and a third fewer LDS reads a WMMA, the same WMMA chain over K for every output
 template <int BITS>
 __global__ void __launch_bounds__(moe_tile::kThreads) affine_wmma_moe_gu_inexact(Affine a, float limit) {
     static_assert(BITS == 4, "4-bit codes");
-    wmma_moe_inexact_tile<MoeGateUp, 2, 128, 64>(a, limit);
+    wmma_moe_inexact_tile<MoeGateUp, 2, 128, 64, 256, 32>(a, limit);
 }
 
 // down in gate+up's 128-row passes of 64 x 32 waves (MG-2): a prompt plan's item of up to 128 pairs is one pass, so
 // its weights are dequantized once (the 64-row pass did it twice an item: VALU : WMMA 12.8 against 6.5 for gate+up)
+// (MS-2: 128 x 256 blocks as gate+up, 10 blocks an item)
 template <int BITS>
 __global__ void __launch_bounds__(moe_tile::kThreads) affine_wmma_moe_down_inexact(Affine a) {
     static_assert(BITS == 4, "4-bit codes");
-    wmma_moe_inexact_tile<MoeDown, 2, 128, 64>(a, 0.f);
-}
-
-// MS-2 (prototype, code objects only): the same tiles with 128 x 256 blocks (BN 256: 8 waves of 64 x 64, 16 tiles a
-// wave), KW K a window. Not launched.
-template <int KW>
-__global__ void __launch_bounds__(moe_tile::kThreads) affine_wmma_moe_gu_inexact_bn256(Affine a, float limit) {
-    wmma_moe_inexact_tile<MoeGateUp, 2, 128, 64, 256, KW>(a, limit);
-}
-
-template <int KW>
-__global__ void __launch_bounds__(moe_tile::kThreads) affine_wmma_moe_down_inexact_bn256(Affine a) {
-    wmma_moe_inexact_tile<MoeDown, 2, 128, 64, 256, KW>(a, 0.f);
+    wmma_moe_inexact_tile<MoeDown, 2, 128, 64, 256, 32>(a, 0.f);
 }
 
 // ---- a prompt's plain 4-bit group-32 products at Qwen3.8-Flash-Next's K (tiles/dense_gemm.hpp, gfx11 matrix cores) ----
