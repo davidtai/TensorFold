@@ -41,9 +41,10 @@ pub const Routed = struct {
     }
 };
 
-/// PF-1 (W4 queue155): a call of at most this many rows reads its live experts' down codes on the side stream beside its
-/// gate and up; from 3 rows the second kernel slows the gate and up by more than the down gains.
-pub const prefetch_rows = 2;
+/// PF-1 (W4 queue155, 619): a call of at most this many rows reads its live experts' down codes on the side stream beside
+/// its gate and up. One row only (PF-1a): from 3 rows the second kernel slows the gate and up by more than the down gains,
+/// and the served A/B (619) found no gain at 2 rows (default-spec 0.9957) against +2.8 % at one (control).
+pub const prefetch_rows = 1;
 
 /// experts.py: the decode tile's most rows, the GEMM tile's rows and where it starts, items' pair cap.
 const LANE_ROWS = 8;
@@ -162,8 +163,8 @@ fn expertParts(o: Ops, kind: Kind, r: Routed, x: Tensor, rows: usize, logits: u6
             if (tile == BLOCK_ROWS) count = @min(cap, planItems(pairs, r.rows, tile));
         }
     }
-    // PF-1: the live experts' down codes into the caches on the side stream while the gate and up run (all of them: at
-    // most 17 experts, 13.9 MB, at 2 rows)
+    // PF-1: the live experts' down codes into the caches on the side stream while the gate and up run (all of them: 11
+    // experts, 9.0 MB, at one row)
     if (prefetch and rows <= prefetch_rows and !o.prefill) switch (ex.down.handle) {
         .mlx => |h| {
             const expert_bytes = @as(usize, ex.down.n) * @as(usize, ex.down.k) * @as(usize, h.bits) / 8;

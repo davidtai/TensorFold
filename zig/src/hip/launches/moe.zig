@@ -156,7 +156,7 @@ pub fn tf_moe_act(l: *const Launcher, both: CF, out: P, kind: c_int, pairs: c_in
     try l.go(l.moe_act[if (kind == 1) 0 else 1], dim(cdiv(total, 256), 1, 1), dim(256, 1, 1), 0, s, &a);
 }
 
-/// PF-1's blocks: 16 of 256 threads finish a 1- or 2-row call's down codes about when its down starts (W4 queue155).
+/// PF-1's blocks: 16 of 256 threads finish a one-row call's down codes about when its down starts (W4 queue155).
 pub const prefetch_blocks = 16;
 
 /// tf_moe_prefetch on stream `s` (the side stream): reads the live items' experts' down codes, `expert_bytes` each, at most
