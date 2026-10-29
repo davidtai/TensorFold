@@ -550,6 +550,15 @@ const own_records = [_]Record{
         },
     },
     .{
+        .launch = .{ .name = "MoE down codes read beside the gate and up (PF-1, side stream) tf_moe_prefetch", .symbol = "tf_moe_prefetch", .image = "decode", .threads = 256 },
+        .usage = .{
+            .{ .vgprs = 11, .sgprs = 26, .lds = 260, .private = 0, .bound = 256, .wave = 32 },
+            .{ .vgprs = 11, .sgprs = 26, .lds = 260, .private = 0, .bound = 256, .wave = 32 },
+            .{ .vgprs = 11, .sgprs = 26, .lds = 260, .private = 0, .bound = 256, .wave = 32 },
+            .{ .vgprs = 11, .sgprs = 22, .lds = 260, .private = 0, .bound = 256, .wave = 32 },
+        },
+    },
+    .{
         .launch = .{ .name = "prompt expert gate+up tile 4-bit", .symbol = "_ZN2tf4rocm18affine_wmma_moe_guILi4EEEvNS0_6AffineEf", .image = "affine_tiles", .threads = 256, .served = limits.gfx11_only },
         .usage = .{
             .{ .vgprs = 0, .sgprs = 0, .lds = 0, .private = 0, .bound = 256, .wave = 32 },

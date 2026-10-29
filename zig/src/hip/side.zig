@@ -1,12 +1,19 @@
 //! A second HIP stream beside a step's own: `fork` gives it the step's work so far, `join` gives its work back.
 //! Work on it runs beside the step's launches (a captured graph keeps the branch); one in-order stream serves every user.
+//!
+//! The events' invariant: a slot is recorded and waited on in the same call (`fork` or `join`), so it is never recorded
+//! again before its wait is queued. A wait takes the record that is the event's last when the wait is queued (HIP's
+//! hipStreamWaitEvent, eagerly and in a captured graph), so a later record of the same slot, ring_len takes on, changes
+//! no wait already queued: the ring may wrap any number of times between joins. ring_len only keeps a step's records
+//! apart in a captured graph's events: 256 covers one forward's PF-1 (48 forks and a join), B-5 (48 forks, 48 joins) and
+//! PF-2 (48 forks) together, 193.
 const std = @import("std");
 const abi = @import("abi.zig");
 const runtime = @import("runtime.zig");
 const util = @import("launches/util.zig");
 
 /// Ordering events a step's forks and joins take in turn: each record in a captured step names its own event.
-pub const ring_len = 128;
+pub const ring_len = 256;
 
 pub const Ring = struct {
     r: *const runtime.Runtime,
@@ -100,4 +107,41 @@ test "fork records on the main stream and the side waits; join the other way; of
     try (Side{}).fork(main);
     try side.join(util.counting);
     try std.testing.expectEqual(@as(usize, 4), Mock.n);
+}
+
+test "more forks than the ring before one join: each wait follows its own record at once, the slots wrap in order" {
+    const Mock = struct {
+        var last_record: usize = 0;
+        var records: usize = 0;
+        var waits: usize = 0;
+        var paired: bool = true;
+        var first: [3]usize = .{ 0, 0, 0 };
+        fn record(e: abi.Event, _: abi.Stream) callconv(.c) c_int {
+            if (records == waits + 1) paired = false; // a record while another one's wait is outstanding
+            last_record = @intFromPtr(e);
+            if (records < 3) first[records] = last_record;
+            records += 1;
+            return 0;
+        }
+        fn wait(_: abi.Stream, e: abi.Event, _: c_uint) callconv(.c) c_int {
+            if (@intFromPtr(e) != last_record or waits + 1 != records) paired = false;
+            waits += 1;
+            return 0;
+        }
+    };
+    var r: runtime.Runtime = undefined;
+    r.api.hipEventRecord = Mock.record;
+    r.api.hipStreamWaitEvent = Mock.wait;
+    var ring: Ring = .{ .r = &r };
+    for (&ring.events, 0..) |*e, i| e.* = @ptrFromInt(0x1000 + i);
+    const side: Side = .{ .stream = @ptrFromInt(0x20), .ring = &ring };
+    const forks = 2 * ring_len + 3;
+    for (0..forks) |_| try side.fork(@ptrFromInt(0x10));
+    try side.join(@ptrFromInt(0x10));
+    try std.testing.expect(Mock.paired);
+    try std.testing.expectEqual(@as(usize, forks + 1), Mock.records);
+    try std.testing.expectEqual(@as(usize, forks + 1), Mock.waits);
+    // the join took slot (forks mod ring_len): the ring wrapped twice in order
+    try std.testing.expectEqual(@as(usize, 0x1000 + forks % ring_len), Mock.last_record);
+    try std.testing.expectEqual(@as(usize, 0x1001), Mock.first[1]);
 }
