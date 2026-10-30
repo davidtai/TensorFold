@@ -222,9 +222,10 @@ TF_EXL3_GEMV(8)
 #undef TF_EXL3_GEMV
 
 // ---- 4. the prompt GEMM over the plan (gfx11 WMMA) ----------------------------------------------------------------
-// Grid (N / 128, items, mats), 256 threads (8 waves: 2 along m x 4 along n). A block owns one item and one 128-column
-// block; passes of 64 member rows. A k step of 32: the step's 2 x 8 trellis tiles decoded into LDS as fp16 [n][k] (the
-// B layout: a lane a column, 16 k), the rows' x into LDS [m][k], two v_wmma_f32_16x16x16_f16 a 16 x 16 accumulator;
+// Grid (N / 128, items, mats), 512 threads (16 waves: 4 along m x 4 along n). A block owns one item and one 128-column
+// block; passes of 128 member rows. A k step of 32: the step's 2 x 8 trellis tiles decoded into LDS as fp16 [n][k] (the
+// B layout: a lane a column, 16 k; one tile a wave), the rows' x into LDS [m][k], two v_wmma_f32_16x16x16_f16 a 16 x 16
+// accumulator (a wave whose 32 rows are all past the item's rows skips its products);
 // the next step's loads go to registers while this step computes. FOLD > 0: each group of FOLD k steps (FOLD x 32 k)
 // runs its WMMA chain from zero and is added to the fp32 sum on the VALU, groups in k order (gfx1151's f16 WMMA adds
 // with a truncating aligner, so a chain over all of K drifts: lane G4's probe, K 4,096: 0.66 % bf16 flips on one chain,
@@ -235,7 +236,8 @@ TF_EXL3_GEMV(8)
 
 namespace {
 
-constexpr int kBM = 64, kBK = 32, kLK = kBK + 8;  // rows a pass, k a step, halves an LDS row
+constexpr int kWM = 4, kBM = 32 * kWM, kBK = 32, kLK = kBK + 8;  // waves along m, rows a pass, k a step, LDS row
+constexpr int kGemmThreads = 32 * kWM * 4;                        // 4 waves along n
 
 typedef _Float16 h16 __attribute__((ext_vector_type(16)));
 typedef float f8 __attribute__((ext_vector_type(8)));
@@ -252,35 +254,32 @@ __device__ void gemm(const uint16_t* X0, const uint16_t* X1, int x_div, const ui
     __shared__ __attribute__((aligned(16))) _Float16 As[2][kBM * kLK];
     __shared__ __attribute__((aligned(16))) _Float16 Bs[2][128 * kLK];
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    const int wm = warp & 1, wn = warp >> 1;  // rows 32 wm.., columns 32 wn..
+    const int wm = warp % kWM, wn = warp / kWM;  // rows 32 wm.., columns 32 wn..
     const int t = lane & 3, g = lane >> 2, l16 = lane & 15;
     const int Nt = n >> 4, iters = k / kBK;
     const uint16_t* X = mat ? X1 : X0;
     const uint32_t* T = reinterpret_cast<const uint32_t*>(mat ? tp1[e] : tp0[e]);
-    // a thread's x chunk: row tid / 4, 8 halves at k (tid % 4) * 8; a wave's 2 trellis tiles: q = 2 warp + u
+    // a thread's x chunk: row tid / 4, 8 halves at k (tid % 4) * 8; a wave's trellis tile: q = warp (kk q / 8, nt q % 8)
     const int arow = threadIdx.x >> 2, akc = threadIdx.x & 3;
 
     for (int h0 = 0; h0 < count; h0 += kBM) {
         const int rows = count - h0 < kBM ? count - h0 : kBM;
         const bool alive = arow < rows;
+        const bool live = wm * 32 < rows;  // this wave's rows hold at least one of the item's
         const uint16_t* xa = X + (alive ? static_cast<size_t>(members[first + h0 + arow] / x_div) * k : 0) + akc * 8;
         uint4 ra;
-        uint32_t rb[2][lane_words<K2>()];
+        uint32_t rb[lane_words<K2>()];
+        const int q = warp, kk_t = q >> 3, nt_t = q & 7;
         auto gload = [&](int s) {
             ra = alive ? *reinterpret_cast<const uint4*>(xa + s * kBK) : make_uint4(0u, 0u, 0u, 0u);
-#pragma unroll
-            for (int u = 0; u < 2; ++u) {
-                const int q = 2 * warp + u, kk = q >> 3, nt = q & 7;
-                lane_load<K2>(T + (static_cast<size_t>(s * 2 + kk) * Nt + nb * 8 + nt) * TW, lane, rb[u]);
-            }
+            lane_load<K2>(T + (static_cast<size_t>(s * 2 + kk_t) * Nt + nb * 8 + nt_t) * TW, lane, rb);
         };
         auto sstore = [&](int buf) {
             *reinterpret_cast<uint4*>(&As[buf][arow * kLK + akc * 8]) = ra;
-#pragma unroll
-            for (int u = 0; u < 2; ++u) {
-                const int q = 2 * warp + u, kk = q >> 3, nt = q & 7;
+            {
+                const int kk = kk_t, nt = nt_t;
                 uint32_t p[4];
-                decode_lane<K2, CB>(rb[u], lane, p);
+                decode_lane<K2, CB>(rb, lane, p);
                 _Float16* c0 = &Bs[buf][(nt * 16 + g) * kLK + kk * 16 + 2 * t];
                 _Float16* c1 = c0 + 8 * kLK;
                 *reinterpret_cast<uint32_t*>(c0) = p[0];
@@ -302,33 +301,35 @@ __device__ void gemm(const uint16_t* X0, const uint16_t* X1, int x_div, const ui
         for (int s = 0; s < iters; ++s) {
             const int buf = s & 1;
             if (s + 1 < iters) gload(s + 1);
+            if (live) {
 #pragma unroll
-            for (int kk = 0; kk < 2; ++kk) {
-                h16 af[2], bf[2];
+                for (int kk = 0; kk < 2; ++kk) {
+                    h16 af[2], bf[2];
 #pragma unroll
-                for (int i = 0; i < 2; ++i) af[i] = *reinterpret_cast<const h16*>(&As[buf][(wm * 32 + i * 16 + l16) * kLK + kk * 16]);
+                    for (int i = 0; i < 2; ++i) af[i] = *reinterpret_cast<const h16*>(&As[buf][(wm * 32 + i * 16 + l16) * kLK + kk * 16]);
 #pragma unroll
-                for (int j = 0; j < 2; ++j) bf[j] = *reinterpret_cast<const h16*>(&Bs[buf][(wn * 32 + j * 16 + l16) * kLK + kk * 16]);
-#pragma unroll
-                for (int i = 0; i < 2; ++i)
-#pragma unroll
-                    for (int j = 0; j < 2; ++j) {
-                        if constexpr (FOLD > 0) {
-                            const bool first = kk == 0 && s % FOLD == 0;
-                            d[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(af[i], bf[j], first ? zero : d[i][j]);
-                        } else {
-                            acc[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(af[i], bf[j], acc[i][j]);
-                        }
-                    }
-            }
-            if constexpr (FOLD > 0) {
-                if ((s + 1) % FOLD == 0 || s + 1 == iters) {
+                    for (int j = 0; j < 2; ++j) bf[j] = *reinterpret_cast<const h16*>(&Bs[buf][(wn * 32 + j * 16 + l16) * kLK + kk * 16]);
 #pragma unroll
                     for (int i = 0; i < 2; ++i)
 #pragma unroll
-                        for (int j = 0; j < 2; ++j)
+                        for (int j = 0; j < 2; ++j) {
+                            if constexpr (FOLD > 0) {
+                                const bool first = kk == 0 && s % FOLD == 0;
+                                d[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(af[i], bf[j], first ? zero : d[i][j]);
+                            } else {
+                                acc[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(af[i], bf[j], acc[i][j]);
+                            }
+                        }
+                }
+                if constexpr (FOLD > 0) {
+                    if ((s + 1) % FOLD == 0 || s + 1 == iters) {
 #pragma unroll
-                            for (int r = 0; r < 8; ++r) acc[i][j][r] = acc[i][j][r] + d[i][j][r];
+                        for (int i = 0; i < 2; ++i)
+#pragma unroll
+                            for (int j = 0; j < 2; ++j)
+#pragma unroll
+                                for (int r = 0; r < 8; ++r) acc[i][j][r] = acc[i][j][r] + d[i][j][r];
+                    }
                 }
             }
             if (s + 1 < iters) sstore(buf ^ 1);
@@ -339,7 +340,8 @@ __device__ void gemm(const uint16_t* X0, const uint16_t* X1, int x_div, const ui
             // the sums of 32 rows (the waves of one wm) in LDS over Bs (20,480 B >= 32 x 128 x 4 B), then a wave a row:
             // tf_exl3_down_epilogue's statements (sk 1) on its 128 columns
             float* zs = reinterpret_cast<float*>(&Bs[0][0]);
-            for (int hf = 0; hf < 2; ++hf) {
+            constexpr int kRowsAWave = 32 / (kGemmThreads / 32);
+            for (int hf = 0; hf < kWM; ++hf) {
                 if (wm == hf) {
 #pragma unroll
                     for (int i = 0; i < 2; ++i)
@@ -352,8 +354,8 @@ __device__ void gemm(const uint16_t* X0, const uint16_t* X1, int x_div, const ui
                 }
                 __syncthreads();
 #pragma unroll
-                for (int q = 0; q < 4; ++q) {
-                    const int ml = warp * 4 + q, m = hf * 32 + ml;
+                for (int q = 0; q < kRowsAWave; ++q) {
+                    const int ml = warp * kRowsAWave + q, m = hf * 32 + ml;
                     if (m >= rows) continue;  // uniform over the wave
                     const int p = members[first + h0 + m];
                     const int c = nb * 128 + 4 * lane;
@@ -396,7 +398,7 @@ __device__ void gemm(const uint16_t* X0, const uint16_t* X1, int x_div, const ui
 // GLM's prompt GEMM: 64-k groups (2 steps) folded on the VALU.
 constexpr int kGemmFold = 2;
 
-extern "C" __global__ void __launch_bounds__(256) tf_exl3_gemm(const uint16_t* X0, const uint16_t* X1, int x_div,
+extern "C" __global__ void __launch_bounds__(kGemmThreads) tf_exl3_gemm(const uint16_t* X0, const uint16_t* X1, int x_div,
                                                                const uint64_t* tp0, const uint64_t* tp1, const int* items,
                                                                const int* members, float* z, int k, int n, int pairs,
                                                                int experts) {
@@ -404,7 +406,7 @@ extern "C" __global__ void __launch_bounds__(256) tf_exl3_gemm(const uint16_t* X
 }
 
 // The down GEMM with the down epilogue fused (EPI 1): y [pair][N] fp32, the bits of tf_exl3_gemm + tf_exl3_down_epilogue.
-extern "C" __global__ void __launch_bounds__(256) tf_exl3_gemm_down(const uint16_t* X0, int x_div, const uint64_t* tp0,
+extern "C" __global__ void __launch_bounds__(kGemmThreads) tf_exl3_gemm_down(const uint16_t* X0, int x_div, const uint64_t* tp0,
                                                                     const int* items, const int* members,
                                                                     const uint16_t* svh_d, float* y, int k, int n,
                                                                     int pairs, int experts) {
@@ -412,7 +414,7 @@ extern "C" __global__ void __launch_bounds__(256) tf_exl3_gemm_down(const uint16
 }
 
 // The same GEMM on one WMMA chain over K (the pre-fold arithmetic): the numerics tests' reference, not served.
-extern "C" __global__ void __launch_bounds__(256) tf_exl3_gemm_chain(const uint16_t* X0, const uint16_t* X1, int x_div,
+extern "C" __global__ void __launch_bounds__(kGemmThreads) tf_exl3_gemm_chain(const uint16_t* X0, const uint16_t* X1, int x_div,
                                                                      const uint64_t* tp0, const uint64_t* tp1,
                                                                      const int* items, const int* members, float* z,
                                                                      int k, int n, int pairs, int experts) {

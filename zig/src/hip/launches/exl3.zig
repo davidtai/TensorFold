@@ -125,7 +125,10 @@ pub fn gemv(l: *const Launcher, p: Product, sk: usize, rows: usize, s: S) Error!
     try l.go(l.exl3.gemv[which], dim(p.n / 128 * sk, p.count, p.mats), dim(256, 1, 1), @intCast(shared), s, &a);
 }
 
-/// The WMMA GEMM (gfx11): passes of 64 member rows an item, the whole of K a block (no split), 64-k groups folded on
+/// The GEMM's threads a block (exl3.hip kGemmThreads: 16 waves, 4 along m x 4 along n, a pass of 128 rows).
+pub const gemm_threads = 512;
+
+/// The WMMA GEMM (gfx11): passes of 128 member rows an item, the whole of K a block (no split), 64-k groups folded on
 /// the VALU in k order.
 pub fn gemm(l: *const Launcher, p: Product, s: S) Error!void {
     return gemmOn(l, l.exl3.gemm, p, s);
@@ -153,7 +156,7 @@ pub fn gemmDown(l: *const Launcher, p: Product, svh_d: u64, y: u64, s: S) Error!
     try a.add(int(p.n));
     try a.add(int(p.pairs));
     try a.add(int(p.experts));
-    try l.go(l.exl3.gemm_down, dim(p.n / 128, p.count, 1), dim(256, 1, 1), 0, s, &a);
+    try l.go(l.exl3.gemm_down, dim(p.n / 128, p.count, 1), dim(gemm_threads, 1, 1), 0, s, &a);
 }
 
 fn gemmOn(l: *const Launcher, f: Function, p: Product, s: S) Error!void {
@@ -162,7 +165,7 @@ fn gemmOn(l: *const Launcher, f: Function, p: Product, s: S) Error!void {
     var a: Args = .{};
     try addProduct(&a, p);
     try a.add(int(p.experts));
-    try l.go(f, dim(p.n / 128, p.count, p.mats), dim(256, 1, 1), 0, s, &a);
+    try l.go(f, dim(p.n / 128, p.count, p.mats), dim(gemm_threads, 1, 1), 0, s, &a);
 }
 
 fn addProduct(a: *Args, p: Product) Error!void {
