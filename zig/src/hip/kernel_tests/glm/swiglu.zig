@@ -99,15 +99,18 @@ test "glm swiglu (CUDA rounding points), prompt kernel: every bf16 gate against 
     try rig.expect(bad == 0, "glm swiglu prompt: {d} outputs differ", .{bad});
 }
 
-/// x and w on a grid whose products and sums are exact in fp32 in any order: x in {-3..3} / 2, w in {-3..3} / 16
-/// (a product is n / 32, |n| <= 9; 4,096 of them stay under 2^24 / 32), so a tile's fp32 sums are the exact sums.
+/// x and w on a grid whose products and partial sums are exact in IEEE fp32 (x in {-3..3} / 2, w in {-3..3} / 16: a
+/// product is n / 32, |n| <= 9). The tiles' fp32 sums still need not be exact: on gfx1151 an exact zero up-sum of the
+/// stream tile came out 2^-23 (run e3c131c6). So the expected bits come from the tile's own fp32 sums of the same
+/// product (the plain fp32 tile has the pair's sum order: the row and column tests above), each checked against the
+/// exact float64 sum first.
 fn grid(rng: *rig.Rng, n: usize, den: f64) ![]u16 {
     const out = try gpa.alloc(u16, n);
     for (out) |*v| v.* = check.rnd(@as(f64, @floatFromInt(@as(i64, @intCast(rng.next() % 7)) - 3)) / den);
     return out;
 }
 
-test "glm swiglu (CUDA rounding points), decode pair epilogue and the prompt's WMMA + kernel: bit-equal to the emulation" {
+test "glm swiglu (CUDA rounding points), decode pair epilogue and the prompt's WMMA + kernel: bit-equal to the emulation of the tile's own sums" {
     const t = try Rig.open(1 << 20);
     defer t.close();
     if (!t.bf16 or t.on.affine.bf16_glu[0] == null or t.on.affine.bf16_wmma[0] == null) return error.SkipZigTest;
@@ -115,48 +118,56 @@ test "glm swiglu (CUDA rounding points), decode pair epilogue and the prompt's W
     const k = 4096;
     for ([_]usize{ 2048, 12288 }) |cols| {
         const m = 8;
+        const n = 2 * cols;
         const hx = try grid(&rng, m * k, 2);
         defer gpa.free(hx);
-        const hw = try grid(&rng, 2 * cols * k, 16);
+        const hw = try grid(&rng, n * k, 16);
         defer gpa.free(hw);
-        // the exact (gate | up) sums, and the expected bits
-        const want = try gpa.alloc(u16, m * cols);
-        defer gpa.free(want);
-        var clamped: usize = 0;
-        for (0..m) |r| for (0..cols) |j| {
-            var gs: f64 = 0;
-            var us: f64 = 0;
-            for (0..k) |i| {
-                const xv = check.val(hx[r * k + i]);
-                gs += xv * check.val(hw[j * k + i]);
-                us += xv * check.val(hw[(cols + j) * k + i]);
-            }
-            if (gs > limit or @abs(us) > limit) clamped += 1;
-            want[r * cols + j] = emulate(bf16Of32(@floatCast(gs)), bf16Of32(@floatCast(us)));
-        };
+        const exact = try check.Dots.of(hx, hw, m, n, k);
+        defer exact.free();
         var x = try t.upload(hx);
         defer x.free();
         var w = try t.upload(hw);
         defer w.free();
         var act = try t.alloc(m * cols * 2);
         defer act.free();
-        var gu = try t.alloc(m * 2 * cols * 2);
+        var gu = try t.alloc(m * n * 2);
         defer gu.free();
+        var sums = try t.alloc(m * n * 4);
+        defer sums.free();
+        var inexact: [2]usize = .{ 0, 0 };
         for ([_]usize{ 1, 2, 3, 4, 5, 8 }) |mm| for ([_]bool{ false, true }) |prompt| {
+            const what = if (prompt) "wmma + kernel" else "decode pair";
+            // the tile's fp32 sums of (gate | up): the stream tile for decode, the WMMA tile for a prompt
+            try t.on.affine.bf16Go(&t.r, K.bf16Arg(at(x), at(w), at(sums), 0, @intCast(mm), @intCast(n), k), prompt, t.stream.handle);
             try act.fill8(0);
             if (prompt) {
-                try t.on.affine.bf16Go(&t.r, K.bf16Arg(at(x), at(w), 0, at(gu), @intCast(mm), @intCast(2 * cols), k), true, t.stream.handle);
+                try t.on.affine.bf16Go(&t.r, K.bf16Arg(at(x), at(w), 0, at(gu), @intCast(mm), @intCast(n), k), true, t.stream.handle);
                 try glm.swiglu(&t.on, p(gu), p(act), @intCast(mm), @intCast(cols), limit, t.stream.handle);
             } else {
                 try t.on.affine.bf16GluGo(&t.r, at(x), at(w), at(act), t.on.glm.silu, @intCast(mm), @intCast(cols), k, limit, t.stream.handle);
             }
             try t.stream.synchronize();
+            const fs = try rig.download(f32, sums);
+            defer gpa.free(fs);
             const got = try rig.download(u16, act);
             defer gpa.free(got);
-            const diff = std.mem.findDiff(u16, want[0 .. mm * cols], got[0 .. mm * cols]);
-            if (diff) |i| std.debug.print("glm swiglu {s} [{d}] {d} rows: output {d} is 0x{x:0>4}, emulation 0x{x:0>4}\n", .{ if (prompt) "wmma + kernel" else "decode pair", cols, mm, i, got[i], want[i] });
-            try rig.expect(diff == null, "glm swiglu {s} [{d}] {d} rows differs from the emulation", .{ if (prompt) "wmma + kernel" else "decode pair", cols, mm });
+            var bad: usize = 0;
+            for (0..mm) |r| for (0..cols) |j| {
+                const gi = r * n + j;
+                const ui = gi + cols;
+                for ([_]usize{ gi, ui }) |idx| {
+                    try rig.expect(@abs(fs[idx] - exact.want[idx]) <= exact.tol[idx], "glm swiglu {s} [{d}] {d} rows: sum {d} is {e}, exact {e}", .{ what, cols, mm, idx, fs[idx], exact.want[idx] });
+                    if (fs[idx] != exact.want[idx]) inexact[@intFromBool(prompt)] += 1;
+                }
+                const want = emulate(bf16Of32(fs[gi]), bf16Of32(fs[ui]));
+                if (got[r * cols + j] != want) {
+                    if (bad < 4) std.debug.print("glm swiglu {s} [{d}] {d} rows: ({d}, {d}) is 0x{x:0>4}, emulation 0x{x:0>4} (sums {e} {e}, exact {e} {e})\n", .{ what, cols, mm, r, j, got[r * cols + j], want, fs[gi], fs[ui], exact.want[gi], exact.want[ui] });
+                    bad += 1;
+                }
+            };
+            try rig.expect(bad == 0, "glm swiglu {s} [{d}] {d} rows: {d} outputs differ from the emulation", .{ what, cols, mm, bad });
         };
-        std.debug.print("RESULT glm swiglu (CUDA points) [2 x {d}, 4096]: decode pair and wmma + kernel at 1-8 rows bit-equal to the emulation ({d} of {d} clamped)\n", .{ cols, clamped, m * cols });
+        std.debug.print("RESULT glm swiglu (CUDA points) [2 x {d}, 4096]: decode pair and wmma + kernel at 1-8 rows bit-equal to the emulation of the tiles' sums; fp32 sums not exact: stream {d}, wmma {d}\n", .{ cols, inexact[0], inexact[1] });
     }
 }

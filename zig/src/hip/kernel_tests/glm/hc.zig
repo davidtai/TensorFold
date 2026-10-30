@@ -167,15 +167,20 @@ test "glm hc pre: the 24 mixing dots, Sinkhorn (20) and the collapsed RMS-normed
             for (0..D) |d| wo.add(r * D + d, check.val(go[r * D + d]), ref.out[d], ref.out_tol[d]);
             for (0..S) |k| wp.add(r * S + k, gp[r * S + k], ref.post[k], ref.post_tol[k]);
             for (0..S * S) |k| wc.add(r * S * S + k, gc[r * S * S + k], ref.comb[k], ref.comb_tol);
-            // Sinkhorn's result is near doubly stochastic: each row and column sums to 1 within 1e-3
+            // Sinkhorn ends on a column normalization (as glm_glue_hc.cuh's hc_finish): each column (the sum over i of
+            // comb[i][j]) is S / (S + hc_eps), 1 within 1e-5. Rows keep the residual of 20 iterations, so each row sum
+            // must equal the float64 reference's row sum (same iterations), not 1.
             for (0..S) |i| {
                 var rs: f64 = 0;
+                var rs_ref: f64 = 0;
                 var cs: f64 = 0;
                 for (0..S) |j| {
                     rs += gc[r * S * S + i * S + j];
+                    rs_ref += ref.comb[i * S + j];
                     cs += gc[r * S * S + j * S + i];
                 }
-                try rig.expect(@abs(rs - 1) < 1e-3 and @abs(cs - 1) < 1e-3, "hc comb row {d}: sums {d} {d}", .{ r, rs, cs });
+                try rig.expect(@abs(cs - 1) < 1e-5, "hc comb row {d} column {d}: sum {d}, not 1 within 1e-5", .{ r, i, cs });
+                try rig.expect(@abs(rs - rs_ref) <= 4 * ref.comb_tol, "hc comb row {d} row {d}: sum {d}, float64 {d}", .{ r, i, rs, rs_ref });
             }
         }
         try wo.done();
