@@ -203,7 +203,8 @@ const Builder = struct {
             b.why.* = try std.fmt.allocPrint(b.a, "{s}: {t} {any}, the HIP family reads {t} {any} as stored", .{ name, s.dtype, s.dims(), dtype, shape });
             return error.UnexpectedTensor;
         }
-        const got = try b.used.getOrPut(b.a, name);
+        // the index's own copy of the name: `name` may live in the builder's buffer
+        const got = try b.used.getOrPut(b.a, b.index.tensors.getKey(name).?);
         if (got.found_existing) return error.PlacedTwice;
         return s;
     }

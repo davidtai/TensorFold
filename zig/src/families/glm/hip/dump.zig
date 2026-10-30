@@ -593,7 +593,7 @@ pub const Dump = struct {
 
     /// A dump into `out` of reference run `ref`'s prompts (`a` an arena: everything lives until it goes).
     pub fn open(a: std.mem.Allocator, out: []const u8, ref: []const u8, eos: []const u32) !Dump {
-        try mkdir(try a.dupeZ(u8, out));
+        try mkdir(try a.dupeSentinel(u8, out, 0));
         return .{ .a = a, .out = out, .ref = ref, .prompts = try prompts(a, ref), .eos = eos };
     }
 
