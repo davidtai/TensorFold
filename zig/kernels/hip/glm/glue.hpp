@@ -281,7 +281,9 @@ extern "C" __global__ void __launch_bounds__(kThreads)
 // +-limit, s = bf16(silu(g)), out = bf16(u s). silu is read from tf_glm_silu, the bf16 nearest to silu(min(g, limit))
 // for each of the 65,536 bf16 g (filled once a device in double): CUDA's points with a correctly rounded s, the value
 // G5's float64 reference rounds. u s of two bf16 is exact in fp32, so the output is one rounding.
-extern "C" __device__ uint16_t tf_glm_silu[1 << 16];
+extern "C" {
+__device__ uint16_t tf_glm_silu[1 << 16];  // braces: a definition with C linkage, not a declaration
+}
 
 extern "C" __global__ void __launch_bounds__(kThreads) tf_glm_silu_fill(float limit) {
     const int h = blockIdx.x * kThreads + threadIdx.x;
