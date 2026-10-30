@@ -16,8 +16,8 @@ const fwd = glm.forward;
 const dump = glm.hip_load.dump;
 const State = fwd.State;
 const Buffers = fwd.Buffers;
-const D = dump.D;
-const V = dump.V;
+const D: usize = dump.D;
+const V: usize = dump.V;
 
 const usage =
     \\usage: tf-glm-hip-test forward <checkpoint> <ids.u32 | -> [--gen N] [--chunk R] [--tf] [--mtp]
