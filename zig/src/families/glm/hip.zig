@@ -14,6 +14,8 @@ pub const hip_load = struct {
     pub const load = @import("hip/load.zig");
     pub const verify = @import("hip/verify.zig");
     pub const dump = @import("hip/dump.zig");
+    /// A checkpoint directory to `Opened.model` in one call.
+    pub const open = @import("hip/open.zig");
 };
 
 test {
@@ -26,4 +28,5 @@ test {
     @import("std").testing.refAllDecls(hip_load.weights);
     @import("std").testing.refAllDecls(hip_load.verify);
     @import("std").testing.refAllDecls(hip_load.shards);
+    @import("std").testing.refAllDecls(hip_load.open);
 }
