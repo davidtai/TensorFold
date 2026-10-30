@@ -44,6 +44,8 @@ const nemotron_moe = @import("launches/nemotron_moe.zig");
 pub const exl3 = @import("launches/exl3.zig");
 /// GLM-5.3-Flash's glue: mHC pre and post, the residual, norms, stream mean, embedding (glm/glue.hpp).
 pub const glm = @import("launches/glm.zig");
+/// GLM-5.3-Flash's DSA: latent cache, absorb and expand, indexer keys and scores, top-512 lists, latent attention.
+pub const glm_dsa = @import("launches/glm_dsa.zig");
 
 pub const ConvArgs = conv.ConvArgs;
 pub const PlanArgs = plan.PlanArgs;
