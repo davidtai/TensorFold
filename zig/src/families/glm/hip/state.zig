@@ -74,7 +74,7 @@ pub const State = struct {
     pub const rec_layer: usize = @as(usize, c0.kda_heads) * c0.kda_dim * c0.kda_dim; // floats
 
     fn sizes(capacity: usize) struct { total: usize, lc: usize, ring: usize, pk: usize } {
-        const ring_rows = @min(capacity, index_ring);
+        const ring_rows: usize = @min(capacity, index_ring);
         const lc = capacity * lw * 2;
         const ring = ring_rows * i_dim * 2;
         const pk = (capacity / pool + 2) * i_dim * 2;
@@ -269,7 +269,7 @@ pub const att_parts = 5;
 /// 256-byte aligned; 64 KiB spare for the alignment of about 40 takes).
 pub fn scratchBytes(rows: usize, prompt: bool, capacity: usize) usize {
     const R = rows;
-    const B = @min(R, att_rows);
+    const B: usize = @min(R, att_rows);
     const V: usize = c0.vocab;
     const kda = R * kda_width * 2 + 2 * R * 128 * 2 + 2 * R * kda_n * 2 + 2 * R * kda_n * 4 + R * kda_n * 2 +
         R * kda_n * 4 + R * c0.kda_heads * 4 + R * kda_n * 4 + R * kda_n * 2;
@@ -286,7 +286,7 @@ pub fn scratchBytes(rows: usize, prompt: bool, capacity: usize) usize {
     const moe = R * E * 4 + 2 * pairs * 4 + pairs * 4 + 3 * (@min(pairs, E + 1) + pairs) * 4 +
         hip.Launcher.routeScratch(pairs, E + 1) + pairs * D * 4 + x3 + (if (prompt) R * 2 * c0.shared_inter * 4 else 0) +
         R * c0.shared_inter * 2 + R * D * 4;
-    const head = @min(R, head_rows) * V * 4;
+    const head = @as(usize, @min(R, head_rows)) * V * 4;
     return @max(@max(kda, dsa), @max(@max(dense, moe), head)) + (64 << 10);
 }
 

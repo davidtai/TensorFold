@@ -237,7 +237,7 @@ pub const Forward = struct {
         try dsa.indexUpdate(f.k, f.s, dp + wk_col * 2, X, igr, w.index.ln_w, w.index.ln_b, w.index.ape, cs.ik, cs.ig, cs.pk, pos, 0, R);
         // rows past the dense limit (2,051 keys) select their tokens; a window that has none attends densely
         const listed = host_pos + R - 1 >= cfg.keyWidth();
-        const B = @min(R, state.att_rows);
+        const B: usize = @min(R, state.att_rows);
         var tokens: u64 = 0;
         var counts: u64 = 0;
         var sparse: u64 = 0;
@@ -249,7 +249,7 @@ pub const Forward = struct {
             const sc: dsa.Scratch = .{ .scores = try ar.of(f32, B * np_max), .complete = try ar.of(i32, B), .ends = try ar.of(i32, B) };
             var r0: usize = 0;
             while (r0 < R) : (r0 += B) {
-                const n = @min(B, R - r0);
+                const n: usize = @min(B, R - r0);
                 const np = dsa.poolBucket(host_pos + r0, n, np_max);
                 try dsa.selectTokens(f.k, f.s, qq + (r0 * Q + cfg.mla_heads * cfg.nope) * 2, Q, dp + (r0 * X + wk_col + cfg.i_dim) * 2, X, cs.pk, pos, r0, host_pos, n, np, sc, tokens + r0 * dsa.width * 4, counts + r0 * 4, sparse + r0 * 4);
             }
@@ -257,7 +257,7 @@ pub const Forward = struct {
         const pt: dsa.Partials = .{ .po = try ar.of(f32, B * H * state.att_parts * lw), .pms = try ar.of(f32, B * H * state.att_parts * 2) };
         var r0: usize = 0;
         while (r0 < R) : (r0 += B) {
-            const n = @min(B, R - r0);
+            const n: usize = @min(B, R - r0);
             const keys: dsa.Keys = if (listed) .{ .listed = .{ .ids = tokens + r0 * dsa.width * 4, .id_stride = dsa.width, .counts = counts + r0 * 4, .sparse = sparse + r0 * 4 } } else .dense;
             const parts = if (listed) dsa.partsFor(dsa.width) else dsa.partsFor(host_pos + r0 + n);
             const off = r0 * H * lw * 2;
@@ -293,7 +293,7 @@ pub const Forward = struct {
         try nemo.select(f.l, cf(mlog), cf(w.bias), mi(pick), mf(wts), null, null, 0, int(R), int(E), int(top_k), f.cfg.routed_scale, f.cfg.norm_topk, f.s);
         // the plan over the routed pairs (experts + 1 as G1's tests plan them); 128 pairs an item in a prompt
         const tile: usize = if (b.prompt) 128 else 8;
-        const cap = @min(pairs, E + 1) + pairs / tile;
+        const cap: usize = @min(pairs, E + 1) + pairs / tile;
         const members = try ar.of(i32, pairs);
         const items = try ar.of(i32, 3 * cap);
         const scratch: u64 = if (pairs >= 4 * hip.Launcher.route_seg) try ar.take(hip.Launcher.routeScratch(pairs, E + 1)) else 0;

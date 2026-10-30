@@ -354,10 +354,17 @@ test "glm fwd: a KDA layer (20 prompt rows, then a decode row) against float64; 
         // the conv window: the last 3 rows' q | k | v projections
         const win = try t.get(u16, st.convAt(0), 3 * 3 * n_kda);
         const p = try mm(a, x.val[18 * D ..], D, 0, 3, kw.proj, 0, 3 * n_kda, D);
+        // fp32 sums over K 4,096 fall on the other side of a bf16 rounding boundary now and then: each value within
+        // one bf16 ulp of float64's (2^-7 of its size), the flips counted
         var flips: usize = 0;
-        for (win, p) |g, w| flips += @intFromBool(g != bfBits(w));
-        std.debug.print("RESULT glm fwd KDA block: conv window = the last 3 rows' projections, {d} of {d} values off float64's bf16 (fp32 sums at rounding boundaries)\n", .{ flips, win.len });
-        if (flips * 1000 > win.len) return error.TestExpectedEqual;
+        for (win, p, 0..) |g, w, i| {
+            flips += @intFromBool(g != bfBits(w));
+            if (!(@abs(bfVal(g) - w) <= @abs(w) * std.math.pow(f64, 2, -7) + 1e-30)) {
+                std.debug.print("FAIL glm fwd KDA block: conv window value {d}: {d} not within a bf16 ulp of {d}\n", .{ i, bfVal(g), w });
+                return error.TestExpectedApproxEq;
+            }
+        }
+        std.debug.print("RESULT glm fwd KDA block: conv window = the last 3 rows' projections, each within a bf16 ulp; {d} of {d} on the other side of float64's rounding\n", .{ flips, win.len });
     }
     // 2. a window's bits do not depend on its cut
     {
