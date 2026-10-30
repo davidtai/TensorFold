@@ -38,10 +38,11 @@ __global__ void __launch_bounds__(32 * kStreamWaves) bf16_stream_glu(Affine a, S
     stream_tile<Bf16Decoder, BF16Act, DotBF16, StreamGlmSwiglu, R, 2>(a, sides, lpc_log2, gshift);
 }
 
-// A prompt: the dense WMMA tile with its weights copied, not dequantized (one WMMA chain over K), at a compiled K.
+// A prompt: the dense WMMA tile (tiles/dense_gemm.hpp) with BF16 weight rows copied as stored, at a compiled K: each
+// 32-k group's two WMMA from zero, folded on the VALU in K order (no long chain through the WMMA accumulator).
 template <int K>
-__global__ void __launch_bounds__(dense_inexact::kThreads) bf16_wmma(Affine a) {
-    wmma_dense_inexact_tile<K, true>(a);
+__global__ void __launch_bounds__(dense_tile::kThreads) bf16_wmma(Affine a) {
+    wmma_dense_tile<K, DenseTune<K>::kAhead, false, true>(a);
 }
 
 }  // namespace rocm
