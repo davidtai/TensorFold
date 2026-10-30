@@ -760,9 +760,12 @@ fn chainRef(b: Block, state: []f64, out: []f64) !void {
 }
 
 /// Out bf16 against float64 within glm_ref_kda.zig:136's tolerance: 2^-8 of the value (the out's rounding) + 2^-8 of
-/// the row's largest value (y's bf16 rounding in the reference; the HIP chain keeps y fp32).
+/// the row's largest value (y's bf16 rounding, which fp32 and float64 sums can put on either side of a boundary). Both
+/// round y where CUDA does (glm_kda.cu:109). Prints the share of outs equal to float64's rounding and the mean error.
 fn expectOut(got: []const u16, want: []const f64, n: usize, what: []const u8) !void {
     var worst: f64 = 0;
+    var sum: f64 = 0;
+    var exact: usize = 0;
     for (0..want.len / n) |row| {
         var most: f64 = 0;
         for (want[row * n ..][0..n]) |e| most = @max(most, @abs(e));
@@ -770,10 +773,13 @@ fn expectOut(got: []const u16, want: []const f64, n: usize, what: []const u8) !v
             const tol = @abs(e) * std.math.pow(f64, 2, -8) + most * std.math.pow(f64, 2, -8) + 1e-30;
             const err = @abs(bfOf(g) - e);
             worst = @max(worst, err / tol);
+            sum += err / tol;
+            exact += @intFromBool(g == bfBits(e));
             try rig.expect(err <= tol, "KDA chain {s}: row {d} column {d}: {d} not {d} (tolerance {e})", .{ what, row, c, bfOf(g), e, tol });
         }
     }
-    std.debug.print("KDA chain {s}: worst error {d:.3} of its tolerance\n", .{ what, worst });
+    const count: f64 = @floatFromInt(want.len);
+    std.debug.print("KDA chain {s}: worst error {d:.3} of its tolerance, mean {d:.4}; {d:.4} of outs equal float64's rounding\n", .{ what, worst, sum / count, @as(f64, @floatFromInt(exact)) / count });
 }
 
 test "KDA: the window and prompt chains on the CUDA buffers against the float64 chain of glm_ref_kda" {
