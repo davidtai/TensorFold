@@ -71,17 +71,20 @@ pub const policy_prefill_step: u32 = state.prompt_rows;
 /// load.
 pub const max_drafts: u32 = serve.max_drafts;
 /// The MTP policy where neither --mtp-drafts, --mtp-confidence nor the mtp_depth key names one (the HIP default is 3
-/// drafts under 0.3): 3 drafts, the lane core's depth rule, no confidence floor. The draft head gives no probabilities
-/// yet, so the policy's confidence is never read: --mtp-confidence is refused, and --mtp-drafts alone drafts the
-/// lane core's depth with no floor.
+/// drafts under 0.3): 3 drafts, the lane core's depth rule, no confidence floor (the harness sweep's
+/// `--mtp-drafts N --mtp-confidence 0`).
 pub const policy_mtp: struct { drafts: u8, confidence: f64, depth: hip.policy.MtpDepth } = .{ .drafts = 3, .confidence = 0, .depth = .rule };
-pub const confidence_refusal = "--mtp-confidence: GLM-5.3-Flash on HIP drafts a fixed chain (its draft head gives no " ++
-    "probabilities yet); serve it without --mtp-confidence";
 
-/// Why `policy`'s MTP settings cannot serve GLM-5.3-Flash on HIP, or null: a gated chain stops on the draft head's
-/// probabilities.
+/// Why `policy`'s MTP settings cannot serve GLM-5.3-Flash on HIP, or null. The draft head gives no probabilities yet,
+/// so a confidence floor (--mtp-confidence past 0, or the HIP default's 0.3 under --mtp-drafts alone) and a gated
+/// chain are refused; --mtp-confidence 0 is no early stop.
 pub fn mtpRefused(policy: hip.Policy) ?[]const u8 {
-    if (policy.mtp.drafts > 0 and policy.mtp_depth == .gated)
+    if (policy.mtp.drafts == 0) return null;
+    if (policy.mtp.confidence > 0)
+        return "--mtp-confidence: GLM-5.3-Flash on HIP drafts a fixed chain (its draft head gives no probabilities " ++
+            "yet); serve it with --mtp-confidence 0 (with --mtp-drafts alone the HIP default's 0.3 applies), or " ++
+            "with neither flag";
+    if (policy.mtp_depth == .gated)
         return "mtp_depth=gated: GLM-5.3-Flash on HIP drafts a fixed chain (its draft head gives no probabilities yet); " ++
             "serve it with the depth rule (no mtp_depth key, or mtp_depth=rule)";
     return null;
@@ -235,12 +238,15 @@ test "GLM on HIP serves numerics=exact only: an inexact policy is refused by nam
     try std.testing.expect(std.mem.indexOf(u8, numericsRefused(p).?, "numerics=exact only") != null);
 }
 
-test "GLM on HIP drafts a fixed chain: 3 drafts by default, a gated chain refused by name" {
+test "GLM on HIP drafts a fixed chain: 3 drafts by default, --mtp-confidence 0 served, a floor or a gated chain refused" {
     var p: hip.Policy = .{};
     p.mtp = .{ .drafts = policy_mtp.drafts, .confidence = policy_mtp.confidence };
     try std.testing.expect(mtpRefused(p) == null);
-    p.mtp.confidence = 0.3; // --mtp-drafts alone keeps the HIP default's 0.3: never read, not refused
+    p.mtp = .{ .drafts = 2, .confidence = 0 }; // the sweep's --mtp-drafts 2 --mtp-confidence 0
     try std.testing.expect(mtpRefused(p) == null);
+    p.mtp.confidence = 0.3; // --mtp-drafts alone: the HIP default's floor
+    try std.testing.expect(std.mem.indexOf(u8, mtpRefused(p).?, "--mtp-confidence 0") != null);
+    p.mtp.confidence = 0;
     p.mtp_depth = .gated;
     try std.testing.expect(std.mem.indexOf(u8, mtpRefused(p).?, "mtp_depth=gated") != null);
     p.mtp.drafts = 0;

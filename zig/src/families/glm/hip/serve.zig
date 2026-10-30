@@ -41,8 +41,6 @@ pub const Engine = struct {
     fp: forward.Forward,
     fd: forward.Forward,
     fm: forward.Forward,
-    /// A prompt chunk's final-normed rows, the MTP layer's input in the prompt pass (bf16 [chunk][D]).
-    phid: hip.DeviceBuffer,
     /// Drafts a round asks for at most (0: no stream drafts; the MTP prompt pass is skipped).
     drafts: usize,
     /// Positions a stream's state holds: align64(window + 8).
@@ -78,8 +76,6 @@ pub const Engine = struct {
         errdefer e.db.deinit();
         e.mb = try state.Buffers.init(&e.r, state.window_rows, false, capacity);
         errdefer e.mb.deinit();
-        e.phid = try hip.DeviceBuffer.alloc(&e.r, if (drafts > 0) chunk * D * 2 else 0);
-        errdefer e.phid.free();
         const cfg = e.opened.ck.config;
         e.fp = try forward.Forward.init(&e.l, e.opened.model(), cfg, e.stream.handle, &e.pb);
         e.fd = try forward.Forward.init(&e.l, e.opened.model(), cfg, e.stream.handle, &e.db);
@@ -91,7 +87,6 @@ pub const Engine = struct {
     pub fn deinit(e: *Engine) void {
         e.stream.synchronize() catch {};
         e.gpa.free(e.row);
-        e.phid.free();
         e.mb.deinit();
         e.db.deinit();
         e.pb.deinit();
@@ -105,7 +100,7 @@ pub const Engine = struct {
 
     /// Device bytes of the two windows' buffers and arenas (the forward's scratch).
     pub fn scratchBytes(e: *const Engine) u64 {
-        return e.pb.buf.len + e.pb.arena.len + e.db.buf.len + e.db.arena.len + e.mb.buf.len + e.mb.arena.len + e.phid.len;
+        return e.pb.buf.len + e.pb.arena.len + e.db.buf.len + e.db.arena.len + e.mb.buf.len + e.mb.arena.len;
     }
 
     pub fn eos(e: *const Engine) []const u32 {
@@ -305,12 +300,11 @@ pub const Hip = struct {
     }
 
     /// A drafting stream's prompt rows [from, from + rows) through the MTP layer, each with the next prompt id
-    /// (lane F's `mtp`: row j is h_j and token j + 1). The prompt's last row waits for the first drawn token.
+    /// (lane F's `mtp`: row j is h_j and token j + 1). The prompt's last row waits for the first drawn token. The
+    /// chunk's own final-normed rows are the input: `mtp` reads them before it writes b.fnormed (stream order).
     fn mtpPrompt(h: *Hip, l: *Lane, prompt: []const u32, from: usize, rows: usize) !void {
         if (!l.mtp or rows == 0) return;
-        const e = h.e;
-        try copy(e, e.phid.base(), e.fp.b.fnormed, rows * D * 2);
-        try e.fp.mtp(&l.st, prompt[from + 1 ..][0..rows], e.phid.base());
+        try h.e.fp.mtp(&l.st, prompt[from + 1 ..][0..rows], h.e.fp.b.fnormed);
     }
 
     pub fn advance(h: *Hip, l: *Lane, prompt: []const u32, from: usize, to: usize, _: ?void) !void {
