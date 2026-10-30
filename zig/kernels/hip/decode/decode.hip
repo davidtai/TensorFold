@@ -8,6 +8,7 @@
 #include <cstdint>
 
 #include "decode/plan.hpp"
+#include "recurrence/kda.hpp"
 
 namespace {
 
@@ -184,6 +185,10 @@ struct ConvArgs {
     // with row f >= 0 here, the window starts from the last window's snapshot after its row f (a keep that dropped
     // rows names it instead of copying it back); null or -1: from `state`
     const int* from;
+    // 128 (KDA): a decay a key channel (gcount rows x heads x 128, tf_kda::decay with `lower`), beta a head; else the
+    // DeltaNet's gate a head
+    int gate_dim;
+    float lower;
 };
 
 // The conv for a window's rows split into q, k, v: taps in order, then silu; q, k heads rms-normed; gate and beta last.
@@ -215,6 +220,14 @@ __device__ void conv_split_body(const ConvArgs& launch) {
     }
     if (blockIdx.x >= conv_blocks) {
         const int i = (blockIdx.x - conv_blocks) * 128 + threadIdx.x;
+        if (c.ga != nullptr && c.gate_dim == tf_kda::kDim) {
+            // KDA: thread i the decay of channel i % 128 of (row, head) i / 128; the head's first channel its beta
+            if (i >= c.gcount * tf_kda::kDim) return;
+            const int rh = i / tf_kda::kDim, hc = i % (c.heads * tf_kda::kDim);
+            if (i % tf_kda::kDim == 0) c.beta[rh] = 1.f / (1.f + expf(-load_kind(c.gb, c.kind, rh)));
+            c.gate[i] = tf_kda::decay(load_kind(c.ga, c.kind, i), c.dt_bias[hc], c.a_log[hc / tf_kda::kDim], c.lower);
+            return;
+        }
         if (c.ga == nullptr || i >= c.gcount) return;
         const int h = i % c.heads;
         c.beta[i] = 1.f / (1.f + expf(-load_kind(c.gb, c.kind, i)));

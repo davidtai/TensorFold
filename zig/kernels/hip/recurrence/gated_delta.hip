@@ -104,13 +104,25 @@ gated_delta_kernel(const float* __restrict__ q, const float* __restrict__ k, con
     }
 }
 
-// Value rows share a staged tile of k and q, in the wave kernel's order (-ffp-contract=off keeps it).
-template <int DK, int ROWS, int STEPS>
+// The decay of key channel `m` at a step: the head's one gate (GD 1, the DeltaNet), or channel m's (GD = DK, KDA).
+template <int GD, int N>
+__device__ __forceinline__ float channel_decay(float head, const float (&channels)[N], int m) {
+    if constexpr (GD == 1) {
+        return head;
+    } else {
+        return channels[m];
+    }
+}
+
+// Value rows share a staged tile of k and q, in the wave kernel's order (-ffp-contract=off keeps it). GD: gate values
+// a step a head, 1 (Gated DeltaNet: gate (rows, heads)) or DK (GLM's KDA: a decay a key channel, (rows, heads, DK)).
+template <int DK, int ROWS, int STEPS, int GD = 1>
 __device__ __forceinline__ void
 gated_delta_tile_body(const float* __restrict__ q, const float* __restrict__ k, const float* __restrict__ v,
                       const float* __restrict__ gate, const float* __restrict__ beta, float* __restrict__ state,
                       float* __restrict__ y, int length, int key_heads, int value_heads, int dv,
                       float* __restrict__ states, int batch, bool write_back = true, const int* from = nullptr) {
+    static_assert(GD == 1 || GD == DK, "a gate a head or a channel");
     constexpr int SPAN = (DK + 31) / 32;
     constexpr int WIDTH = 32 * ROWS;
     const int lane = threadIdx.x;
@@ -122,7 +134,7 @@ gated_delta_tile_body(const float* __restrict__ q, const float* __restrict__ k, 
 
     __shared__ float ks[STEPS][DK];
     __shared__ float qs[STEPS][DK];
-    __shared__ float gs[STEPS];
+    __shared__ float gs[STEPS][GD];
     __shared__ float bs[STEPS];
     __shared__ float vs[STEPS][ROWS];
 
@@ -160,8 +172,15 @@ gated_delta_tile_body(const float* __restrict__ q, const float* __restrict__ k, 
         }
         for (int i = tid; i < n; i += WIDTH) {
             const size_t step = (static_cast<size_t>(batch) * length + (t0 + i)) * value_heads + head;
-            gs[i] = gate[step];
+            if constexpr (GD == 1) gs[i][0] = gate[step];
             bs[i] = beta[step];
+        }
+        if constexpr (GD > 1) {
+            for (int i = tid; i < n * GD; i += WIDTH) {
+                const int step = i / GD;
+                const int c = i - step * GD;
+                gs[step][c] = gate[((static_cast<size_t>(batch) * length + (t0 + step)) * value_heads + head) * GD + c];
+            }
         }
         for (int i = tid; i < n * ROWS; i += WIDTH) {
             const int step = i / ROWS;
@@ -172,7 +191,7 @@ gated_delta_tile_body(const float* __restrict__ q, const float* __restrict__ k, 
         __syncthreads();
 
         for (int tt = 0; tt < n; ++tt) {
-            const float decay = gs[tt];
+            const float decay = gs[tt][0];
             const float step_beta = bs[tt];
             const float value = vs[tt][local];
             float remembered = 0.f;
@@ -182,7 +201,7 @@ gated_delta_tile_body(const float* __restrict__ q, const float* __restrict__ k, 
                 const int idx = lane + i * 32;
                 if (idx < DK) {
                     held[i] = ks[tt][idx];
-                    s[i] = s[i] * decay;
+                    s[i] = s[i] * channel_decay<GD>(decay, gs[tt], idx);
                     remembered = remembered + s[i] * held[i];
                 }
             }
@@ -236,19 +255,20 @@ gated_delta_tile(const float* __restrict__ q, const float* __restrict__ k, const
 
 // A verify window that holds its state: the rows' outputs, no snapshot and no state store. The keep that follows runs
 // the state through the kept rows (gated_delta_keep), so the state in its place is always the committed one.
-template <int DK, int ROWS, int STEPS>
+template <int DK, int ROWS, int STEPS, int GD = 1>
 __device__ __forceinline__ void
 gated_delta_hold(const float* __restrict__ q, const float* __restrict__ k, const float* __restrict__ v,
                  const float* __restrict__ gate, const float* __restrict__ beta, float* __restrict__ state,
                  float* __restrict__ y, int length, int key_heads, int value_heads, int dv) {
-    gated_delta_tile_body<DK, ROWS, STEPS>(q, k, v, gate, beta, state, y, length, key_heads, value_heads, dv, nullptr,
+    gated_delta_tile_body<DK, ROWS, STEPS, GD>(q, k, v, gate, beta, state, y, length, key_heads, value_heads, dv, nullptr,
                                            blockIdx.z, false, nullptr);
 }
 
 // A keep: layer z's state runs from its place through the first `kept` rows of its window's inputs (k, v, gate and
 // beta of `rows` rows from in + z * in_stride, as the window read them) by the window's own scan, and is stored back.
-// The state equals the snapshot the window would have written after its row kept - 1.
-template <int DK>
+// The state equals the snapshot the window would have written after its row kept - 1. GD as the tile's (gate: rows x
+// value heads x GD).
+template <int DK, int GD = 1>
 __device__ __forceinline__ void
 gated_delta_keep(float* state, long long state_stride, const float* in, long long in_stride, int rows, int kept,
                  int key_heads, int value_heads, int dv) {
@@ -256,8 +276,8 @@ gated_delta_keep(float* state, long long state_stride, const float* in, long lon
     const float* k = in + layer * in_stride;
     const float* v = k + static_cast<long long>(rows) * key_heads * DK;
     const float* gate = v + static_cast<long long>(rows) * value_heads * dv;
-    const float* beta = gate + static_cast<long long>(rows) * value_heads;
-    gated_delta_tile_body<DK, 8, 16>(nullptr, k, v, gate, beta, state + layer * state_stride, nullptr, kept, key_heads,
+    const float* beta = gate + static_cast<long long>(rows) * value_heads * GD;
+    gated_delta_tile_body<DK, 8, 16, GD>(nullptr, k, v, gate, beta, state + layer * state_stride, nullptr, kept, key_heads,
                                      value_heads, dv, nullptr, 0);
 }
 
@@ -318,7 +338,8 @@ __device__ __forceinline__ float quad_sum(const float (&part)[8]) {
     return c;
 }
 
-template <int WAVES>
+// GD as the tile's: KDA's decays stage transposed like k, and lane p takes its 32 in registers like k.
+template <int WAVES, int GD = 1>
 __device__ __forceinline__ void
 gated_delta_prompt_body(const float* __restrict__ q, const float* __restrict__ k, const float* __restrict__ v,
                         const float* __restrict__ gate, const float* __restrict__ beta, float* __restrict__ state,
@@ -335,7 +356,7 @@ gated_delta_prompt_body(const float* __restrict__ q, const float* __restrict__ k
     __shared__ __attribute__((aligned(16))) float ks[T][DK];  // transposed: [t][p * 32 + m] = k[t][p + 4 m]
     __shared__ __attribute__((aligned(16))) float qs[T][DK];
     __shared__ float vs[T][ROWS];
-    __shared__ float gs[T];
+    __shared__ __attribute__((aligned(16))) float gs[T][GD];  // GD = DK: transposed as ks
     __shared__ float bs[T];
 
     float s[2][32];
@@ -353,6 +374,9 @@ gated_delta_prompt_body(const float* __restrict__ q, const float* __restrict__ k
             const int to = (e & 3) * 32 + (e >> 2);
             ks[step][to] = k[at];
             qs[step][to] = q[at];
+            if constexpr (GD == DK) {
+                gs[step][to] = gate[((static_cast<size_t>(batch) * length + (t0 + step)) * value_heads + head) * DK + e];
+            }
         }
         for (int i = tid; i < n * ROWS; i += THREADS) {
             const int step = i / ROWS, e = i - step * ROWS;
@@ -360,13 +384,13 @@ gated_delta_prompt_body(const float* __restrict__ q, const float* __restrict__ k
         }
         for (int i = tid; i < n; i += THREADS) {
             const size_t at = (static_cast<size_t>(batch) * length + (t0 + i)) * value_heads + head;
-            gs[i] = gate[at];
+            if constexpr (GD == 1) gs[i][0] = gate[at];
             bs[i] = beta[at];
         }
         __syncthreads();
         for (int tt = 0; tt < n; ++tt) {
-            const float decay = gs[tt], step_beta = bs[tt];
-            float kv[32], qv[32];
+            const float decay = gs[tt][0], step_beta = bs[tt];
+            float kv[32], qv[32], gv[GD == 1 ? 1 : 32];
             const float4* k4 = reinterpret_cast<const float4*>(&ks[tt][p * 32]);
             const float4* q4 = reinterpret_cast<const float4*>(&qs[tt][p * 32]);
 #pragma unroll
@@ -374,6 +398,10 @@ gated_delta_prompt_body(const float* __restrict__ q, const float* __restrict__ k
                 const float4 a = k4[c], b = q4[c];
                 kv[4 * c] = a.x, kv[4 * c + 1] = a.y, kv[4 * c + 2] = a.z, kv[4 * c + 3] = a.w;
                 qv[4 * c] = b.x, qv[4 * c + 1] = b.y, qv[4 * c + 2] = b.z, qv[4 * c + 3] = b.w;
+                if constexpr (GD > 1) {
+                    const float4 g = reinterpret_cast<const float4*>(&gs[tt][p * 32])[c];
+                    gv[4 * c] = g.x, gv[4 * c + 1] = g.y, gv[4 * c + 2] = g.z, gv[4 * c + 3] = g.w;
+                }
             }
             float out[2];
 #pragma unroll
@@ -386,7 +414,7 @@ gated_delta_prompt_body(const float* __restrict__ q, const float* __restrict__ k
 #pragma unroll
                     for (int j = 0; j < 8; ++j) {
                         const int m = j + 8 * i;
-                        s[r][m] = s[r][m] * decay;
+                        s[r][m] = s[r][m] * channel_decay<GD>(decay, gv, m);
                         part[j] = part[j] + s[r][m] * kv[m];
                     }
                 }
@@ -492,6 +520,33 @@ extern "C" __global__ void __launch_bounds__(128)
 tf_gdn_prompt_128(const float* q, const float* k, const float* v, const float* gate, const float* beta, float* state,
                   float* y, int length, int key_heads, int value_heads) {
     tf::rocm::gated_delta_prompt_body<4>(q, k, v, gate, beta, state, y, length, key_heads, value_heads);
+}
+
+// GLM-5.3-Flash's KDA: the scans above with a decay a key channel (gate (rows, heads, 128)), Dk = Dv = 128. The same
+// sums in the same order as the DeltaNet's; only the decay's operand differs.
+extern "C" __global__ void __launch_bounds__(256)
+tf_kda_tile_128(const float* q, const float* k, const float* v, const float* gate, const float* beta, float* state,
+                float* y, int length, int key_heads, int value_heads, int dv, float* states, const int* from) {
+    tf::rocm::gated_delta_tile_body<128, 8, 16, 128>(q, k, v, gate, beta, state, y, length, key_heads, value_heads, dv,
+                                                     states, blockIdx.z, true, from);
+}
+
+extern "C" __global__ void __launch_bounds__(256)
+tf_kda_hold_128(const float* q, const float* k, const float* v, const float* gate, const float* beta, float* state,
+                float* y, int length, int key_heads, int value_heads, int dv) {
+    tf::rocm::gated_delta_hold<128, 8, 16, 128>(q, k, v, gate, beta, state, y, length, key_heads, value_heads, dv);
+}
+
+extern "C" __global__ void __launch_bounds__(256)
+tf_kda_keep_128(float* state, long long state_stride, const float* in, long long in_stride, int rows, int kept,
+                int key_heads, int value_heads, int dv) {
+    tf::rocm::gated_delta_keep<128, 128>(state, state_stride, in, in_stride, rows, kept, key_heads, value_heads, dv);
+}
+
+extern "C" __global__ void __launch_bounds__(128)
+tf_kda_prompt_128(const float* q, const float* k, const float* v, const float* gate, const float* beta, float* state,
+                  float* y, int length, int key_heads, int value_heads) {
+    tf::rocm::gated_delta_prompt_body<4, 128>(q, k, v, gate, beta, state, y, length, key_heads, value_heads);
 }
 
 #include "recurrence/gated_delta_wy.hpp"

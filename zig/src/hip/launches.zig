@@ -67,6 +67,8 @@ pub const Launcher = struct {
     gdn_keep: [2]Function, // dk 128, 16: a keep's run of every DeltaNet layer's state through its kept rows
     gdn_prompt: Function, // dk = dv = 128, a prompt's rows, half a value head a block
     gdn_wy: [2]Function, // dk = dv = 128, a prompt's rows in chunks on the gfx11 matrix cores: prep, scan (inexact)
+    /// GLM's KDA: the DeltaNet scans with a decay a key channel (dk = dv = 128).
+    kda: recurrence.KdaFns,
     score_keys: Triple, // by cache kind
     apply_values: Triple,
     causal: Triple,
@@ -276,6 +278,7 @@ pub const Launcher = struct {
         l.gdn_keep = .{ try gd.function("tf_gdn_keep_128"), try gd.function("tf_gdn_keep_16") };
         l.gdn_prompt = try gd.function("tf_gdn_prompt_128");
         l.gdn_wy = .{ try gd.function("tf_gdn_wy_prep"), try gd.function("tf_gdn_wy_scan") };
+        l.kda = try recurrence.KdaFns.load(gd);
         l.gated_delta_wave = .{
             try gd.function(ns ++ "18gated_delta_kernelILi128EEEvPKfS3_S3_S3_S3_PfS4_iiiiS4_PKi"),
             try gd.function(ns ++ "18gated_delta_kernelILi16EEEvPKfS3_S3_S3_S3_PfS4_iiiiS4_PKi"),
@@ -327,6 +330,8 @@ pub const Launcher = struct {
     pub const tf_conv_split = conv.tf_conv_split;
     pub const tf_conv_prefill = conv.tf_conv_prefill;
     pub const tf_gdn_prompt_prep = conv.tf_gdn_prompt_prep;
+    pub const tf_kda_prompt_prep = conv.tf_kda_prompt_prep;
+    pub const kda_dim = conv.kda_dim;
     pub const tf_qk_rope = rope.tf_qk_rope;
     pub const tf_rope_decode = rope.tf_rope_decode;
     pub const tf_rope_prefill = rope.tf_rope_prefill;
@@ -364,6 +369,9 @@ pub const Launcher = struct {
     pub const gdn_wy_scratch = recurrence.wyScratch;
     pub const gdn_wy_on = recurrence.wyOnMatrix;
     pub const gdn_prompt_rows = recurrence.prompt_rows;
+    pub const tf_kda = recurrence.tf_kda;
+    pub const tf_kda_hold = recurrence.tf_kda_hold;
+    pub const tf_kda_keep = recurrence.tf_kda_keep;
     pub const planKvWrite = plan.planKvWrite;
     pub const planCausal = plan.planCausal;
     pub const planCausalAs = plan.planCausalAs;
