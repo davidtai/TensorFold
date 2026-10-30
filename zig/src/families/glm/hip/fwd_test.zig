@@ -850,7 +850,8 @@ fn oneTensor(sh: *Shards, t: *Rig, p: []const u8, name: []const u8) !u64 {
 
 fn writeNpy(a: std.mem.Allocator, dir: []const u8, name: []const u8, comptime T: type, shape: []const usize, data: []const T) !void {
     const dump = @import("dump.zig");
-    const bytes = try dump.npyBytes(a, T, shape, data);
+    // bf16 bit patterns as int16 (the writer has no u16 descr; the reader views them back as uint16)
+    const bytes = if (T == u16) try dump.npyBytes(a, i16, shape, std.mem.bytesAsSlice(i16, std.mem.sliceAsBytes(data))) else try dump.npyBytes(a, T, shape, data);
     const path = try std.fs.path.join(a, &.{ dir, name });
     try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data = bytes });
 }
