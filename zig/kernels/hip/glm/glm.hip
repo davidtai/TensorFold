@@ -1,5 +1,6 @@
-// GLM-5.3-Flash's own kernels as one code object (the build's "glm" group). Each lane topic keeps its kernels in one
-// .hpp in this folder and adds one #include line below; the build tracks every file in this folder.
+// GLM-5.3-Flash's own kernels as one code object (the build's "glm" group, kernels.Group.glm). Each lane topic keeps
+// its kernels in one .hpp in this folder and adds one #include line below; the build tracks every file in this folder.
+// Launchers load from the group's module (Launcher.mods[@backingInt(kernels.Group.glm)]) in zig/src/hip/launches/.
 
 #include <hip/hip_runtime.h>
 #include <cstdint>

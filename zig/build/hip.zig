@@ -99,9 +99,20 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     kernel_module.addCSourceFile(.{ .file = b.path("zig/src/hip/device_arch.c"), .flags = &.{"-D__HIP_PLATFORM_AMD__"} });
     kernel_module.addImport("hip_kernels", objects);
     kernel_module.addImport("core", coreModule(b, target));
+    kernel_module.addImport("glm_config", glmConfig(b, target));
     const kernel_test = b.addTest(.{ .root_module = kernel_module });
     b.step("hip-kernel-build", "Compile the model-free kernels and their GPU tests without running them").dependOn(&kernel_test.step);
     b.step("hip-kernel-test", "Every model-free kernel against its host reference on the GPU").dependOn(&b.addRunArtifact(kernel_test).step);
+    // GLM-5.3-Flash's kernels alone (src/hip/glm_kernel_tests.zig), ReleaseSafe for the float64 references' host loops
+    const glm_module = b.createModule(.{ .root_source_file = b.path("zig/src/hip/glm_kernel_tests.zig"), .target = target, .optimize = .ReleaseSafe, .link_libc = true });
+    glm_module.addIncludePath(.{ .cwd_relative = hip_include });
+    glm_module.addCSourceFile(.{ .file = b.path("zig/src/hip/device_arch.c"), .flags = &.{"-D__HIP_PLATFORM_AMD__"} });
+    glm_module.addImport("hip_kernels", objects);
+    glm_module.addImport("core", coreModule(b, target));
+    glm_module.addImport("glm_config", glmConfig(b, target));
+    const glm_test = b.addTest(.{ .name = "glm-hip-test", .root_module = glm_module });
+    b.step("glm-hip-test", "Build GLM-5.3-Flash's HIP kernel tests into zig-out/bin/glm-hip-test (-Dhip-arch, no run)").dependOn(&b.addInstallArtifact(glm_test, .{}).step);
+    b.step("hip-glm-kernel-test", "GLM-5.3-Flash's kernels against their host references on the GPU (builds and runs glm-hip-test)").dependOn(&b.addRunArtifact(glm_test).step);
     const stub_kernels = b.createModule(.{ .root_source_file = b.addWriteFiles().add("kernels.zig", stub) });
     const host = engineModules(b, b.graph.host, .Debug, stub_kernels, null);
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = host.hip })).step);
@@ -151,17 +162,6 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
         "tf-nemotron-hip-test",
         "Nemotron-H load and skeleton checks on the GPU (-Dhip-arch)",
     ).dependOn(&b.addInstallArtifact(nem_test, .{}).step);
-    const glm_test = b.addTest(.{ .name = "glm-hip-test", .root_module = b.createModule(.{
-        .root_source_file = b.path("zig/tests/hip/glm_tests.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-        .imports = &.{ .{ .name = "hip", .module = gpu.hip }, .{ .name = "glm", .module = gpu.glm } },
-    }) });
-    b.step(
-        "glm-hip-test",
-        "GLM-5.3-Flash's HIP kernels against their host references: builds zig-out/bin/glm-hip-test (-Dhip-arch, no run)",
-    ).dependOn(&b.addInstallArtifact(glm_test, .{}).step);
     const native = server(b, target, gpu, build_options);
     b.step("native-hip", "tensorfold-native with the HIP engines into zig-out/native-hip/bin (-Dhip-arch)").dependOn(&b.addInstallArtifact(native, .{ .dest_dir = .{ .override = .{ .custom = "native-hip/bin" } } }).step);
     @import("hip_contract.zig").steps(b, .{
@@ -411,6 +411,11 @@ pub fn compile(b: *std.Build, cc: Hipcc, arch: []const u8, source: std.Build.Laz
     const object = run.addOutputFileArg(out);
     run.addFileArg(source);
     return object;
+}
+
+/// The GLM checkpoint's config.json checks (TF_GLM_CONFIG) for the GLM kernel tests: config.zig alone, no HIP module.
+fn glmConfig(b: *std.Build, target: std.Build.ResolvedTarget) *std.Build.Module {
+    return b.createModule(.{ .root_source_file = b.path("zig/src/families/glm/config_checkpoint_test.zig"), .target = target, .link_libc = true });
 }
 
 /// The backend-neutral core (checkpoint formats, the kernel registry), as the other backends import it.

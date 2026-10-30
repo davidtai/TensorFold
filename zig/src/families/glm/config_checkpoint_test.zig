@@ -1,6 +1,6 @@
 //! A real checkpoint's config.json against GLM-5.3-Flash's shape: TF_GLM_CONFIG names the file (skipped when unset).
 //! Run on the box: TF_GLM_CONFIG=<checkpoint>/config.json zig test -lc zig/src/families/glm/config_checkpoint_test.zig
-//! HIP's glm-hip-test runs `check` too (zig/tests/hip/glm_config.zig): a test runs only in its binary's root module.
+//! glm-hip-test runs `check` too (zig/src/hip/kernel_tests/glm/config.zig): a test runs only in its binary's root module.
 const std = @import("std");
 const config = @import("config.zig");
 

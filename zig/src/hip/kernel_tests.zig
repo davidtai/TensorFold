@@ -38,4 +38,5 @@ test {
     _ = @import("kernel_tests/nemotron/fused.zig");
     _ = @import("kernel_tests/nemotron/window.zig");
     _ = @import("kernel_tests/nemotron/epilogue.zig");
+    _ = @import("glm_kernel_tests.zig");
 }
