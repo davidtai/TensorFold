@@ -115,53 +115,94 @@ pub fn tf_gdn_keep(l: *const Launcher, state: F, state_stride: i64, in: CF, in_s
     try l.go(l.gdn_keep[if (dk == 128) 0 else 1], dim(@divExact(dv, 8), value_heads, layers), dim(32, 8, 1), 0, s, &a);
 }
 
-/// GLM's KDA scans (gated_delta.hip tf_kda_*_128): the DeltaNet's tile, hold, keep and prompt bodies with a decay a key
-/// channel. Key heads = value heads = `heads`, dk = dv = 128; gate (rows, heads, 128) fp32, beta (rows, heads).
+/// GLM-5.3-Flash's KDA (gated_delta.hip tf_kda_*_128 on the DeltaNet bodies; recurrence/kda.hpp's ports of the CUDA
+/// prep, out and conv shift). Buffers as the CUDA path's (cuda_state.zig, cuda_kda_block.zig): heads x 128 channels,
+/// key heads = value heads; decays fp32 (rows, heads, 128); saves k fp32, v bf16, decays fp32, beta fp32 (rows, heads).
 pub const KdaFns = struct {
+    prep: Function,
     tile: Function,
     hold: Function,
     keep: Function,
     prompt: Function,
+    out: Function,
+    conv_shift: Function,
 
     pub fn load(m: Module) Error!KdaFns {
-        var k: KdaFns = undefined;
-        inline for (.{ "tile", "hold", "keep", "prompt" }) |name| @field(k, name) = try m.function("tf_kda_" ++ name ++ "_128");
-        return k;
+        return .{
+            .prep = try m.function("tf_kda_prep"),
+            .tile = try m.function("tf_kda_tile_128"),
+            .hold = try m.function("tf_kda_hold_128"),
+            .keep = try m.function("tf_kda_keep_128"),
+            .prompt = try m.function("tf_kda_prompt_128"),
+            .out = try m.function("tf_kda_out"),
+            .conv_shift = try m.function("tf_kda_conv_shift"),
+        };
     }
 };
 
-const kda_dim = 128;
+/// KDA's key and value channels a head.
+pub const kda_dim = 128;
 
-/// KDA's delta rule over `length` rows from `state` (fp32 (heads, 128 v, 128 k), stored back), y fp32 (rows, heads, 128).
-/// A prompt's rows (no snapshots, at least prompt_rows) take the half-head blocks; others the 8-row tile. `states`: each
-/// row's state (rows, heads, 128, 128); `from`: as tf_gated_delta's.
-pub fn tf_kda(l: *const Launcher, q: CF, k: CF, v: CF, gate: CF, beta: CF, state: F, y: F, length: c_int, heads: c_int, s: S, states: F, from: u64) Error!void {
+/// kda.chain's prep (glm_kda.cu tf_glm_kda_prep): `rows` rows of the stacked bf16 projection p (row stride p_stride,
+/// q | k | v from column 0, beta's logits at b_off), the bf16 decay rows a (stride a_stride) and the bf16 conv window cs
+/// [3][3 heads 128] (read, not written); taps cw fp32 [3 heads 128][4]. Out: q fp32, k fp32, v bf16, decays fp32 and
+/// beta fp32, row-major (rows, heads, 128) and (rows, heads).
+pub fn tf_kda_prep(l: *const Launcher, p: C, p_stride: c_int, b_off: c_int, a: C, a_stride: c_int, cs: C, cw: CF, a_log: CF, dt_bias: CF, lower: f32, q: F, k: F, v: P, g: F, b: F, rows: c_int, heads: c_int, s: S) Error!void {
+    if (heads < 1 or rows < 1 or p_stride < 3 * heads * kda_dim or b_off + heads > p_stride) return invalid("kda prep");
+    var x: Args = .{};
+    inline for (.{ heads, ad(p), p_stride, b_off, ad(a), a_stride, ad(cs), ad(cw), ad(a_log), ad(dt_bias), lower, ad(q), ad(k), ad(v), ad(g), ad(b) }) |e| try x.add(e);
+    try l.go(l.kda.prep, dim(rows, heads, 1), dim(512, 1, 1), 0, s, &x);
+}
+
+/// KDA's delta rule over `length` rows from `state` (fp32 (heads, 128 v, 128 k), stored back): q, k fp32, v bf16, decays
+/// and beta as tf_kda_prep writes them; y fp32 (rows, heads, 128). A prompt's rows (no snapshots, at least prompt_rows)
+/// take the half-head blocks, others the 8-row tile: the same sums. `states`: each row's state; `from`: tf_gated_delta's.
+pub fn tf_kda(l: *const Launcher, q: CF, k: CF, v: C, gate: CF, beta: CF, state: F, y: F, length: c_int, heads: c_int, s: S, states: F, from: u64) Error!void {
     if (heads < 1 or length < 1) return invalid("kda");
     if (states == null and length >= prompt_rows) {
         var b: Args = .{};
-        inline for (.{ ad(q), ad(k), ad(v), ad(gate), ad(beta), ad(state), ad(y), length, heads, heads }) |x| try b.add(x);
+        inline for (.{ ad(q), ad(k), ad(v), ad(gate), ad(beta), ad(state), ad(y), length, heads }) |x| try b.add(x);
         return l.go(l.kda.prompt, dim(2, heads, 1), dim(32, 4, 1), 0, s, &b);
     }
     var a: Args = .{};
-    inline for (.{ ad(q), ad(k), ad(v), ad(gate), ad(beta), ad(state), ad(y), length, heads, heads, @as(c_int, kda_dim), ad(states), from }) |x| try a.add(x);
+    inline for (.{ ad(q), ad(k), ad(v), ad(gate), ad(beta), ad(state), ad(y), length, heads, ad(states), from }) |x| try a.add(x);
     try l.go(l.kda.tile, dim(kda_dim / 8, heads, 1), dim(32, 8, 1), 0, s, &a);
 }
 
 /// A KDA verify window that holds its state: the rows' outputs only (tf_gdn_hold's). At most 16 rows.
-pub fn tf_kda_hold(l: *const Launcher, q: CF, k: CF, v: CF, gate: CF, beta: CF, state: F, y: F, length: c_int, heads: c_int, s: S) Error!void {
+pub fn tf_kda_hold(l: *const Launcher, q: CF, k: CF, v: C, gate: CF, beta: CF, state: F, y: F, length: c_int, heads: c_int, s: S) Error!void {
     if (heads < 1 or length < 1 or length > 16) return invalid("kda hold");
     var a: Args = .{};
-    inline for (.{ ad(q), ad(k), ad(v), ad(gate), ad(beta), ad(state), ad(y), length, heads, heads, @as(c_int, kda_dim) }) |x| try a.add(x);
+    inline for (.{ ad(q), ad(k), ad(v), ad(gate), ad(beta), ad(state), ad(y), length, heads }) |x| try a.add(x);
     try l.go(l.kda.hold, dim(kda_dim / 8, heads, 1), dim(32, 8, 1), 0, s, &a);
 }
 
-/// A KDA keep (tf_gdn_keep's): `layers` states each run through the first `kept` rows of its window's inputs: at
-/// in + z * in_stride floats, `rows` rows of k (heads x 128), of v (heads x 128), of gate (heads x 128), of beta (heads).
-pub fn tf_kda_keep(l: *const Launcher, state: F, state_stride: i64, in: CF, in_stride: i64, rows: c_int, kept: c_int, layers: c_int, heads: c_int, s: S) Error!void {
-    if (heads < 1 or kept < 1 or kept > rows or layers < 1) return invalid("kda keep");
+/// A keep on the CUDA window saves (cuda_forward.zig commit's replay_layers inputs): `layers` states (layer z at
+/// state + z state_stride floats) each run in place through its first `kept` saved rows. k, v (bf16) and decays at
+/// z kv_stride elements, beta at z b_stride; each layer's rows from row 0. The state after the window's row kept - 1.
+pub fn tf_kda_keep(l: *const Launcher, state: F, state_stride: i64, k: CF, v: C, gate: CF, beta: CF, kv_stride: i64, b_stride: i64, kept: c_int, layers: c_int, heads: c_int, s: S) Error!void {
+    if (heads < 1 or kept < 1 or layers < 1) return invalid("kda keep");
     var a: Args = .{};
-    inline for (.{ ad(state), state_stride, ad(in), in_stride, rows, kept, heads, heads, @as(c_int, kda_dim) }) |x| try a.add(x);
+    inline for (.{ ad(state), state_stride, ad(k), ad(v), ad(gate), ad(beta), kv_stride, b_stride, kept, heads }) |x| try a.add(x);
     try l.go(l.kda.keep, dim(kda_dim / 8, heads, layers), dim(32, 8, 1), 0, s, &a);
+}
+
+/// kda.chain's out (glm_kda.cu tf_glm_kda_out): bf16 out (rows, heads, 128) = norm_w rms(y) sigmoid(g), y fp32, the
+/// gate rows g bf16 (stride g_stride), norm_w bf16 [128].
+pub fn tf_kda_out(l: *const Launcher, y: CF, g: C, g_stride: c_int, norm_w: C, eps: f32, out: P, rows: c_int, heads: c_int, s: S) Error!void {
+    if (heads < 1 or rows < 1) return invalid("kda out");
+    var a: Args = .{};
+    inline for (.{ heads, ad(y), ad(g), g_stride, ad(norm_w), eps, ad(out) }) |x| try a.add(x);
+    try l.go(l.kda.out, dim(rows, heads, 1), dim(kda_dim, 1, 1), 0, s, &a);
+}
+
+/// forward._conv_shift (glue.convShift): each of `layers` bf16 conv windows (3 rows of c columns, conv_layer elements
+/// apart) takes rows keep .. keep + 2 of [window; projection rows] (proj_row apart, proj_layer a layer).
+pub fn tf_kda_conv_shift(l: *const Launcher, conv: P, proj: C, keep: i64, conv_layer: i64, proj_layer: i64, proj_row: i64, c: i64, layers: c_int, s: S) Error!void {
+    if (keep < 0 or c < 1 or layers < 1) return invalid("kda conv shift");
+    var a: Args = .{};
+    inline for (.{ ad(conv), ad(proj), keep, conv_layer, proj_layer, proj_row, c }) |x| try a.add(x);
+    try l.go(l.kda.conv_shift, dim(layers, cdiv(c, 256), 1), dim(256, 1, 1), 0, s, &a);
 }
 
 /// Tokens a chunk of tf_gdn_wy and its packed operands (gated_delta_wy.hpp).

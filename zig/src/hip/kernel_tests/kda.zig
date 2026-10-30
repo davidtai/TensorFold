@@ -1,7 +1,7 @@
-//! GLM-5.3-Flash's KDA on HIP against float64 host references: the window conv split and the prompt prep with a decay
-//! a key channel, the scan (tile, prompt, hold and keep), and the chain to the gated norm against the float64 chain of
-//! tests/cuda/glm_ref_kda.zig (fp32 between kernels, so no bf16 rounding of q, k, v, beta and y). GLM-5.3-Flash on one
-//! device: 64 heads x 128, conv 4 taps, gate_lower_bound -5.
+//! GLM-5.3-Flash's KDA on HIP against float64 host references, on the CUDA path's buffers (cuda_state.zig,
+//! cuda_kda_block.zig): the prep (conv, decays a channel, beta, q and k norms), the conv shift, the scan (tile, prompt,
+//! hold, keep on the window saves) and the chain to the bf16 out against glm_ref_kda.zig's float64 chain. One device:
+//! 64 heads x 128, conv 4 taps, gate_lower_bound -5, o_norm eps 1e-5.
 const std = @import("std");
 const rig = @import("rig.zig");
 const Rig = rig.Rig;
@@ -14,9 +14,25 @@ const d = Launcher.kda_dim;
 const taps = 4;
 const lower: f32 = -5.0;
 const glm_heads = 64;
+/// A decode window's rows (cuda_state.zig window_rows): the saves' rows a layer.
+const window_rows = 8;
+const eps_out: f32 = 1e-5;
 
 fn sigmoid(x: f64) f64 {
     return 1 / (1 + @exp(-x));
+}
+
+const bfOf = rig.bf16Value;
+
+/// bf16 bits of x to nearest even, as the kernels round.
+fn bfBits(x: f64) u16 {
+    const u: u32 = @bitCast(@as(f32, @floatCast(x)));
+    return @intCast((u + (((u >> 16) & 1) + 0x7fff)) >> 16);
+}
+
+/// x rounded to bf16, as a float64.
+fn rb(x: f64) f64 {
+    return bfOf(bfBits(x));
 }
 
 /// The largest error over the reference's largest value.
@@ -36,21 +52,11 @@ fn widen(xs: []const f32) ![]f64 {
     return out;
 }
 
-/// The L2 norms of q and k as the RMS norm with a weight (flashnext mixers.zig qkConstants): x rsqrt(sum + 1e-6), q
-/// also by 128^-0.5. Weights [q x 128 | k x 128].
-const qk = struct {
-    const inv = 1 / @sqrt(@as(f64, d));
-    const q: f32 = @floatCast(inv * inv);
-    const k: f32 = @floatCast(inv);
-    const eps: f32 = @floatCast(1e-6 * inv * inv);
-
-    fn weights() [2 * d]f32 {
-        var w: [2 * d]f32 = undefined;
-        @memset(w[0..d], q);
-        @memset(w[d..], k);
-        return w;
-    }
-};
+fn widenBf(xs: []const u16) ![]f64 {
+    const out = try gpa.alloc(f64, xs.len);
+    for (out, xs) |*o, x| o.* = bfOf(x);
+    return out;
+}
 
 /// Device buffers freed together.
 const Held = struct {
@@ -89,202 +95,8 @@ fn cv(addr: u64) ?*const anyopaque {
     return @ptrFromInt(addr);
 }
 
-/// One KDA layer's conv and gate inputs: x (rows, q | k | v of heads x 128) and the decay rows a (rows, heads x 128) and
-/// beta logits b (rows, heads) in the activation kind; taps fp32 (channels, 4); the conv tail fp32 (3, channels);
-/// A_log a head, dt_bias a channel.
-const ConvIn = struct {
-    heads: usize,
-    rows: usize,
-    x: []u16,
-    a: []u16,
-    b: []u16,
-    w: []f32,
-    tail: []f32,
-    a_log: []f32,
-    dt_bias: []f32,
-
-    fn make(t: *const Rig, heads: usize, rows: usize, seed: u64) !ConvIn {
-        var rng: rig.Rng = .{ .state = seed };
-        const n = heads * d;
-        const in: ConvIn = .{
-            .heads = heads,
-            .rows = rows,
-            .x = try gpa.alloc(u16, rows * 3 * n),
-            .a = try gpa.alloc(u16, rows * n),
-            .b = try gpa.alloc(u16, rows * heads),
-            .w = try gpa.alloc(f32, 3 * n * taps),
-            .tail = try gpa.alloc(f32, (taps - 1) * 3 * n),
-            .a_log = try gpa.alloc(f32, heads),
-            .dt_bias = try gpa.alloc(f32, n),
-        };
-        for (in.x) |*v| v.* = t.bits(rng.unit() * 2.0);
-        for (in.a) |*v| v.* = t.bits(rng.unit() * 3.0);
-        for (in.b) |*v| v.* = t.bits(rng.unit() * 3.0);
-        for (in.w) |*v| v.* = rng.unit() / 2.0;
-        for (in.tail) |*v| v.* = rng.unit();
-        for (in.a_log) |*v| v.* = rng.unit();
-        for (in.dt_bias) |*v| v.* = rng.unit() / 2.0;
-        return in;
-    }
-
-    fn free(in: ConvIn) void {
-        gpa.free(in.x);
-        gpa.free(in.a);
-        gpa.free(in.b);
-        gpa.free(in.w);
-        gpa.free(in.tail);
-        gpa.free(in.a_log);
-        gpa.free(in.dt_bias);
-    }
-
-    /// Conv input t of channel c: the tail's rows, then x's (no tail: zeros).
-    fn window(in: ConvIn, t: *const Rig, with_tail: bool, row: usize, c: usize) f64 {
-        const ch = 3 * in.heads * d;
-        if (row < taps - 1) return if (with_tail) in.tail[row * ch + c] else 0;
-        return t.value(in.x[(row - (taps - 1)) * ch + c]);
-    }
-};
-
-/// The scan's inputs a row: q and k (heads x 128, q L2 1/sqrt(128), k L2 1), v (heads x 128), decays (heads x 128), beta.
-const Prep = struct {
-    q: []f64,
-    k: []f64,
-    v: []f64,
-    gate: []f64,
-    beta: []f64,
-
-    fn free(p: Prep) void {
-        for ([_][]f64{ p.q, p.k, p.v, p.gate, p.beta }) |x| gpa.free(x);
-    }
-};
-
-/// float64 conv + SiLU, the L2 norms of q and k, the decays exp(lower sigmoid(exp(A_log) (a + dt_bias))), beta.
-fn prepRef(t: *const Rig, in: ConvIn, with_tail: bool) !Prep {
-    const heads = in.heads;
-    const n = heads * d;
-    const ch = 3 * n;
-    const rows = in.rows;
-    const p: Prep = .{
-        .q = try gpa.alloc(f64, rows * n),
-        .k = try gpa.alloc(f64, rows * n),
-        .v = try gpa.alloc(f64, rows * n),
-        .gate = try gpa.alloc(f64, rows * n),
-        .beta = try gpa.alloc(f64, rows * heads),
-    };
-    const act = try gpa.alloc(f64, ch);
-    defer gpa.free(act);
-    for (0..rows) |r| {
-        for (act, 0..) |*o, c| {
-            var acc: f64 = 0;
-            for (0..taps) |tap| acc += @as(f64, in.w[c * taps + tap]) * in.window(t, with_tail, r + tap, c);
-            o.* = acc * sigmoid(acc);
-        }
-        for (0..heads) |h| {
-            for ([_][]f64{ p.q, p.k }, 0..) |dst, part| {
-                const src = act[part * n + h * d ..][0..d];
-                var ss: f64 = 0;
-                for (src) |e| ss += e * e;
-                const extra: f64 = if (part == 0) 1 / @sqrt(@as(f64, d)) else 1;
-                const inv = 1 / @sqrt(ss + 1e-6) * extra;
-                for (dst[r * n + h * d ..][0..d], src) |*o, e| o.* = e * inv;
-            }
-            @memcpy(p.v[r * n + h * d ..][0..d], act[2 * n + h * d ..][0..d]);
-            const rate = @exp(@as(f64, in.a_log[h]));
-            for (0..d) |i| {
-                const c = h * d + i;
-                p.gate[r * n + c] = @exp(@as(f64, lower) * sigmoid(rate * (t.value(in.a[r * n + c]) + in.dt_bias[c])));
-            }
-            p.beta[r * heads + h] = sigmoid(t.value(in.b[r * heads + h]));
-        }
-    }
-    return p;
-}
-
-/// float64 delta rule with a decay a key channel: state (heads, 128 v, 128 k) in place, y (rows, heads, 128).
-fn scanRef(heads: usize, rows: usize, q: []const f64, k: []const f64, v: []const f64, gate: []const f64, beta: []const f64, state: []f64, y: []f64) void {
-    for (0..heads) |h| {
-        const s = state[h * d * d ..][0 .. d * d];
-        for (0..rows) |t| {
-            const at_ = (t * heads + h) * d;
-            const g = gate[at_..][0..d];
-            const kk = k[at_..][0..d];
-            const qq = q[at_..][0..d];
-            const b = beta[t * heads + h];
-            for (0..d) |r| {
-                const row = s[r * d ..][0..d];
-                var kv: f64 = 0;
-                for (row, g, kk) |*e, gi, ki| {
-                    e.* *= gi;
-                    kv += e.* * ki;
-                }
-                const delta = (v[at_ + r] - kv) * b;
-                var out: f64 = 0;
-                for (row, kk, qq) |*e, ki, qi| {
-                    e.* += ki * delta;
-                    out += e.* * qi;
-                }
-                y[at_ + r] = out;
-            }
-        }
-    }
-}
-
-/// Weights and rows the conv split and the prompt prep read, on the device.
-const ConvDev = struct { x: DeviceBuffer, a: DeviceBuffer, b: DeviceBuffer, w: DeviceBuffer, a_log: DeviceBuffer, dt_bias: DeviceBuffer, norm: DeviceBuffer };
-
-fn convDev(h: *Held, t: *Rig, in: ConvIn) !ConvDev {
-    const norm = qk.weights();
-    return .{
-        .x = try h.up(t, in.x),
-        .a = try h.up(t, in.a),
-        .b = try h.up(t, in.b),
-        .w = try h.up(t, in.w),
-        .a_log = try h.up(t, in.a_log),
-        .dt_bias = try h.up(t, in.dt_bias),
-        .norm = try h.up(t, &norm),
-    };
-}
-
-/// Where a conv writes: q, k, v, decays (rows, heads x 128) and beta (rows, heads).
-const Split = struct { q: u64, k: u64, v: u64, gate: u64, beta: u64 };
-
-/// A window's conv split of in.rows rows with the KDA gate (conv tail `state` in place; `states`: each row's tail).
-fn convSplit(t: *Rig, in: ConvIn, c: ConvDev, state: u64, states: u64, out: Split) !void {
-    const n = in.heads * d;
-    try t.on.tf_conv_split(.{
-        .x = at(c.x),
-        .kind = t.kind(),
-        .weight = at(c.w),
-        .state = state,
-        .states = states,
-        .qn = out.q,
-        .kn = out.k,
-        .v = out.v,
-        .channels = @intCast(3 * n),
-        .kernel = taps,
-        .rows = @intCast(in.rows),
-        .kw = @intCast(n),
-        .vw = @intCast(n),
-        .qw = at(c.norm),
-        .kw_w = at(c.norm) + d * 4,
-        .eps = qk.eps,
-        .norm = 128,
-        .ga = at(c.a),
-        .gb = at(c.b),
-        .a_log = at(c.a_log),
-        .dt_bias = at(c.dt_bias),
-        .gate = out.gate,
-        .beta = out.beta,
-        .gcount = @intCast(in.rows * in.heads),
-        .heads = @intCast(in.heads),
-        .gate_dim = d,
-        .lower = lower,
-    }, t.stream.handle);
-}
-
-/// A prompt's KDA prework of in.rows rows (conv tail `state`, 0: none; the next tail into `new_state`).
-fn promptPrep(t: *Rig, in: ConvIn, c: ConvDev, state: u64, new_state: u64, out: Split) !void {
-    try t.on.tf_kda_prompt_prep(cv(at(c.x)), t.kind(), cf(at(c.w)), cf(state), mf(new_state), mf(out.q), mf(out.k), mf(out.v), cf(at(c.norm)), cf(at(c.norm) + d * 4), qk.eps, @intCast(in.rows), @intCast(in.heads), taps, cv(at(c.a)), cv(at(c.b)), cf(at(c.a_log)), cf(at(c.dt_bias)), mf(out.gate), mf(out.beta), lower, t.stream.handle);
+fn mv(addr: u64) ?*anyopaque {
+    return @ptrFromInt(addr);
 }
 
 /// `count` values at a device address inside a held buffer.
@@ -293,91 +105,314 @@ fn download(comptime T: type, t: *Rig, addr: u64, count: usize) ![]T {
     return rig.download(T, view);
 }
 
-/// q, k, v, decays and beta at `out` against the float64 prework, each within 1e-5 of its largest value.
-fn expectPrep(t: *Rig, out: Split, want: Prep, what: []const u8, rows: usize) !void {
-    const names = [_][]const u8{ "q", "k", "v", "decay", "beta" };
-    for ([_]u64{ out.q, out.k, out.v, out.gate, out.beta }, [_][]f64{ want.q, want.k, want.v, want.gate, want.beta }, names) |addr, ref, name| {
-        const got = try download(f32, t, addr, ref.len);
-        defer gpa.free(got);
-        const e = relative(got, ref);
-        std.debug.print("KDA {s} rows={d}: {s} relative error {e:.3}\n", .{ what, rows, name, e });
-        try rig.expect(e < 1e-5, "KDA {s} rows={d}: {s} relative error {e}", .{ what, rows, name, e });
+/// One KDA layer's block inputs as the CUDA path holds them: the stacked projection p bf16 (rows, kw) = [q | k | v |
+/// f_a | g_a | b], the decay rows a and gate rows g bf16 (rows, heads x 128), the conv window cs bf16 [3][3 heads 128],
+/// taps fp32 (widened bf16, as the CUDA loader), A_log a head, dt_bias a channel, o_norm bf16 [128].
+const Block = struct {
+    heads: usize,
+    rows: usize,
+    p: []u16,
+    a: []u16,
+    g: []u16,
+    cs: []u16,
+    cw: []f32,
+    a_log: []f32,
+    dt_bias: []f32,
+    norm: []u16,
+
+    fn n(b: Block) usize {
+        return b.heads * d;
+    }
+
+    /// kda_block.Layer.width: 3 heads 128 + f_a 128 + g_a 128 + b heads.
+    fn width(b: Block) usize {
+        return 3 * b.n() + 2 * d + b.heads;
+    }
+
+    fn bOff(b: Block) usize {
+        return 3 * b.n() + 2 * d;
+    }
+
+    fn make(heads: usize, rows: usize, seed: u64, zero_window: bool) !Block {
+        var rng: rig.Rng = .{ .state = seed };
+        const n_ = heads * d;
+        const kw = 3 * n_ + 2 * d + heads;
+        const b: Block = .{
+            .heads = heads,
+            .rows = rows,
+            .p = try gpa.alloc(u16, rows * kw),
+            .a = try gpa.alloc(u16, rows * n_),
+            .g = try gpa.alloc(u16, rows * n_),
+            .cs = try gpa.alloc(u16, 3 * 3 * n_),
+            .cw = try gpa.alloc(f32, 3 * n_ * taps),
+            .a_log = try gpa.alloc(f32, heads),
+            .dt_bias = try gpa.alloc(f32, n_),
+            .norm = try gpa.alloc(u16, d),
+        };
+        for (b.p) |*v| v.* = bfBits(rng.unit() * 1.0);
+        for (b.a) |*v| v.* = bfBits(rng.unit() * 2.0);
+        for (b.g) |*v| v.* = bfBits(rng.unit() * 2.0);
+        for (b.cs) |*v| v.* = if (zero_window) 0 else bfBits(rng.unit() * 1.0);
+        for (b.cw) |*v| v.* = @floatCast(rb(rng.unit() * 0.5));
+        for (b.a_log) |*v| v.* = rng.unit();
+        for (b.dt_bias) |*v| v.* = rng.unit() * 0.5;
+        for (b.norm) |*v| v.* = bfBits(1.0 + rng.unit() / 4.0);
+        return b;
+    }
+
+    fn free(b: Block) void {
+        gpa.free(b.p);
+        gpa.free(b.a);
+        gpa.free(b.g);
+        gpa.free(b.cs);
+        gpa.free(b.cw);
+        gpa.free(b.a_log);
+        gpa.free(b.dt_bias);
+        gpa.free(b.norm);
+    }
+
+    /// Conv input `row` (window rows first) of channel c.
+    fn input(b: Block, row: usize, c: usize) f64 {
+        if (row < taps - 1) return bfOf(b.cs[row * 3 * b.n() + c]);
+        return bfOf(b.p[(row - (taps - 1)) * b.width() + c]);
+    }
+};
+
+/// The prep's outputs: q, k (L2 of the bf16 acts), v (bf16), decays, beta (bf16); `pre` = conv + SiLU before rounding.
+const Prep = struct {
+    q: []f64,
+    k: []f64,
+    v: []f64,
+    pre_v: []f64,
+    gate: []f64,
+    beta: []f64,
+    pre_beta: []f64,
+
+    fn free(p: Prep) void {
+        for ([_][]f64{ p.q, p.k, p.v, p.pre_v, p.gate, p.beta, p.pre_beta }) |x| gpa.free(x);
+    }
+};
+
+/// float64 prep_kernel_body: conv + SiLU rounded to bf16, q and k L2-normed (q by 128^-0.5), decays, bf16 beta.
+fn prepRef(b: Block) !Prep {
+    const heads = b.heads;
+    const n = b.n();
+    const rows = b.rows;
+    const p: Prep = .{
+        .q = try gpa.alloc(f64, rows * n),
+        .k = try gpa.alloc(f64, rows * n),
+        .v = try gpa.alloc(f64, rows * n),
+        .pre_v = try gpa.alloc(f64, rows * n),
+        .gate = try gpa.alloc(f64, rows * n),
+        .beta = try gpa.alloc(f64, rows * heads),
+        .pre_beta = try gpa.alloc(f64, rows * heads),
+    };
+    var act: [3][d]f64 = undefined;
+    for (0..rows) |r| for (0..heads) |h| {
+        for (0..3) |part| for (0..d) |i| {
+            const c = part * n + h * d + i;
+            var acc: f64 = 0;
+            for (0..taps) |tap| acc += @as(f64, b.cw[c * taps + tap]) * b.input(r + tap, c);
+            const silu = acc * sigmoid(acc);
+            act[part][i] = rb(silu);
+            if (part == 2) p.pre_v[r * n + h * d + i] = silu;
+        };
+        for ([_][]f64{ p.q, p.k }, 0..) |dst, part| {
+            var ss: f64 = 0;
+            for (act[part]) |e| ss += e * e;
+            const extra: f64 = if (part == 0) 1 / @sqrt(@as(f64, d)) else 1;
+            const inv = 1 / @sqrt(ss + 1e-6) * extra;
+            for (dst[r * n + h * d ..][0..d], act[part]) |*o, e| o.* = e * inv;
+        }
+        @memcpy(p.v[r * n + h * d ..][0..d], &act[2]);
+        const rate = @exp(@as(f64, b.a_log[h]));
+        for (0..d) |i| {
+            const c = h * d + i;
+            p.gate[r * n + c] = @exp(@as(f64, lower) * sigmoid(rate * (bfOf(b.a[r * n + c]) + b.dt_bias[c])));
+        }
+        const sb = sigmoid(bfOf(b.p[r * b.width() + b.bOff() + h]));
+        p.pre_beta[r * heads + h] = sb;
+        p.beta[r * heads + h] = rb(sb);
+    };
+    return p;
+}
+
+/// float64 delta rule with a decay a key channel: state (heads, 128 v, 128 k) in place, y (rows, heads, 128).
+fn scanRef(heads: usize, rows: usize, q: []const f64, k: []const f64, v: []const f64, gate: []const f64, beta: []const f64, state: []f64, y: []f64) void {
+    for (0..heads) |h| {
+        const s = state[h * d * d ..][0 .. d * d];
+        for (0..rows) |t| {
+            const base = (t * heads + h) * d;
+            const g = gate[base..][0..d];
+            const kk = k[base..][0..d];
+            const qq = q[base..][0..d];
+            const b = beta[t * heads + h];
+            for (0..d) |r| {
+                const row = s[r * d ..][0..d];
+                var kv: f64 = 0;
+                for (row, g, kk) |*e, gi, ki| {
+                    e.* *= gi;
+                    kv += e.* * ki;
+                }
+                const delta = (v[base + r] - kv) * b;
+                var out: f64 = 0;
+                for (row, kk, qq) |*e, ki, qi| {
+                    e.* += ki * delta;
+                    out += e.* * qi;
+                }
+                y[base + r] = out;
+            }
+        }
     }
 }
 
-/// The conv tail after `rows` rows (the last 3 inputs a channel), or after each row r of a window (`snaps`), exact.
-fn expectTail(t: *Rig, in: ConvIn, with_tail: bool, addr: u64, after: usize) !void {
-    const ch = 3 * in.heads * d;
-    const got = try download(f32, t, addr, (taps - 1) * ch);
-    defer gpa.free(got);
-    for (0..taps - 1) |tap| for (0..ch) |c| {
-        const want: f32 = @floatCast(in.window(t, with_tail, after + tap, c));
-        try rig.expect(got[tap * ch + c] == want, "KDA conv tail after {d} rows: tap {d} channel {d}: {d} not {d}", .{ after, tap, c, got[tap * ch + c], want });
+/// A block's inputs on the device.
+const BlockDev = struct { p: u64, a: u64, g: u64, cs: u64, cw: u64, a_log: u64, dt_bias: u64, norm: u64 };
+
+fn blockDev(h: *Held, t: *Rig, b: Block) !BlockDev {
+    return .{
+        .p = at(try h.up(t, b.p)),
+        .a = at(try h.up(t, b.a)),
+        .g = at(try h.up(t, b.g)),
+        .cs = at(try h.up(t, b.cs)),
+        .cw = at(try h.up(t, b.cw)),
+        .a_log = at(try h.up(t, b.a_log)),
+        .dt_bias = at(try h.up(t, b.dt_bias)),
+        .norm = at(try h.up(t, b.norm)),
     };
 }
 
-test "KDA: a window's conv split and a prompt's prework write float64's q, k, v, decays a channel and beta" {
+/// The scan's inputs as the prep writes them: q fp32, then the saves k fp32, v bf16, decays fp32, beta fp32.
+const Saves = struct { q: u64, k: u64, v: u64, g: u64, b: u64 };
+
+fn saves(h: *Held, t: *Rig, rows: usize, heads: usize) !Saves {
+    const n = heads * d;
+    return .{
+        .q = at(try h.zeros(t, rows * n * 4)),
+        .k = at(try h.zeros(t, rows * n * 4)),
+        .v = at(try h.zeros(t, rows * n * 2)),
+        .g = at(try h.zeros(t, rows * n * 4)),
+        .b = at(try h.zeros(t, rows * heads * 4)),
+    };
+}
+
+fn prep(t: *Rig, b: Block, dev: BlockDev, out: Saves) !void {
+    try t.on.tf_kda_prep(cv(dev.p), @intCast(b.width()), @intCast(b.bOff()), cv(dev.a), @intCast(b.n()), cv(dev.cs), cf(dev.cw), cf(dev.a_log), cf(dev.dt_bias), lower, mf(out.q), mf(out.k), mv(out.v), mf(out.g), mf(out.b), @intCast(b.rows), @intCast(b.heads), t.stream.handle);
+}
+
+/// Bf16 `got` against float64 `pre` rounded: within a bf16 ulp (2^-7 of the value: a rounding boundary that fp32 and
+/// float64 sums put on either side), and the count that equals rb(pre) exactly.
+fn bfClose(got: []const u16, pre: []const f64, exact: *usize, worst: *f64) bool {
+    for (got, pre) |g, w| {
+        const e = @abs(bfOf(g) - w);
+        const tol = @abs(w) * std.math.pow(f64, 2, -7) + 1e-30;
+        worst.* = @max(worst.*, e / tol);
+        if (e > tol) return false;
+        exact.* += @intFromBool(g == bfBits(w));
+    }
+    return true;
+}
+
+test "KDA: the prep on the CUDA buffers writes float64's q, k, v (bf16), decays a channel and beta" {
     const t = try Rig.open(1 << 20);
     defer t.close();
     const heads = glm_heads;
-    const n = heads * d;
-    const ch = 3 * n;
-    // windows: one row (the plain decode), and verify windows of 3 and 8 rows with each row's conv tail kept aside
-    for ([_]usize{ 1, 3, 8 }) |rows| {
-        const in = try ConvIn.make(t, heads, rows, 0x4bda + rows);
-        defer in.free();
-        const want = try prepRef(t, in, true);
+    var exact: usize = 0;
+    var total: usize = 0;
+    var worst: f64 = 0;
+    const Case = struct { rows: usize, zero: bool };
+    for ([_]Case{ .{ .rows = 1, .zero = false }, .{ .rows = 3, .zero = false }, .{ .rows = 8, .zero = false }, .{ .rows = 70, .zero = false }, .{ .rows = 70, .zero = true }, .{ .rows = 300, .zero = false } }) |cs| {
+        const b = try Block.make(heads, cs.rows, 0x4bda + cs.rows + @intFromBool(cs.zero), cs.zero);
+        defer b.free();
+        const want = try prepRef(b);
         defer want.free();
         var h: Held = .{};
         defer h.deinit();
-        const c = try convDev(&h, t, in);
-        const tail = try h.up(t, in.tail);
-        const snaps = try h.zeros(t, rows * (taps - 1) * ch * 4);
-        const out: Split = .{
-            .q = at(try h.zeros(t, rows * n * 4)),
-            .k = at(try h.zeros(t, rows * n * 4)),
-            .v = at(try h.zeros(t, rows * n * 4)),
-            .gate = at(try h.zeros(t, rows * n * 4)),
-            .beta = at(try h.zeros(t, rows * heads * 4)),
-        };
-        try convSplit(t, in, c, at(tail), if (rows > 1) at(snaps) else 0, out);
+        const dev = try blockDev(&h, t, b);
+        const out = try saves(&h, t, cs.rows, heads);
+        try prep(t, b, dev, out);
         try t.stream.synchronize();
-        try expectPrep(t, out, want, "conv split", rows);
-        try expectTail(t, in, true, at(tail), rows);
-        if (rows > 1) for (0..rows) |r| try expectTail(t, in, true, at(snaps) + r * (taps - 1) * ch * 4, r + 1);
+        const n = cs.rows * b.n();
+        // v and beta: bf16, one rounding of float64's value
+        const gv = try download(u16, t, out.v, n);
+        defer gpa.free(gv);
+        const gb = try download(f32, t, out.b, cs.rows * heads);
+        defer gpa.free(gb);
+        const gb16 = try gpa.alloc(u16, gb.len);
+        defer gpa.free(gb16);
+        for (gb16, gb) |*o, x| o.* = bfBits(x);
+        for (gb16, gb) |o, x| try rig.expect(bfOf(o) == x, "KDA prep: beta {d} is not a bf16 value", .{x});
+        try rig.expect(bfClose(gv, want.pre_v, &exact, &worst), "KDA prep rows={d}: v outside a bf16 ulp", .{cs.rows});
+        try rig.expect(bfClose(gb16, want.pre_beta, &exact, &worst), "KDA prep rows={d}: beta outside a bf16 ulp", .{cs.rows});
+        total += n + gb.len;
+        // q and k: L2 of the bf16 acts, within a flipped act's share (2^-7 of the head's largest value) and fp32's 1e-5
+        for ([_]u64{ out.q, out.k }, [_][]f64{ want.q, want.k }, [_][]const u8{ "q", "k" }) |addr, ref, name| {
+            const got = try download(f32, t, addr, n);
+            defer gpa.free(got);
+            var e_most: f64 = 0;
+            for (0..n / d) |hd| {
+                var most: f64 = 0;
+                for (ref[hd * d ..][0..d]) |x| most = @max(most, @abs(x));
+                for (got[hd * d ..][0..d], ref[hd * d ..][0..d]) |g, w| {
+                    const e = @abs(@as(f64, g) - w) / most;
+                    e_most = @max(e_most, e);
+                }
+            }
+            std.debug.print("KDA prep rows={d}{s}: {s} worst error {e:.3} of the head's largest value\n", .{ cs.rows, if (cs.zero) " (zero window)" else "", name, e_most });
+            try rig.expect(e_most < std.math.pow(f64, 2, -7), "KDA prep rows={d}: {s} error {e}", .{ cs.rows, name, e_most });
+        }
+        const gg = try download(f32, t, out.g, n);
+        defer gpa.free(gg);
+        const eg = relative(gg, want.gate);
+        std.debug.print("KDA prep rows={d}: decay relative error {e:.3}\n", .{ cs.rows, eg });
+        try rig.expect(eg < 1e-5, "KDA prep rows={d}: decay relative error {e}", .{ cs.rows, eg });
     }
-    // prompts, from a conv tail and from none (a sequence's first chunk)
-    for ([_]usize{ 1, 70, 300 }) |rows| for ([_]bool{ true, false }) |with_tail| {
-        const in = try ConvIn.make(t, heads, rows, 0x9a7e + rows);
-        defer in.free();
-        const want = try prepRef(t, in, with_tail);
-        defer want.free();
-        var h: Held = .{};
-        defer h.deinit();
-        const c = try convDev(&h, t, in);
-        const tail = try h.up(t, in.tail);
-        const next = try h.zeros(t, (taps - 1) * ch * 4);
-        const out: Split = .{
-            .q = at(try h.zeros(t, rows * n * 4)),
-            .k = at(try h.zeros(t, rows * n * 4)),
-            .v = at(try h.zeros(t, rows * n * 4)),
-            .gate = at(try h.zeros(t, rows * n * 4)),
-            .beta = at(try h.zeros(t, rows * heads * 4)),
-        };
-        try promptPrep(t, in, c, if (with_tail) at(tail) else 0, at(next), out);
-        try t.stream.synchronize();
-        try expectPrep(t, out, want, if (with_tail) "prompt prep" else "prompt prep (no tail)", rows);
-        try expectTail(t, in, with_tail, at(next), rows);
-    };
+    const frac = @as(f64, @floatFromInt(exact)) / @as(f64, @floatFromInt(total));
+    std.debug.print("KDA prep: v and beta equal float64's bf16 rounding in {d} of {d} ({d:.5}); worst {d:.3} of a bf16 ulp\n", .{ exact, total, frac, worst });
+    try rig.expect(frac > 0.999, "KDA prep: only {d:.5} of v and beta equal float64's rounding", .{frac});
 }
 
-/// The scan's inputs: q and k L2-normed (q to 128^-0.5), v normal, decays exp(-5 sigmoid(2 z)), beta sigmoid(z).
+test "KDA: the conv shift takes rows keep .. keep + 2 of [window; projection rows], every layer" {
+    const t = try Rig.open(1 << 20);
+    defer t.close();
+    const heads = glm_heads;
+    const c = 3 * heads * d;
+    const kw = 3 * heads * d + 2 * d + heads;
+    const layers = 3;
+    var rng: rig.Rng = .{ .state = 0x5a1f7 };
+    const conv = try gpa.alloc(u16, layers * 3 * c);
+    defer gpa.free(conv);
+    for (conv) |*v| v.* = bfBits(rng.unit());
+    for ([_]usize{ window_rows, 300 }) |rows| {
+        const proj = try gpa.alloc(u16, layers * rows * kw);
+        defer gpa.free(proj);
+        for (proj) |*v| v.* = bfBits(rng.unit());
+        for (0..rows + 1) |keep| {
+            if (rows > window_rows and keep != rows) continue; // a prompt chunk commits all its rows
+            var h: Held = .{};
+            defer h.deinit();
+            const dc = try h.up(t, conv);
+            const dp = try h.up(t, proj);
+            try t.on.tf_kda_conv_shift(mv(at(dc)), cv(at(dp)), @intCast(keep), @intCast(3 * c), @intCast(rows * kw), @intCast(kw), @intCast(c), layers, t.stream.handle);
+            try t.stream.synchronize();
+            const got = try rig.download(u16, dc);
+            defer gpa.free(got);
+            for (0..layers) |l| for (0..3) |j| for (0..c) |k| {
+                const src = keep + j;
+                const want = if (src < 3) conv[l * 3 * c + src * c + k] else proj[l * rows * kw + (src - 3) * kw + k];
+                try rig.expect(got[l * 3 * c + j * c + k] == want, "KDA conv shift rows={d} keep={d}: layer {d} row {d} column {d}", .{ rows, keep, l, j, k });
+            };
+        }
+    }
+}
+
+/// The scan's inputs: q and k L2-normed (q to 128^-0.5), v bf16, decays exp(-5 sigmoid(2 z)), beta bf16(sigmoid(z)).
 const ScanIn = struct {
     heads: usize,
     rows: usize,
     q: []f32,
     k: []f32,
-    v: []f32,
+    v: []u16,
     gate: []f32,
     beta: []f32,
     state: []f32,
@@ -390,7 +425,7 @@ const ScanIn = struct {
             .rows = rows,
             .q = try gpa.alloc(f32, rows * n),
             .k = try gpa.alloc(f32, rows * n),
-            .v = try gpa.alloc(f32, rows * n),
+            .v = try gpa.alloc(u16, rows * n),
             .gate = try gpa.alloc(f32, rows * n),
             .beta = try gpa.alloc(f32, rows * heads),
             .state = try gpa.alloc(f32, heads * d * d),
@@ -407,28 +442,27 @@ const ScanIn = struct {
                 for (a[row * d ..][0..d]) |*x| x.* *= inv;
             }
         }
-        for (in.v) |*x| x.* = @floatCast(rng.normal());
+        for (in.v) |*x| x.* = bfBits(rng.normal());
         for (in.gate) |*g| g.* = @floatCast(@exp(@as(f64, lower) * sigmoid(2 * rng.normal())));
-        for (in.beta) |*b| b.* = @floatCast(sigmoid(rng.normal()));
+        for (in.beta) |*b| b.* = @floatCast(rb(sigmoid(rng.normal())));
         for (in.state) |*x| x.* = @floatCast(0.1 * rng.normal());
         return in;
     }
 
     fn free(in: ScanIn) void {
-        for ([_][]f32{ in.q, in.k, in.v, in.gate, in.beta, in.state }) |a| gpa.free(a);
+        for ([_][]f32{ in.q, in.k, in.gate, in.beta, in.state }) |a| gpa.free(a);
+        gpa.free(in.v);
+    }
+
+    fn dev(in: ScanIn, h: *Held, t: *Rig) !Saves {
+        return .{ .q = at(try h.up(t, in.q)), .k = at(try h.up(t, in.k)), .v = at(try h.up(t, in.v)), .g = at(try h.up(t, in.gate)), .b = at(try h.up(t, in.beta)) };
     }
 };
 
-/// The scan's inputs on the device: q, k, v, gate, beta.
-fn scanDev(h: *Held, t: *Rig, in: ScanIn) ![5]DeviceBuffer {
-    return .{ try h.up(t, in.q), try h.up(t, in.k), try h.up(t, in.v), try h.up(t, in.gate), try h.up(t, in.beta) };
-}
-
-/// tf_kda over rows [from, from + rows) of `in` (state in place; `snaps`: each row's state, 0: none).
-fn scan(t: *Rig, heads: usize, in: [5]DeviceBuffer, state: u64, y: u64, from: usize, rows: usize, snaps: u64) !void {
+/// tf_kda over rows [from, from + rows) (state in place; `snaps`: each row's state, 0: none).
+fn scan(t: *Rig, heads: usize, in: Saves, state: u64, y: u64, from: usize, rows: usize, snaps: u64) !void {
     const n = heads * d;
-    const row = from * n * 4;
-    try t.on.tf_kda(cf(at(in[0]) + row), cf(at(in[1]) + row), cf(at(in[2]) + row), cf(at(in[3]) + row), cf(at(in[4]) + from * heads * 4), mf(state), mf(y + row), @intCast(rows), @intCast(heads), t.stream.handle, mf(snaps), 0);
+    try t.on.tf_kda(cf(in.q + from * n * 4), cf(in.k + from * n * 4), cv(in.v + from * n * 2), cf(in.g + from * n * 4), cf(in.b + from * heads * 4), mf(state), mf(y + from * n * 4), @intCast(rows), @intCast(heads), t.stream.handle, mf(snaps), 0);
 }
 
 test "KDA: the scan (tile under 64 rows, prompt blocks from 64) stays within 5e-3 of the float64 recurrence" {
@@ -453,13 +487,13 @@ test "KDA: the scan (tile under 64 rows, prompt blocks from 64) stays within 5e-
         const rs = try widen(in.state);
         defer gpa.free(rs);
         {
-            const w = [_][]f64{ try widen(in.q), try widen(in.k), try widen(in.v), try widen(in.gate), try widen(in.beta) };
+            const w = [_][]f64{ try widen(in.q), try widen(in.k), try widenBf(in.v), try widen(in.gate), try widen(in.beta) };
             defer for (w) |x| gpa.free(x);
             scanRef(sh.heads, sh.rows, w[0], w[1], w[2], w[3], w[4], rs, ry);
         }
         var h: Held = .{};
         defer h.deinit();
-        const dev = try scanDev(&h, t, in);
+        const dev = try in.dev(&h, t);
         const state = try h.up(t, in.state);
         const y = try h.zeros(t, sh.rows * n * 4);
         try scan(t, sh.heads, dev, at(state), at(y), 0, sh.rows, 0);
@@ -484,17 +518,16 @@ test "KDA: the prompt blocks give the tile's bits, and a prompt cut anywhere giv
     defer in.free();
     var h: Held = .{};
     defer h.deinit();
-    const dev = try scanDev(&h, t, in);
+    const dev = try in.dev(&h, t);
     const state = try h.up(t, in.state);
     const y = try h.zeros(t, rows * heads * d * 4);
-    // one call: the prompt blocks
     try scan(t, heads, dev, at(state), at(y), 0, rows, 0);
     try t.stream.synchronize();
     const want_y = try rig.download(u8, y);
     defer gpa.free(want_y);
     const want_s = try rig.download(u8, state);
     defer gpa.free(want_s);
-    // cuts: [0, c) and [c, 200) (either side of 64 rows), and 50-row calls (the tile alone)
+    // cuts either side of 64 rows (prompt blocks and tile mixed), and 50-row calls (the tile alone)
     const Cut = struct { at: []const usize };
     for ([_]Cut{ .{ .at = &.{1} }, .{ .at = &.{63} }, .{ .at = &.{64} }, .{ .at = &.{65} }, .{ .at = &.{136} }, .{ .at = &.{ 50, 100, 150 } } }) |cut| {
         try state.upload(0, std.mem.sliceAsBytes(in.state));
@@ -514,41 +547,64 @@ test "KDA: the prompt blocks give the tile's bits, and a prompt cut anywhere giv
     }
 }
 
-/// Rows a keep's inputs hold a layer: a verify window's most (Flash Next's cache.max_window; GLM drafts at most 3).
-const keep_rows = 8;
+/// `layers` layers' window saves as cuda_state.zig lays them: k, v (bf16), decays [layers][window_rows][heads][128],
+/// beta [layers][window_rows][heads]; the first `rows` rows of layer z from ins[z], the rest NaN.
+const WindowSaves = struct {
+    k: []f32,
+    v: []u16,
+    g: []f32,
+    b: []f32,
 
-/// Layer inputs as a window's conv split writes them for its keep: keep_rows rows of k, then of v, of decays and of beta;
-/// the rows past `rows` NaN, so a keep that read one would show it.
-fn keepInputs(in: ScanIn, rows: usize, out: []f32) void {
-    @memset(out, std.math.nan(f32));
-    const n = in.heads * d;
-    @memcpy(out[0 .. rows * n], in.k[0 .. rows * n]);
-    @memcpy(out[keep_rows * n ..][0 .. rows * n], in.v[0 .. rows * n]);
-    @memcpy(out[2 * keep_rows * n ..][0 .. rows * n], in.gate[0 .. rows * n]);
-    @memcpy(out[3 * keep_rows * n ..][0 .. rows * in.heads], in.beta[0 .. rows * in.heads]);
-}
+    fn make(ins: []const ScanIn, rows: usize) !WindowSaves {
+        const heads = ins[0].heads;
+        const kv = window_rows * heads * d;
+        const w: WindowSaves = .{
+            .k = try gpa.alloc(f32, ins.len * kv),
+            .v = try gpa.alloc(u16, ins.len * kv),
+            .g = try gpa.alloc(f32, ins.len * kv),
+            .b = try gpa.alloc(f32, ins.len * window_rows * heads),
+        };
+        @memset(w.k, std.math.nan(f32));
+        @memset(w.v, 0x7fc0);
+        @memset(w.g, std.math.nan(f32));
+        @memset(w.b, std.math.nan(f32));
+        for (ins, 0..) |in, z| {
+            const n = rows * heads * d;
+            @memcpy(w.k[z * kv ..][0..n], in.k[0..n]);
+            @memcpy(w.v[z * kv ..][0..n], in.v[0..n]);
+            @memcpy(w.g[z * kv ..][0..n], in.gate[0..n]);
+            @memcpy(w.b[z * window_rows * heads ..][0 .. rows * heads], in.beta[0 .. rows * heads]);
+        }
+        return w;
+    }
 
-test "KDA: a held window and its keep give the window's outputs, and the state after its row kept - 1" {
+    fn free(w: WindowSaves) void {
+        gpa.free(w.k);
+        gpa.free(w.v);
+        gpa.free(w.g);
+        gpa.free(w.b);
+    }
+};
+
+test "KDA: a held window and its keep on the CUDA saves give the window's outputs and its state after row kept - 1" {
     const t = try Rig.open(1 << 20);
     defer t.close();
     const heads = glm_heads;
     const n = heads * d;
     const layers = 2;
     var ins: [layers]ScanIn = undefined;
-    for (&ins, 0..) |*in, z| in.* = try ScanIn.make(heads, keep_rows, 0x4ee9 + z);
+    for (&ins, 0..) |*in, z| in.* = try ScanIn.make(heads, window_rows, 0x4ee9 + z);
     defer for (ins) |in| in.free();
     const state_floats = heads * d * d;
     const state_bytes = state_floats * 4;
     const state_stride = state_floats + 64;
-    const in_stride = keep_rows * (3 * n + heads);
-    for (1..keep_rows + 1) |rows| {
-        // the window as a plain scan: its outputs and each row's state
+    for (1..window_rows + 1) |rows| {
         var want_y: [layers][]u8 = undefined;
         var want_snaps: [layers][]u8 = undefined;
         for (0..layers) |z| {
             var h: Held = .{};
             defer h.deinit();
-            const dev = try scanDev(&h, t, ins[z]);
+            const dev = try ins[z].dev(&h, t);
             const state = try h.up(t, ins[z].state);
             const y = try h.zeros(t, rows * n * 4);
             const snaps = try h.zeros(t, rows * state_bytes);
@@ -561,14 +617,13 @@ test "KDA: a held window and its keep give the window's outputs, and the state a
             gpa.free(a);
             gpa.free(b);
         };
-        // the held window: the same outputs, the state untouched; one row: the plain scan stores the snapshot's bits
         for (0..layers) |z| {
             var h: Held = .{};
             defer h.deinit();
-            const dev = try scanDev(&h, t, ins[z]);
+            const dev = try ins[z].dev(&h, t);
             const state = try h.up(t, ins[z].state);
             const y = try h.zeros(t, rows * n * 4);
-            try t.on.tf_kda_hold(cf(at(dev[0])), cf(at(dev[1])), cf(at(dev[2])), cf(at(dev[3])), cf(at(dev[4])), mf(at(state)), mf(at(y)), @intCast(rows), heads, t.stream.handle);
+            try t.on.tf_kda_hold(cf(dev.q), cf(dev.k), cv(dev.v), cf(dev.g), cf(dev.b), mf(at(state)), mf(at(y)), @intCast(rows), heads, t.stream.handle);
             try t.stream.synchronize();
             const got_y = try rig.download(u8, y);
             defer gpa.free(got_y);
@@ -576,18 +631,9 @@ test "KDA: a held window and its keep give the window's outputs, and the state a
             const held = try rig.download(f32, state);
             defer gpa.free(held);
             try std.testing.expectEqualSlices(u32, @ptrCast(ins[z].state), @ptrCast(held));
-            if (rows == 1) {
-                try scan(t, heads, dev, at(state), at(y), 0, 1, 0);
-                try t.stream.synchronize();
-                const stored = try rig.download(u8, state);
-                defer gpa.free(stored);
-                try rig.expect(std.mem.eql(u8, want_snaps[z][0..state_bytes], stored), "KDA one-row window: state differs from the snapshot", .{});
-            }
         }
-        // the keep of every count a window of `rows` can keep (1: a full reject, the pending token alone)
-        const packed_in = try gpa.alloc(f32, layers * in_stride);
-        defer gpa.free(packed_in);
-        for (0..layers) |z| keepInputs(ins[z], rows, packed_in[z * in_stride ..][0..in_stride]);
+        const ws = try WindowSaves.make(&ins, rows);
+        defer ws.free();
         const states = try gpa.alloc(f32, layers * state_stride);
         defer gpa.free(states);
         for (1..rows + 1) |kept| {
@@ -595,9 +641,12 @@ test "KDA: a held window and its keep give the window's outputs, and the state a
             for (0..layers) |z| @memcpy(states[z * state_stride ..][0..state_floats], ins[z].state);
             var h: Held = .{};
             defer h.deinit();
-            const inputs = try h.up(t, packed_in);
+            const dk = try h.up(t, ws.k);
+            const dv = try h.up(t, ws.v);
+            const dg = try h.up(t, ws.g);
+            const db = try h.up(t, ws.b);
             const state = try h.up(t, states);
-            try t.on.tf_kda_keep(mf(at(state)), @intCast(state_stride), cf(at(inputs)), @intCast(in_stride), keep_rows, @intCast(kept), layers, heads, t.stream.handle);
+            try t.on.tf_kda_keep(mf(at(state)), @intCast(state_stride), cf(at(dk)), cv(at(dv)), cf(at(dg)), cf(at(db)), window_rows * n, window_rows * heads, @intCast(kept), layers, heads, t.stream.handle);
             try t.stream.synchronize();
             const got = try rig.download(u8, state);
             defer gpa.free(got);
@@ -612,119 +661,98 @@ test "KDA: a held window and its keep give the window's outputs, and the state a
     }
 }
 
-/// The chain's output: rms(y) o_norm sigmoid(g) a (row, head) in float64, as glm_ref_kda.zig's reference ends.
-fn gnormRef(t: *const Rig, heads: usize, rows: usize, y: []const f64, z: []const u16, norm_w: []const f32, eps: f64, out: []f64) void {
-    for (0..rows * heads) |rh| {
+/// glm_ref_kda.zig's float64 chain on a Block: conv + SiLU, L2 q / k, decays, bf16 beta, delta rule, y = bf16(S q),
+/// RMS norm, gate. Out [rows][n]; the state after the rows into `state`.
+fn chainRef(b: Block, state: []f64, out: []f64) !void {
+    const p = try prepRef(b);
+    defer p.free();
+    const n = b.n();
+    const y = try gpa.alloc(f64, b.rows * n);
+    defer gpa.free(y);
+    scanRef(b.heads, b.rows, p.q, p.k, p.v, p.gate, p.beta, state, y);
+    for (0..b.rows * b.heads) |rh| {
         const yy = y[rh * d ..][0..d];
         var ss: f64 = 0;
-        for (yy) |e| ss += e * e;
-        const rinv = 1 / @sqrt(ss / d + eps);
-        for (out[rh * d ..][0..d], yy, 0..) |*o, e, i| o.* = @as(f64, norm_w[i]) * e * rinv * sigmoid(t.value(z[rh * d + i]));
+        for (yy) |*e| {
+            e.* = rb(e.*);
+            ss += e.* * e.*;
+        }
+        const rinv = 1 / @sqrt(ss / d + eps_out);
+        for (out[rh * d ..][0..d], yy, 0..) |*o, e, i| o.* = bfOf(b.norm[i]) * e * rinv * sigmoid(bfOf(b.g[rh * d + i]));
     }
 }
 
-/// Out (activation kind) against float64 within its rounding (2^-8 of the value) and 2^-8 of the row's largest value,
-/// as glm_ref_kda.zig's tolerance.
-fn expectOut(t: *Rig, out: DeviceBuffer, want: []const f64, n: usize, what: []const u8) !void {
-    const got = try rig.download(u16, out);
-    defer gpa.free(got);
+/// Out bf16 against float64 within glm_ref_kda.zig:136's tolerance: 2^-8 of the value (the out's rounding) + 2^-8 of
+/// the row's largest value (y's bf16 rounding in the reference; the HIP chain keeps y fp32).
+fn expectOut(got: []const u16, want: []const f64, n: usize, what: []const u8) !void {
     var worst: f64 = 0;
     for (0..want.len / n) |row| {
         var most: f64 = 0;
         for (want[row * n ..][0..n]) |e| most = @max(most, @abs(e));
         for (got[row * n ..][0..n], want[row * n ..][0..n], 0..) |g, e, c| {
             const tol = @abs(e) * std.math.pow(f64, 2, -8) + most * std.math.pow(f64, 2, -8) + 1e-30;
-            const err = @abs(t.value(g) - e);
+            const err = @abs(bfOf(g) - e);
             worst = @max(worst, err / tol);
-            try rig.expect(err <= tol, "KDA chain {s}: row {d} column {d}: {d} not {d} (tolerance {e})", .{ what, row, c, t.value(g), e, tol });
+            try rig.expect(err <= tol, "KDA chain {s}: row {d} column {d}: {d} not {d} (tolerance {e})", .{ what, row, c, bfOf(g), e, tol });
         }
     }
     std.debug.print("KDA chain {s}: worst error {d:.3} of its tolerance\n", .{ what, worst });
 }
 
-test "KDA: the window and prompt chains (conv, scan, keep, gated norm) against the float64 chain of glm_ref_kda" {
+test "KDA: the window and prompt chains on the CUDA buffers against the float64 chain of glm_ref_kda" {
     const t = try Rig.open(1 << 20);
     defer t.close();
     const heads = glm_heads;
-    const n = heads * d;
-    const eps: f32 = 1e-5; // GLM-5.3-Flash's rms_norm_eps, o_norm's
     for ([_]usize{ 3, 70 }) |rows| {
-        const window = rows < keep_rows;
-        const in = try ConvIn.make(t, heads, rows, 0xc4a1 + rows);
-        defer in.free();
+        const window = rows <= window_rows;
+        const b = try Block.make(heads, rows, 0xc4a1 + rows, false);
+        defer b.free();
+        const n = b.n();
         var rng: rig.Rng = .{ .state = 0x9a7e5 + rows };
-        const z = try gpa.alloc(u16, rows * n);
-        defer gpa.free(z);
-        for (z) |*v| v.* = t.bits(rng.unit() * 2.0);
-        const norm_w = try gpa.alloc(f32, d);
-        defer gpa.free(norm_w);
-        for (norm_w) |*v| v.* = @floatCast(t.value(t.bits(1.0 + rng.unit() / 4.0)));
         const state0 = try gpa.alloc(f32, heads * d * d);
         defer gpa.free(state0);
         for (state0) |*v| v.* = rng.unit() * 0.05;
-        // float64: prework, scan, gated norm
         const want_out = try gpa.alloc(f64, rows * n);
         defer gpa.free(want_out);
         const want_state = try widen(state0);
         defer gpa.free(want_state);
-        {
-            const p = try prepRef(t, in, true);
-            defer p.free();
-            const y = try gpa.alloc(f64, rows * n);
-            defer gpa.free(y);
-            scanRef(heads, rows, p.q, p.k, p.v, p.gate, p.beta, want_state, y);
-            gnormRef(t, heads, rows, y, z, norm_w, eps, want_out);
-        }
+        try chainRef(b, want_state, want_out);
         var h: Held = .{};
         defer h.deinit();
-        const c = try convDev(&h, t, in);
-        const tail = try h.up(t, in.tail);
+        const dev = try blockDev(&h, t, b);
         const state = try h.up(t, state0);
-        const dz = try h.up(t, z);
-        const dnorm = try h.up(t, norm_w);
         const y = try h.zeros(t, rows * n * 4);
         const out = try h.zeros(t, rows * n * 2);
-        const q = try h.zeros(t, rows * n * 4);
-        // the window's k, v, decays and beta where its keep reads them: `rows` rows of each
-        const win = try h.zeros(t, rows * (3 * n + heads) * 4);
-        const sp: Split = .{ .q = at(q), .k = at(win), .v = at(win) + rows * n * 4, .gate = at(win) + 2 * rows * n * 4, .beta = at(win) + 3 * rows * n * 4 };
+        const sv = try saves(&h, t, rows, heads);
+        const s = t.stream.handle;
+        try prep(t, b, dev, sv);
         if (window) {
-            const snaps = try h.zeros(t, rows * (taps - 1) * 3 * n * 4);
-            try convSplit(t, in, c, at(tail), at(snaps), sp);
-            try t.on.tf_kda_hold(cf(sp.q), cf(sp.k), cf(sp.v), cf(sp.gate), cf(sp.beta), mf(at(state)), mf(at(y)), @intCast(rows), heads, t.stream.handle);
+            // the window holds the state; the keep of all its rows commits it, and the conv window shifts by them
+            try t.on.tf_kda_hold(cf(sv.q), cf(sv.k), cv(sv.v), cf(sv.g), cf(sv.b), mf(at(state)), mf(at(y)), @intCast(rows), heads, s);
+            try t.on.tf_kda_keep(mf(at(state)), 0, cf(sv.k), cv(sv.v), cf(sv.g), cf(sv.b), 0, 0, @intCast(rows), 1, heads, s);
         } else {
-            const next = try h.zeros(t, (taps - 1) * 3 * n * 4);
-            try promptPrep(t, in, c, at(tail), at(next), sp);
-            try t.on.tf_kda(cf(sp.q), cf(sp.k), cf(sp.v), cf(sp.gate), cf(sp.beta), mf(at(state)), mf(at(y)), @intCast(rows), heads, t.stream.handle, null, 0);
-            try t.stream.synchronize();
-            try expectTail(t, in, true, at(next), rows);
+            try t.on.tf_kda(cf(sv.q), cf(sv.k), cv(sv.v), cf(sv.g), cf(sv.b), mf(at(state)), mf(at(y)), @intCast(rows), heads, s, null, 0);
         }
-        try t.on.tf_gnorm_out(cf(at(y)), cf(at(dnorm)), cv(at(dz)), @ptrFromInt(at(out)), t.kind(), @intCast(rows * heads), d, eps, 1, t.stream.handle);
+        try t.on.tf_kda_out(cf(at(y)), cv(dev.g), @intCast(n), cv(dev.norm), eps_out, mv(at(out)), @intCast(rows), heads, s);
+        try t.on.tf_kda_conv_shift(mv(dev.cs), cv(dev.p), @intCast(rows), @intCast(3 * 3 * n), @intCast(rows * b.width()), @intCast(b.width()), @intCast(3 * n), 1, s);
         try t.stream.synchronize();
-        try expectOut(t, out, want_out, n, if (window) "window of 3 rows (conv split, hold, gated norm)" else "prompt of 70 rows (prompt prep, prompt scan, gated norm)");
-        if (window) {
-            // the keep of all rows: the state a plain scan of the window stores, and float64's
-            const plain = try h.up(t, state0);
-            const y2 = try h.zeros(t, rows * n * 4);
-            try t.on.tf_kda(cf(sp.q), cf(sp.k), cf(sp.v), cf(sp.gate), cf(sp.beta), mf(at(plain)), mf(at(y2)), @intCast(rows), heads, t.stream.handle, null, 0);
-            try t.on.tf_kda_keep(mf(at(state)), @intCast(heads * d * d), cf(at(win)), 0, @intCast(rows), @intCast(rows), 1, heads, t.stream.handle);
-            try t.stream.synchronize();
-            const a = try rig.download(u8, plain);
-            defer gpa.free(a);
-            const b = try rig.download(u8, state);
-            defer gpa.free(b);
-            try rig.expect(std.mem.eql(u8, a, b), "KDA window chain: the keep's state differs from the plain scan's", .{});
-            const ya = try rig.download(u8, y);
-            defer gpa.free(ya);
-            const yb = try rig.download(u8, y2);
-            defer gpa.free(yb);
-            try rig.expect(std.mem.eql(u8, ya, yb), "KDA window chain: the held window's outputs differ from the plain scan's", .{});
-        }
+        const what = if (window) "window of 3 rows (prep, hold, keep, out, conv shift)" else "prompt of 70 rows (prep, prompt scan, out, conv shift)";
+        const got = try rig.download(u16, out);
+        defer gpa.free(got);
+        try expectOut(got, want_out, n, what);
         const gs = try rig.download(f32, state);
         defer gpa.free(gs);
         const es = relative(gs, want_state);
         std.debug.print("KDA chain rows={d}: state relative error {e:.3}\n", .{ rows, es });
         try rig.expect(es < 5e-3, "KDA chain rows={d}: state relative error {e}", .{ rows, es });
+        // the conv window after the rows: the last 3 inputs a channel
+        const gw = try download(u16, t, dev.cs, 3 * 3 * n);
+        defer gpa.free(gw);
+        for (0..3) |j| for (0..3 * n) |c| {
+            const src = rows + j;
+            const want = if (src < 3) b.cs[src * 3 * n + c] else b.p[(src - 3) * b.width() + c];
+            try rig.expect(gw[j * 3 * n + c] == want, "KDA chain rows={d}: conv window row {d} column {d}", .{ rows, j, c });
+        };
     }
 }
 
@@ -748,7 +776,7 @@ fn timeMs(t: *Rig, runs: usize, ctx: anytype, comptime f: fn (@TypeOf(ctx)) anye
     return ms[runs / 2];
 }
 
-test "KDA: speed facts (no gate): the scans against the DeltaNet's at GLM's 64 heads, one layer" {
+test "KDA: speed facts (no gate): prep, scans, out and keep at GLM's 64 heads, one layer, beside the DeltaNet's" {
     const t = try Rig.open(1 << 20);
     defer t.close();
     const heads = glm_heads;
@@ -758,46 +786,82 @@ test "KDA: speed facts (no gate): the scans against the DeltaNet's at GLM's 64 h
     defer in.free();
     var h: Held = .{};
     defer h.deinit();
-    const dev = try scanDev(&h, t, in);
+    const dev = try in.dev(&h, t);
     const state = try h.up(t, in.state);
     const y = try h.zeros(t, rows * n * 4);
-    const head_gate = try h.up(t, in.gate[0 .. rows * heads]); // the DeltaNet's: a gate a head
-    const Ctx = struct { t: *Rig, dev: [5]DeviceBuffer, state: u64, y: u64, g: u64, rows: usize, kda: bool, hold: bool };
+    // the DeltaNet at the same shape: v fp32, a gate a head
+    const v32 = try gpa.alloc(f32, rows * n);
+    defer gpa.free(v32);
+    for (v32, in.v) |*o, x| o.* = @floatCast(bfOf(x));
+    const dv32 = at(try h.up(t, v32));
+    const head_gate = at(try h.up(t, in.gate[0 .. rows * heads]));
+    const Ctx = struct { t: *Rig, dev: Saves, state: u64, y: u64, v32: u64, g: u64, rows: usize, kda: bool, hold: bool };
     const run = struct {
         fn f(c: Ctx) anyerror!void {
             const l = &c.t.on;
             const s = c.t.stream.handle;
-            const q, const k, const v, const g, const b = .{ at(c.dev[0]), at(c.dev[1]), at(c.dev[2]), at(c.dev[3]), at(c.dev[4]) };
             const r: c_int = @intCast(c.rows);
+            const x = c.dev;
             if (c.kda) {
-                if (c.hold) return l.tf_kda_hold(cf(q), cf(k), cf(v), cf(g), cf(b), mf(c.state), mf(c.y), r, glm_heads, s);
-                return l.tf_kda(cf(q), cf(k), cf(v), cf(g), cf(b), mf(c.state), mf(c.y), r, glm_heads, s, null, 0);
+                if (c.hold) return l.tf_kda_hold(cf(x.q), cf(x.k), cv(x.v), cf(x.g), cf(x.b), mf(c.state), mf(c.y), r, glm_heads, s);
+                return l.tf_kda(cf(x.q), cf(x.k), cv(x.v), cf(x.g), cf(x.b), mf(c.state), mf(c.y), r, glm_heads, s, null, 0);
             }
-            if (c.hold) return l.tf_gdn_hold(cf(q), cf(k), cf(v), cf(c.g), cf(b), mf(c.state), mf(c.y), r, glm_heads, glm_heads, d, d, s);
-            return l.tf_gated_delta(cf(q), cf(k), cf(v), cf(c.g), cf(b), mf(c.state), mf(c.y), 1, r, glm_heads, glm_heads, d, d, s, null, 0);
+            if (c.hold) return l.tf_gdn_hold(cf(x.q), cf(x.k), cf(c.v32), cf(c.g), cf(x.b), mf(c.state), mf(c.y), r, glm_heads, glm_heads, d, d, s);
+            return l.tf_gated_delta(cf(x.q), cf(x.k), cf(c.v32), cf(c.g), cf(x.b), mf(c.state), mf(c.y), 1, r, glm_heads, glm_heads, d, d, s, null, 0);
         }
     };
     const Case = struct { name: []const u8, rows: usize, hold: bool };
     for ([_]Case{
-        .{ .name = "prompt 2048 rows", .rows = rows, .hold = false },
-        .{ .name = "decode 1 row", .rows = 1, .hold = false },
-        .{ .name = "verify hold 4 rows", .rows = 4, .hold = true },
+        .{ .name = "scan, prompt 2048 rows", .rows = rows, .hold = false },
+        .{ .name = "scan, decode 1 row", .rows = 1, .hold = false },
+        .{ .name = "scan, verify hold 4 rows", .rows = 4, .hold = true },
     }) |cs| {
         var ms: [2]f64 = undefined;
-        for (&ms, [_]bool{ true, false }) |*m, kda| m.* = try timeMs(t, 15, Ctx{ .t = t, .dev = dev, .state = at(state), .y = at(y), .g = at(head_gate), .rows = cs.rows, .kda = kda, .hold = cs.hold }, run.f);
-        std.debug.print("KDA speed {s}, 64 heads: KDA {d:.4} ms, DeltaNet (a gate a head) {d:.4} ms, ratio {d:.3}\n", .{ cs.name, ms[0], ms[1], ms[0] / ms[1] });
+        for (&ms, [_]bool{ true, false }) |*m, kda| m.* = try timeMs(t, 15, Ctx{ .t = t, .dev = dev, .state = at(state), .y = at(y), .v32 = dv32, .g = head_gate, .rows = cs.rows, .kda = kda, .hold = cs.hold }, run.f);
+        std.debug.print("KDA speed {s}, 64 heads: KDA {d:.4} ms, DeltaNet (a gate a head, v fp32) {d:.4} ms, ratio {d:.3}\n", .{ cs.name, ms[0], ms[1], ms[0] / ms[1] });
     }
-    // the keep of 4 rows over GLM's 34 KDA layers (one launch), a full accept
-    const layers = 34;
-    const in_stride = keep_rows * (3 * n + heads);
-    const big = try h.zeros(t, layers * in_stride * 4);
-    const states = try h.zeros(t, layers * heads * d * d * 4);
-    const Keep = struct { t: *Rig, states: u64, in: u64, stride: usize };
-    const keep = struct {
-        fn f(c: Keep) anyerror!void {
-            return c.t.on.tf_kda_keep(mf(c.states), @intCast(glm_heads * d * d), cf(c.in), @intCast(c.stride), keep_rows, 4, 34, glm_heads, c.t.stream.handle);
+    // prep and out on the CUDA buffers, 2,048 rows and 1 row
+    const b = try Block.make(heads, rows, 0xbeef, false);
+    defer b.free();
+    const bd = try blockDev(&h, t, b);
+    const sv = try saves(&h, t, rows, heads);
+    const out = at(try h.zeros(t, rows * n * 2));
+    const PO = struct { t: *Rig, b: *const Block, bd: BlockDev, sv: Saves, y: u64, out: u64, rows: usize, which: u1 };
+    const po = struct {
+        fn f(c: PO) anyerror!void {
+            const s = c.t.stream.handle;
+            if (c.which == 0) return c.t.on.tf_kda_prep(cv(c.bd.p), @intCast(c.b.width()), @intCast(c.b.bOff()), cv(c.bd.a), @intCast(c.b.n()), cv(c.bd.cs), cf(c.bd.cw), cf(c.bd.a_log), cf(c.bd.dt_bias), lower, mf(c.sv.q), mf(c.sv.k), mv(c.sv.v), mf(c.sv.g), mf(c.sv.b), @intCast(c.rows), glm_heads, s);
+            return c.t.on.tf_kda_out(cf(c.y), cv(c.bd.g), @intCast(c.b.n()), cv(c.bd.norm), eps_out, mv(c.out), @intCast(c.rows), glm_heads, s);
         }
     };
-    const km = try timeMs(t, 15, Keep{ .t = t, .states = at(states), .in = at(big), .stride = in_stride }, keep.f);
-    std.debug.print("KDA speed keep 4 of 8 rows, {d} layers x 64 heads: {d:.4} ms ({d:.1} GB/s on the states read and written)\n", .{ layers, km, @as(f64, @floatFromInt(2 * layers * heads * d * d * 4)) / km / 1e6 });
+    for ([_]usize{ rows, 1 }) |r| for ([_]u1{ 0, 1 }, [_][]const u8{ "prep", "out" }) |which, name| {
+        const m = try timeMs(t, 15, PO{ .t = t, .b = &b, .bd = bd, .sv = sv, .y = at(y), .out = out, .rows = r, .which = which }, po.f);
+        std.debug.print("KDA speed {s}, {d} rows, 64 heads: {d:.4} ms\n", .{ name, r, m });
+    };
+    // the keep of 4 rows over GLM's 34 KDA layers on the window saves (one launch), and the conv shift of all 34
+    const layers = 34;
+    const kv = window_rows * n;
+    const sk = at(try h.zeros(t, layers * kv * 4));
+    const svv = at(try h.zeros(t, layers * kv * 2));
+    const sg = at(try h.zeros(t, layers * kv * 4));
+    const sb = at(try h.zeros(t, layers * window_rows * heads * 4));
+    const states = at(try h.zeros(t, layers * heads * d * d * 4));
+    const conv = at(try h.zeros(t, layers * 3 * 3 * n * 2));
+    const proj = at(try h.zeros(t, layers * window_rows * b.width() * 2));
+    const Keep = struct { t: *Rig, states: u64, k: u64, v: u64, g: u64, b: u64, conv: u64, proj: u64, width: usize, shift: bool };
+    const keep = struct {
+        fn f(c: Keep) anyerror!void {
+            const s = c.t.stream.handle;
+            if (c.shift) return c.t.on.tf_kda_conv_shift(mv(c.conv), cv(c.proj), 4, 3 * 3 * glm_heads * d, window_rows * @as(i64, @intCast(c.width)), @intCast(c.width), 3 * glm_heads * d, 34, s);
+            return c.t.on.tf_kda_keep(mf(c.states), glm_heads * d * d, cf(c.k), cv(c.v), cf(c.g), cf(c.b), window_rows * glm_heads * d, window_rows * glm_heads, 4, 34, glm_heads, s);
+        }
+    };
+    for ([_]bool{ false, true }) |shift| {
+        const m = try timeMs(t, 15, Keep{ .t = t, .states = states, .k = sk, .v = svv, .g = sg, .b = sb, .conv = conv, .proj = proj, .width = b.width(), .shift = shift }, keep.f);
+        if (shift) {
+            std.debug.print("KDA speed conv shift of 4 rows, {d} layers: {d:.4} ms\n", .{ layers, m });
+        } else {
+            std.debug.print("KDA speed keep 4 of 8 rows, {d} layers x 64 heads: {d:.4} ms ({d:.1} GB/s on the states read and written)\n", .{ layers, m, @as(f64, @floatFromInt(2 * layers * heads * d * d * 4)) / m / 1e6 });
+        }
+    }
 }
