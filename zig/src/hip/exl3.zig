@@ -81,7 +81,8 @@ pub fn run(o: Ops, e: Experts, x: u64, x_stride: usize, plan: Plan, rows: usize,
     dn.mats = 1;
     dn.k = e.width;
     dn.n = e.dims;
-    if (gemm) try launch.gemm(l, dn, s) else try launch.gemv(l, dn, sk[1], @min(plan.tile, pairs), s);
+    if (gemm) return launch.gemmDown(l, dn, e.svh_d, y, s); // the down epilogue fused: the same bits, no z round trip
+    try launch.gemv(l, dn, sk[1], @min(plan.tile, pairs), s);
     try launch.down(l, z, plan.pick, e.svh_d, y, pairs, e.dims, sk[1], e.count, s);
 }
 

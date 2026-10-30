@@ -641,6 +641,52 @@ test "EXL3 routed experts at GLM-5.3-Flash's shape (D 4096, I 2048): decode and 
     std.debug.print("RESULT EXL3 GLM shape: within {d:.3} of the float64 tolerance\n", .{worst});
 }
 
+/// Code contract 7 on the prompt path (GEMM and its epilogues): a row's routed slots in a 2,048-row chunk equal its slots
+/// in prompt windows of 1, 2, 4, 8 and 16 rows that hold it at another place beside other rows.
+fn rowInvariance(t: *Rig, rng: *rig.Rng, name: []const u8, d: *const Dev, experts: usize) !usize {
+    const D = d.e.dims;
+    const rows = 2048;
+    const x = try inputs(rng, rows * D);
+    defer gpa.free(x);
+    const pk = try picks(rng, rows, experts);
+    defer gpa.free(pk);
+    const all = try run(t, d, x, pk, rows, tileFor(rows), true);
+    defer gpa.free(all);
+    var compared: usize = 0;
+    for ([_]usize{ 1, 2, 4, 8, 16 }) |w| {
+        for ([_]usize{ 0, 1, 777, rows - w }) |r0| {
+            const got = try run(t, d, x[r0 * D ..][0 .. w * D], pk[r0 * slots ..][0 .. w * slots], w, tileFor(w), true);
+            defer gpa.free(got);
+            for (0..w) |i| {
+                const row = r0 + i;
+                const want = std.mem.sliceAsBytes(all[row * slots * D ..][0 .. top_k * D]);
+                const mine = std.mem.sliceAsBytes(got[i * slots * D ..][0 .. top_k * D]);
+                try rig.expect(std.mem.eql(u8, mine, want), "{s}: row {d} in a {d}-row window at {d} differs from the 2,048-row chunk", .{ name, row, w, r0 });
+                compared += 1;
+            }
+        }
+    }
+    return compared;
+}
+
+test "EXL3 routed experts, contract 7: a row's prompt slots in a 2,048-row chunk equal its slots in 1-16-row windows" {
+    const t = try Rig.open(1 << 30);
+    defer t.close();
+    var rng: rig.Rng = .{ .state = 0xC7 };
+    var compared: usize = 0;
+    for ([_]Shape{ small, .{ .experts = 9, .dims = 4096, .width = 2048 } }) |sh| {
+        if (sh.dims > 512 and heavySkipped()) continue;
+        var h = try synthetic(&rng, sh, true);
+        defer h.deinit();
+        var d = try Dev.init(t, &h);
+        defer d.deinit();
+        var name_buf: [64]u8 = undefined;
+        const name = try std.fmt.bufPrint(&name_buf, "EXL3 contract 7, D {d}", .{sh.dims});
+        compared += try rowInvariance(t, &rng, name, &d, sh.experts);
+    }
+    std.debug.print("RESULT EXL3 contract 7 (prompt): {d} rows in 1-16-row windows byte-equal to the 2,048-row chunk\n", .{compared});
+}
+
 /// TF_GLM_DIR: a GLM-5.3-Flash EXL3 4 bpw checkpoint (Mia-AiLab's); the real-weight tests are skipped when unset, and in
 /// a Debug build (hip-kernel-test), where their float64 references take many minutes (hip-glm-kernel-test is ReleaseSafe).
 fn checkpointDir() ?[]const u8 {

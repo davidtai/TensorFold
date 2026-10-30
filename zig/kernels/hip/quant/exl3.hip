@@ -229,7 +229,9 @@ TF_EXL3_GEMV(8)
 // runs its WMMA chain from zero and is added to the fp32 sum on the VALU, groups in k order (gfx1151's f16 WMMA adds
 // with a truncating aligner, so a chain over all of K drifts: lane G4's probe, K 4,096: 0.66 % bf16 flips on one chain,
 // 0.017 % with 64-k groups). FOLD 0: one WMMA chain over K (the numerics reference). Either way one order for each
-// pair. z[(mat P + p) N + col], fp32 before the output rotation.
+// pair. z[(mat P + p) N + col], fp32 before the output rotation. EPI 1 (the down GEMM, mats 1): the down epilogue's
+// statements on the pass's sums in place of z (through LDS, 32 rows at a time): y [pair][N] fp32 = H(0 + sum) / sqrt(128)
+// x svh_d, the bits of tf_exl3_gemm + tf_exl3_down_epilogue with no z round trip.
 
 namespace {
 
@@ -238,9 +240,10 @@ constexpr int kBM = 64, kBK = 32, kLK = kBK + 8;  // rows a pass, k a step, halv
 typedef _Float16 h16 __attribute__((ext_vector_type(16)));
 typedef float f8 __attribute__((ext_vector_type(8)));
 
-template <int K2, int CB, int FOLD>
+template <int K2, int CB, int FOLD, int EPI>
 __device__ void gemm(const uint16_t* X0, const uint16_t* X1, int x_div, const uint64_t* tp0, const uint64_t* tp1,
-                     const int* items, const int* members, float* z, int k, int n, int pairs, int experts) {
+                     const int* items, const int* members, float* z, int k, int n, int pairs, int experts,
+                     const uint16_t* svh_d, float* y) {
 #if TF_DEVICE_WMMA_GFX11
     constexpr int TW = tile_words<K2>();
     const int it = blockIdx.y, mat = blockIdx.z, nb = blockIdx.x;
@@ -332,18 +335,56 @@ __device__ void gemm(const uint16_t* X0, const uint16_t* X1, int x_div, const ui
             __syncthreads();
         }
         // accumulator element r of lane l: row 2 r + l / 16, column l % 16 of its 16 x 16 block
+        if constexpr (EPI) {
+            // the sums of 32 rows (the waves of one wm) in LDS over Bs (20,480 B >= 32 x 128 x 4 B), then a wave a row:
+            // tf_exl3_down_epilogue's statements (sk 1) on its 128 columns
+            float* zs = reinterpret_cast<float*>(&Bs[0][0]);
+            for (int hf = 0; hf < 2; ++hf) {
+                if (wm == hf) {
 #pragma unroll
-        for (int i = 0; i < 2; ++i)
+                    for (int i = 0; i < 2; ++i)
 #pragma unroll
-            for (int r = 0; r < 8; ++r) {
-                const int m = wm * 32 + i * 16 + 2 * r + (lane >> 4);
-                if (m >= rows) continue;
-                const int p = members[first + h0 + m];
-                float* o = z + (static_cast<size_t>(mat) * pairs + p) * n + nb * 128 + wn * 32 + l16;
+                        for (int r = 0; r < 8; ++r) {
+                            const int ml = i * 16 + 2 * r + (lane >> 4);
 #pragma unroll
-                for (int j = 0; j < 2; ++j) o[j * 16] = acc[i][j][r];
+                            for (int j = 0; j < 2; ++j) zs[ml * 128 + wn * 32 + j * 16 + l16] = acc[i][j][r];
+                        }
+                }
+                __syncthreads();
+#pragma unroll
+                for (int q = 0; q < 4; ++q) {
+                    const int ml = warp * 4 + q, m = hf * 32 + ml;
+                    if (m >= rows) continue;  // uniform over the wave
+                    const int p = members[first + h0 + m];
+                    const int c = nb * 128 + 4 * lane;
+                    float v[4] = {0.f, 0.f, 0.f, 0.f};
+                    const float4 w = *reinterpret_cast<const float4*>(&zs[ml * 128 + 4 * lane]);
+                    v[0] += w.x, v[1] += w.y, v[2] += w.z, v[3] += w.w;
+                    fwht128(v, lane);
+                    const uint16_t* sv = svh_d + static_cast<size_t>(e) * n + c;
+                    float4 o;
+                    o.x = v[0] * kHad * f16_value(sv[0]);
+                    o.y = v[1] * kHad * f16_value(sv[1]);
+                    o.z = v[2] * kHad * f16_value(sv[2]);
+                    o.w = v[3] * kHad * f16_value(sv[3]);
+                    *reinterpret_cast<float4*>(&y[static_cast<size_t>(p) * n + c]) = o;
+                }
+                __syncthreads();
             }
-        __syncthreads();
+        } else {
+#pragma unroll
+            for (int i = 0; i < 2; ++i)
+#pragma unroll
+                for (int r = 0; r < 8; ++r) {
+                    const int m = wm * 32 + i * 16 + 2 * r + (lane >> 4);
+                    if (m >= rows) continue;
+                    const int p = members[first + h0 + m];
+                    float* o = z + (static_cast<size_t>(mat) * pairs + p) * n + nb * 128 + wn * 32 + l16;
+#pragma unroll
+                    for (int j = 0; j < 2; ++j) o[j * 16] = acc[i][j][r];
+                }
+            __syncthreads();
+        }
     }
 #else
     __builtin_trap();
@@ -359,7 +400,15 @@ extern "C" __global__ void __launch_bounds__(256) tf_exl3_gemm(const uint16_t* X
                                                                const uint64_t* tp0, const uint64_t* tp1, const int* items,
                                                                const int* members, float* z, int k, int n, int pairs,
                                                                int experts) {
-    gemm<8, kMcg, kGemmFold>(X0, X1, x_div, tp0, tp1, items, members, z, k, n, pairs, experts);
+    gemm<8, kMcg, kGemmFold, 0>(X0, X1, x_div, tp0, tp1, items, members, z, k, n, pairs, experts, nullptr, nullptr);
+}
+
+// The down GEMM with the down epilogue fused (EPI 1): y [pair][N] fp32, the bits of tf_exl3_gemm + tf_exl3_down_epilogue.
+extern "C" __global__ void __launch_bounds__(256) tf_exl3_gemm_down(const uint16_t* X0, int x_div, const uint64_t* tp0,
+                                                                    const int* items, const int* members,
+                                                                    const uint16_t* svh_d, float* y, int k, int n,
+                                                                    int pairs, int experts) {
+    gemm<8, kMcg, kGemmFold, 1>(X0, X0, x_div, tp0, tp0, items, members, nullptr, k, n, pairs, experts, svh_d, y);
 }
 
 // The same GEMM on one WMMA chain over K (the pre-fold arithmetic): the numerics tests' reference, not served.
@@ -367,31 +416,34 @@ extern "C" __global__ void __launch_bounds__(256) tf_exl3_gemm_chain(const uint1
                                                                      const uint64_t* tp0, const uint64_t* tp1,
                                                                      const int* items, const int* members, float* z,
                                                                      int k, int n, int pairs, int experts) {
-    gemm<8, kMcg, 0>(X0, X1, x_div, tp0, tp1, items, members, z, k, n, pairs, experts);
+    gemm<8, kMcg, 0, 0>(X0, X1, x_div, tp0, tp1, items, members, z, k, n, pairs, experts, nullptr, nullptr);
 }
 
 // ---- 5. the epilogues -----------------------------------------------------------------------------------------------
 
-// Grid (pairs, I / 128), 32 threads: a routed pair's gate and up (splits summed in order) through H and svh, rounded to
-// bf16 and limited, silu to bf16, the product to bf16; then * suh_d, H, fp16: xd [pair][I], the down inputs.
-extern "C" __global__ void __launch_bounds__(32) tf_exl3_gateup_epilogue(const float* z, const int* pick,
-                                                                         const uint16_t* svh_g, const uint16_t* svh_u,
-                                                                         const uint16_t* suh_d, uint16_t* xd, int pairs,
-                                                                         int n, int sk, int experts, float limit) {
-    const int p = blockIdx.x, blk = blockIdx.y, lane = threadIdx.x;
+// A wave a unit (a pair's 128-column block), kEpiWaves units a block, the blocks of one pair side by side: one wave's
+// statements are the same at any block size, so the bits do not depend on it.
+constexpr int kEpiWaves = 8;
+
+// Grid (ceil(pairs x I / 128 / 8)), 256 threads: a routed pair's gate and up (splits summed in order) through H and
+// svh, rounded to bf16 and limited, silu to bf16, the product to bf16; then * suh_d, H, fp16: xd [pair][I], the down
+// inputs.
+extern "C" __global__ void __launch_bounds__(32 * kEpiWaves)
+tf_exl3_gateup_epilogue(const float* z, const int* pick, const uint16_t* svh_g, const uint16_t* svh_u,
+                        const uint16_t* suh_d, uint16_t* xd, int pairs, int n, int sk, int experts, float limit) {
+    const int lane = threadIdx.x & 31, nb = n / 128;
+    const long unit = static_cast<long>(blockIdx.x) * kEpiWaves + (threadIdx.x >> 5);
+    if (unit >= static_cast<long>(pairs) * nb) return;
+    const int p = static_cast<int>(unit / nb), blk = static_cast<int>(unit % nb);
     const int e = pick[p];
     if (e < 0 || e >= experts) return;
     const int c = blk * 128 + 4 * lane;
-    float gv[4], uv[4];
-#pragma unroll
-    for (int j = 0; j < 4; ++j) {
-        float sg = 0.f, su = 0.f;
-        for (int s = 0; s < sk; ++s) {
-            sg += z[(static_cast<size_t>(s) * pairs + p) * n + c + j];
-            su += z[(static_cast<size_t>(sk + s) * pairs + p) * n + c + j];
-        }
-        gv[j] = sg;
-        uv[j] = su;
+    float gv[4] = {0.f, 0.f, 0.f, 0.f}, uv[4] = {0.f, 0.f, 0.f, 0.f};
+    for (int s = 0; s < sk; ++s) {  // each value's splits in order, from 0
+        const float4 g = *reinterpret_cast<const float4*>(&z[(static_cast<size_t>(s) * pairs + p) * n + c]);
+        const float4 u = *reinterpret_cast<const float4*>(&z[(static_cast<size_t>(sk + s) * pairs + p) * n + c]);
+        gv[0] += g.x, gv[1] += g.y, gv[2] += g.z, gv[3] += g.w;
+        uv[0] += u.x, uv[1] += u.y, uv[2] += u.z, uv[3] += u.w;
     }
     fwht128(gv, lane);
     fwht128(uv, lane);
@@ -414,23 +466,29 @@ extern "C" __global__ void __launch_bounds__(32) tf_exl3_gateup_epilogue(const f
     for (int j = 0; j < 4; ++j) o[j] = f16_bits(v[j] * kHad);
 }
 
-// Grid (pairs, D / 128), 32 threads: a routed pair's down sums (splits in order) through H and svh_d: y [pair][D] fp32.
-// The shared expert's pairs (and any pick >= experts) keep y as it is.
-extern "C" __global__ void __launch_bounds__(32) tf_exl3_down_epilogue(const float* z, const int* pick,
-                                                                       const uint16_t* svh_d, float* y, int pairs, int d,
-                                                                       int sk, int experts) {
-    const int p = blockIdx.x, blk = blockIdx.y, lane = threadIdx.x;
+// Grid (ceil(pairs x D / 128 / 8)), 256 threads: a routed pair's down sums (splits in order) through H and svh_d:
+// y [pair][D] fp32. The shared expert's pairs (and any pick >= experts) keep y as it is.
+extern "C" __global__ void __launch_bounds__(32 * kEpiWaves)
+tf_exl3_down_epilogue(const float* z, const int* pick, const uint16_t* svh_d, float* y, int pairs, int d, int sk,
+                      int experts) {
+    const int lane = threadIdx.x & 31, nb = d / 128;
+    const long unit = static_cast<long>(blockIdx.x) * kEpiWaves + (threadIdx.x >> 5);
+    if (unit >= static_cast<long>(pairs) * nb) return;
+    const int p = static_cast<int>(unit / nb), blk = static_cast<int>(unit % nb);
     const int e = pick[p];
     if (e < 0 || e >= experts) return;
     const int c = blk * 128 + 4 * lane;
-    float v[4];
-#pragma unroll
-    for (int j = 0; j < 4; ++j) {
-        float s = 0.f;
-        for (int q = 0; q < sk; ++q) s += z[(static_cast<size_t>(q) * pairs + p) * d + c + j];
-        v[j] = s;
+    float v[4] = {0.f, 0.f, 0.f, 0.f};
+    for (int q = 0; q < sk; ++q) {  // each value's splits in order, from 0
+        const float4 w = *reinterpret_cast<const float4*>(&z[(static_cast<size_t>(q) * pairs + p) * d + c]);
+        v[0] += w.x, v[1] += w.y, v[2] += w.z, v[3] += w.w;
     }
     fwht128(v, lane);
-#pragma unroll
-    for (int j = 0; j < 4; ++j) y[static_cast<size_t>(p) * d + c + j] = v[j] * kHad * f16_value(svh_d[static_cast<size_t>(e) * d + c + j]);
+    const uint16_t* sv = svh_d + static_cast<size_t>(e) * d + c;
+    float4 o;
+    o.x = v[0] * kHad * f16_value(sv[0]);
+    o.y = v[1] * kHad * f16_value(sv[1]);
+    o.z = v[2] * kHad * f16_value(sv[2]);
+    o.w = v[3] * kHad * f16_value(sv[3]);
+    *reinterpret_cast<float4*>(&y[static_cast<size_t>(p) * d + c]) = o;
 }

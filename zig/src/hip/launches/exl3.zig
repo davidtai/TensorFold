@@ -26,6 +26,8 @@ pub const Fns = struct {
     gemm: Function,
     /// The GEMM on one WMMA chain over K (tf_exl3_gemm_chain): the numerics reference of the tests, not served.
     gemm_chain: Function,
+    /// The down GEMM with the down epilogue fused (tf_exl3_gemm_down): y [pair][D] in one launch, the same bits.
+    gemm_down: Function,
     gateup: Function,
     down: Function,
 
@@ -36,6 +38,7 @@ pub const Fns = struct {
             .gemv = .{ try m.function("tf_exl3_gemv_1"), try m.function("tf_exl3_gemv_2"), try m.function("tf_exl3_gemv_4"), try m.function("tf_exl3_gemv_8") },
             .gemm = try m.function("tf_exl3_gemm"),
             .gemm_chain = try m.function("tf_exl3_gemm_chain"),
+            .gemm_down = try m.function("tf_exl3_gemm_down"),
             .gateup = try m.function("tf_exl3_gateup_epilogue"),
             .down = try m.function("tf_exl3_down_epilogue"),
         };
@@ -133,6 +136,26 @@ pub fn gemmChain(l: *const Launcher, p: Product, s: S) Error!void {
     return gemmOn(l, l.exl3.gemm_chain, p, s);
 }
 
+/// The down GEMM (mats 1) and the down epilogue in one launch: y [pairs][n] fp32 = the routed pairs' down outputs, the bits
+/// of `gemm` then `down` (sk 1). Other pairs keep y.
+pub fn gemmDown(l: *const Launcher, p: Product, svh_d: u64, y: u64, s: S) Error!void {
+    if (p.k % 32 != 0 or p.n % 128 != 0 or p.mats != 1) return invalid("exl3 gemm down");
+    if (p.count == 0) return;
+    var a: Args = .{};
+    try a.add(p.x0);
+    try a.add(int(p.x_div));
+    try a.add(p.tp0);
+    try a.add(p.items);
+    try a.add(p.members);
+    try a.add(svh_d);
+    try a.add(y);
+    try a.add(int(p.k));
+    try a.add(int(p.n));
+    try a.add(int(p.pairs));
+    try a.add(int(p.experts));
+    try l.go(l.exl3.gemm_down, dim(p.n / 128, p.count, 1), dim(256, 1, 1), 0, s, &a);
+}
+
 fn gemmOn(l: *const Launcher, f: Function, p: Product, s: S) Error!void {
     if (p.k % 32 != 0 or p.n % 128 != 0) return invalid("exl3 gemm");
     if (p.count == 0) return;
@@ -172,7 +195,7 @@ pub fn gateup(l: *const Launcher, z: u64, pick: u64, svh_g: u64, svh_u: u64, suh
     try a.add(int(sk));
     try a.add(int(experts));
     try a.add(limit);
-    try l.go(l.exl3.gateup, dim(pairs, n / 128, 1), dim(32, 1, 1), 0, s, &a);
+    try l.go(l.exl3.gateup, dim(epiBlocks(pairs, n), 1, 1), dim(32 * epi_waves, 1, 1), 0, s, &a);
 }
 
 /// y [pairs][d] fp32: each routed pair's down sums (sk splits in z) through H and svh_d; other pairs keep y.
@@ -187,7 +210,14 @@ pub fn down(l: *const Launcher, z: u64, pick: u64, svh_d: u64, y: u64, pairs: us
     try a.add(int(d));
     try a.add(int(sk));
     try a.add(int(experts));
-    try l.go(l.exl3.down, dim(pairs, d / 128, 1), dim(32, 1, 1), 0, s, &a);
+    try l.go(l.exl3.down, dim(epiBlocks(pairs, d), 1, 1), dim(32 * epi_waves, 1, 1), 0, s, &a);
+}
+
+/// The epilogues' waves a block (exl3.hip kEpiWaves): a wave a pair's 128-column block.
+pub const epi_waves = 8;
+
+fn epiBlocks(pairs: usize, n: usize) usize {
+    return (pairs * (n / 128) + epi_waves - 1) / epi_waves;
 }
 
 test "the GEMV split depends on the shape alone: GLM's gate/up 4, down 1" {
