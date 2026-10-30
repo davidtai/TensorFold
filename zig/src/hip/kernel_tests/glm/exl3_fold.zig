@@ -162,3 +162,32 @@ test "glm exl3 fold (F-K6): the prompt GEMM's 64-k groups within float64's bound
         std.debug.print("RESULT glm exl3 gemm fold K {d}: 6 cuts (single rows, across the 64-row passes) bit-equal to the full call\n", .{k});
     }
 }
+
+const TimedGemm = struct {
+    t: *Rig,
+    p: launch.Product,
+    chain: bool,
+
+    fn call(c: TimedGemm) anyerror!void {
+        if (c.chain) try launch.gemmChain(&c.t.on, c.p, c.t.stream.handle) else try launch.gemm(&c.t.on, c.p, c.t.stream.handle);
+    }
+};
+
+test "glm exl3 fold (G4-T1): speed facts (no gate) of the folded prompt GEMM against one chain, 2,048 rows of one expert" {
+    const t = try Rig.open(1 << 20);
+    defer t.close();
+    if (!t.bf16 or @import("../../exl3.zig").matrix() == false) return error.SkipZigTest;
+    var rng: rig.Rng = .{ .state = 0xF0D6_0002 };
+    const m = 2048;
+    for ([_][2]usize{ .{ 4096, 2048 }, .{ 2048, 4096 } }) |kn| {
+        var c = try Case.init(t, &rng, m, kn[0], kn[1]);
+        defer c.deinit();
+        const it = [3]i32{ 0, 0, m };
+        try c.items.upload(0, std.mem.asBytes(&it));
+        const p: launch.Product = .{ .x0 = at(c.x), .x1 = at(c.x), .x_div = 1, .tp0 = at(c.table), .tp1 = at(c.table), .mats = 1, .items = at(c.items), .count = 1, .members = at(c.members), .z = at(c.z), .k = c.k, .n = c.n, .pairs = c.m, .experts = 1 };
+        const flops: f64 = 2.0 * m * @as(f64, @floatFromInt(kn[0] * kn[1]));
+        const fold = try check.timeUs(t, TimedGemm{ .t = t, .p = p, .chain = false }, TimedGemm.call, 10);
+        const chain = try check.timeUs(t, TimedGemm{ .t = t, .p = p, .chain = true }, TimedGemm.call, 10);
+        std.debug.print("SPEED glm exl3 prompt gemm K {d}, N {d}, 2048 rows: fold G64 {d:.0} us ({d:.1} TFLOPS), one chain {d:.0} us ({d:.1}), fold / chain {d:.3}\n", .{ kn[0], kn[1], fold, flops / fold / 1e6, chain, flops / chain / 1e6, fold / chain });
+    }
+}

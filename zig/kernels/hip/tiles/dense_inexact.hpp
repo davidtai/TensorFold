@@ -48,7 +48,11 @@ __device__ __forceinline__ u32x4 dequant8(uint32_t w, float s, float b) {
 // K: the product's K (a multiple of 64). bf16 x and tables, plain products; fp32 out, or bf16 (nearest even) with out16.
 // BF16W: a.words are the weights already in bf16, (n, K) row major (a router's rows): a thread copies its 32 bf16 a
 // window (4 loads) where the affine weights dequantize 32 codes; the windows, LDS and WMMA chain are the same.
-template <int K, bool BF16W = false>
+// GROUP32 (with BF16W): each output's sum is the BF16W dense tile's (tiles/dense_gemm.hpp): every 32-k group's two
+// WMMA from zero, folded acc + d on the VALU in K order, so the bits equal it at every block shape. A wave keeps its
+// 64 x 64 accumulators; a group runs half the columns at a time (two d a lane live), so the fold needs 16 VGPRs more,
+// not 128.
+template <int K, bool BF16W = false, bool GROUP32 = false>
 __device__ __forceinline__ void wmma_dense_inexact_tile(const Affine& a) {
 #if TF_DEVICE_WMMA_GFX11
     using namespace dense_inexact;
@@ -57,6 +61,7 @@ __device__ __forceinline__ void wmma_dense_inexact_tile(const Affine& a) {
     constexpr int kGroups = K / 32;
     constexpr int kWordsRow = K / 8;
     static_assert(K % kKW == 0, "whole windows");
+    static_assert(!GROUP32 || BF16W, "the grouped fold is for BF16 weight rows");
     __shared__ __attribute__((aligned(16))) __bf16 xs[kBM * kLd];
     __shared__ __attribute__((aligned(16))) __bf16 ws[kBN * kLd];
     const int num_n = (a.n + kBN - 1) / kBN;
@@ -140,7 +145,37 @@ __device__ __forceinline__ void wmma_dense_inexact_tile(const Affine& a) {
     stash();
     load(1);
     lds_barrier();
+    const f32x8 zero = f32x8{0, 0, 0, 0, 0, 0, 0, 0};
     for (int w = 0; w < kWindows; ++w) {
+        if constexpr (GROUP32) {
+#pragma unroll
+            for (int g = 0; g < kKW / 32; ++g) {
+#pragma unroll
+                for (int jh = 0; jh < 2; ++jh) {
+                    bf16x16 bf[2][2];  // [column tile of the half][k half of the group]
+#pragma unroll
+                    for (int jj = 0; jj < 2; ++jj) {
+#pragma unroll
+                        for (int t = 0; t < 2; ++t) bf[jj][t] = frag16(reinterpret_cast<const uint32_t*>(ws + (wn * 64 + (jh * 2 + jj) * 16 + rl) * kLd + g * 32 + t * 16));
+                    }
+#pragma unroll
+                    for (int i = 0; i < 4; ++i) {
+                        const uint32_t* xr = reinterpret_cast<const uint32_t*>(xs + (wm * 64 + i * 16 + rl) * kLd + g * 32);
+                        const bf16x16 a0 = frag16(xr);
+                        const bf16x16 a1 = frag16(xr + 8);
+                        f32x8 d0 = T::mma(a0, bf[0][0], zero);
+                        f32x8 d1 = T::mma(a0, bf[1][0], zero);
+                        d0 = T::mma(a1, bf[0][1], d0);
+                        d1 = T::mma(a1, bf[1][1], d1);
+#pragma unroll
+                        for (int e = 0; e < 8; ++e) {
+                            acc[i][jh * 2][e] = acc[i][jh * 2][e] + d0[e];
+                            acc[i][jh * 2 + 1][e] = acc[i][jh * 2 + 1][e] + d1[e];
+                        }
+                    }
+                }
+            }
+        } else {
 #pragma unroll
         for (int ks = 0; ks < kKW; ks += 16) {
             bf16x16 bf[4];
@@ -152,6 +187,7 @@ __device__ __forceinline__ void wmma_dense_inexact_tile(const Affine& a) {
 #pragma unroll
                 for (int j = 0; j < 4; ++j) acc[i][j] = T::mma(af, bf[j], acc[i][j]);
             }
+        }
         }
         lds_barrier();
         // past the last window the stash rewrites LDS no later window reads

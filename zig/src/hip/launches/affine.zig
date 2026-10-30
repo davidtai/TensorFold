@@ -215,6 +215,9 @@ pub const Kernels = struct {
     /// The same pair with GLM's SwiGLU rounding points (bf16_tiles.hpp StreamGlmSwiglu); its silu table in scale.p.
     bf16_glu: [stream_rows.len]?Function,
     bf16_wmma: [bf16_ks.len]?Function,
+    /// The same sums on other block shapes (bf16_tiles.hpp: grouped 256 x 128, dense with two windows ahead), and the
+    /// pre-F-K5 one-chain tile (other bits, a timing reference): G4-4's measurement, by Bf16Tile.
+    bf16_wmma_alt: [3][bf16_ks.len]?Function,
     kp: [bit_widths.len][kp_tiles.len]Function,
     span: [2]Function,
     fold: Function,
@@ -269,6 +272,9 @@ pub const Kernels = struct {
         }
         inline for (bf16_ks, 0..) |bk, i| {
             k.bf16_wmma[i] = if (k.matrix) try tiles_obj.function(std.fmt.comptimePrint(r ++ "9bf16_wmmaILi{d}EEEvNS0_6AffineE", .{bk})) else null;
+            inline for (.{ "17bf16_wmma_grouped", "12bf16_wmma_a2", "15bf16_wmma_chain" }, 0..) |name, v| {
+                k.bf16_wmma_alt[v][i] = if (k.matrix) try tiles_obj.function(std.fmt.comptimePrint(r ++ name ++ "ILi{d}EEEvNS0_6AffineE", .{bk})) else null;
+            }
         }
         return k;
     }
@@ -771,6 +777,22 @@ pub const Kernels = struct {
         var args: hl.Args = .{};
         try args.add(a);
         try go(r, f, .{ .x = cdiv(a.n, 128) * cdiv(a.m, 128) }, .{ .x = 256 }, s, &args);
+    }
+
+    /// The prompt tiles a BF16 product may take (G4-4): `dense` is bf16Go's; `grouped` and `ahead2` give its bits on
+    /// other block shapes; `chain` is the pre-F-K5 one-chain tile (other bits, timing only).
+    pub const Bf16Tile = enum { dense, grouped, ahead2, chain };
+
+    /// bf16Go's prompt product on tile `t` (the tests' A/B of block shapes).
+    pub fn bf16GoTile(k: *const Kernels, r: *const runtime.Runtime, a: Arg, t: Bf16Tile, s: abi.Stream) Error!void {
+        if (t == .dense) return k.bf16Go(r, a, true, s);
+        if (a.bits != 16 or a.m < 1 or a.n < 1 or @rem(a.k, 64) != 0 or a.x % 16 != 0 or a.words % 16 != 0) return refuse("bf16 shape");
+        const i = bf16Index(a.k) orelse return refuse("bf16 K");
+        const f = k.bf16_wmma_alt[@intFromEnum(t) - 1][i] orelse return refuse("bf16 wmma tile");
+        const rows: c_int = if (t == .ahead2) 128 else 256;
+        var args: hl.Args = .{};
+        try args.add(a);
+        try go(r, f, .{ .x = cdiv(a.n, 128) * cdiv(a.m, rows) }, .{ .x = 256 }, s, &args);
     }
 
     /// Decode's (gate | up) product of BF16 rows on the stream tile: `w` is gate (cols, k) then up (cols, k), act (m, cols)

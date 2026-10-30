@@ -404,6 +404,30 @@ TF_HELD(8, 2) TF_HELD(8, 4)
 TF_BF16_STREAM(1) TF_BF16_STREAM(2) TF_BF16_STREAM(4)
 #endif
 #if TF_MATRIX
+template __global__ void bf16_wmma_grouped<128>(Affine);
+template __global__ void bf16_wmma_a2<128>(Affine);
+template __global__ void bf16_wmma_chain<128>(Affine);
+template __global__ void bf16_wmma_grouped<512>(Affine);
+template __global__ void bf16_wmma_a2<512>(Affine);
+template __global__ void bf16_wmma_chain<512>(Affine);
+template __global__ void bf16_wmma_grouped<1536>(Affine);
+template __global__ void bf16_wmma_a2<1536>(Affine);
+template __global__ void bf16_wmma_chain<1536>(Affine);
+template __global__ void bf16_wmma_grouped<2048>(Affine);
+template __global__ void bf16_wmma_a2<2048>(Affine);
+template __global__ void bf16_wmma_chain<2048>(Affine);
+template __global__ void bf16_wmma_grouped<4096>(Affine);
+template __global__ void bf16_wmma_a2<4096>(Affine);
+template __global__ void bf16_wmma_chain<4096>(Affine);
+template __global__ void bf16_wmma_grouped<8192>(Affine);
+template __global__ void bf16_wmma_a2<8192>(Affine);
+template __global__ void bf16_wmma_chain<8192>(Affine);
+template __global__ void bf16_wmma_grouped<12288>(Affine);
+template __global__ void bf16_wmma_a2<12288>(Affine);
+template __global__ void bf16_wmma_chain<12288>(Affine);
+template __global__ void bf16_wmma_grouped<16384>(Affine);
+template __global__ void bf16_wmma_a2<16384>(Affine);
+template __global__ void bf16_wmma_chain<16384>(Affine);
 template __global__ void bf16_wmma<128>(Affine);
 template __global__ void bf16_wmma<512>(Affine);
 template __global__ void bf16_wmma<1536>(Affine);

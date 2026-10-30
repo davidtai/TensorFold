@@ -45,5 +45,21 @@ __global__ void __launch_bounds__(dense_tile::kThreads) bf16_wmma(Affine a) {
     wmma_dense_tile<K, DenseTune<K>::kAhead, false, true>(a);
 }
 
+// The same sums on other block shapes (G4-4; the bits are bf16_wmma's): GROUPED, the 256 x 128 tile of 64 x 64 waves
+// (tiles/dense_inexact.hpp GROUP32); A2, the dense tile with two windows of loads ahead.
+template <int K>
+__global__ void __launch_bounds__(dense_inexact::kThreads) bf16_wmma_grouped(Affine a) {
+    wmma_dense_inexact_tile<K, true, true>(a);
+}
+template <int K>
+__global__ void __launch_bounds__(dense_tile::kThreads) bf16_wmma_a2(Affine a) {
+    wmma_dense_tile<K, 2, false, true>(a);
+}
+// The pre-F-K5 tile, one WMMA chain over K (other bits): timing reference of the tests only, not served.
+template <int K>
+__global__ void __launch_bounds__(dense_inexact::kThreads) bf16_wmma_chain(Affine a) {
+    wmma_dense_inexact_tile<K, true>(a);
+}
+
 }  // namespace rocm
 }  // namespace tf
