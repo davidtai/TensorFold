@@ -727,3 +727,77 @@ test "KDA: the window and prompt chains (conv, scan, keep, gated norm) against t
         try rig.expect(es < 5e-3, "KDA chain rows={d}: state relative error {e}", .{ rows, es });
     }
 }
+
+/// The median of `runs` launches of `f` in ms, by events on the rig's stream, after two warm-up launches.
+fn timeMs(t: *Rig, runs: usize, ctx: anytype, comptime f: fn (@TypeOf(ctx)) anyerror!void) !f64 {
+    const Event = @import("../stream.zig").Event;
+    var a = try Event.init(&t.r, true);
+    defer a.deinit();
+    var b = try Event.init(&t.r, true);
+    defer b.deinit();
+    for (0..2) |_| try f(ctx);
+    var ms: [32]f64 = undefined;
+    for (ms[0..runs]) |*m| {
+        try a.record(t.stream);
+        try f(ctx);
+        try b.record(t.stream);
+        try b.synchronize();
+        m.* = try Event.elapsedMs(a, b);
+    }
+    std.mem.sort(f64, ms[0..runs], {}, std.sort.asc(f64));
+    return ms[runs / 2];
+}
+
+test "KDA: speed facts (no gate): the scans against the DeltaNet's at GLM's 64 heads, one layer" {
+    const t = try Rig.open(1 << 20);
+    defer t.close();
+    const heads = glm_heads;
+    const n = heads * d;
+    const rows = 2048;
+    const in = try ScanIn.make(heads, rows, 0x5eed);
+    defer in.free();
+    var h: Held = .{};
+    defer h.deinit();
+    const dev = try scanDev(&h, t, in);
+    const state = try h.up(t, in.state);
+    const y = try h.zeros(t, rows * n * 4);
+    const head_gate = try h.up(t, in.gate[0 .. rows * heads]); // the DeltaNet's: a gate a head
+    const Ctx = struct { t: *Rig, dev: [5]DeviceBuffer, state: u64, y: u64, g: u64, rows: usize, kda: bool, hold: bool };
+    const run = struct {
+        fn f(c: Ctx) anyerror!void {
+            const l = &c.t.on;
+            const s = c.t.stream.handle;
+            const q, const k, const v, const g, const b = .{ at(c.dev[0]), at(c.dev[1]), at(c.dev[2]), at(c.dev[3]), at(c.dev[4]) };
+            const r: c_int = @intCast(c.rows);
+            if (c.kda) {
+                if (c.hold) return l.tf_kda_hold(cf(q), cf(k), cf(v), cf(g), cf(b), mf(c.state), mf(c.y), r, glm_heads, s);
+                return l.tf_kda(cf(q), cf(k), cf(v), cf(g), cf(b), mf(c.state), mf(c.y), r, glm_heads, s, null, 0);
+            }
+            if (c.hold) return l.tf_gdn_hold(cf(q), cf(k), cf(v), cf(c.g), cf(b), mf(c.state), mf(c.y), r, glm_heads, glm_heads, d, d, s);
+            return l.tf_gated_delta(cf(q), cf(k), cf(v), cf(c.g), cf(b), mf(c.state), mf(c.y), 1, r, glm_heads, glm_heads, d, d, s, null, 0);
+        }
+    };
+    const Case = struct { name: []const u8, rows: usize, hold: bool };
+    for ([_]Case{
+        .{ .name = "prompt 2048 rows", .rows = rows, .hold = false },
+        .{ .name = "decode 1 row", .rows = 1, .hold = false },
+        .{ .name = "verify hold 4 rows", .rows = 4, .hold = true },
+    }) |cs| {
+        var ms: [2]f64 = undefined;
+        for (&ms, [_]bool{ true, false }) |*m, kda| m.* = try timeMs(t, 15, Ctx{ .t = t, .dev = dev, .state = at(state), .y = at(y), .g = at(head_gate), .rows = cs.rows, .kda = kda, .hold = cs.hold }, run.f);
+        std.debug.print("KDA speed {s}, 64 heads: KDA {d:.4} ms, DeltaNet (a gate a head) {d:.4} ms, ratio {d:.3}\n", .{ cs.name, ms[0], ms[1], ms[0] / ms[1] });
+    }
+    // the keep of 4 rows over GLM's 34 KDA layers (one launch), a full accept
+    const layers = 34;
+    const in_stride = keep_rows * (3 * n + heads);
+    const big = try h.zeros(t, layers * in_stride * 4);
+    const states = try h.zeros(t, layers * heads * d * d * 4);
+    const Keep = struct { t: *Rig, states: u64, in: u64, stride: usize };
+    const keep = struct {
+        fn f(c: Keep) anyerror!void {
+            return c.t.on.tf_kda_keep(mf(c.states), @intCast(glm_heads * d * d), cf(c.in), @intCast(c.stride), keep_rows, 4, 34, glm_heads, c.t.stream.handle);
+        }
+    };
+    const km = try timeMs(t, 15, Keep{ .t = t, .states = at(states), .in = at(big), .stride = in_stride }, keep.f);
+    std.debug.print("KDA speed keep 4 of 8 rows, {d} layers x 64 heads: {d:.4} ms ({d:.1} GB/s on the states read and written)\n", .{ layers, km, @as(f64, @floatFromInt(2 * layers * heads * d * d * 4)) / km / 1e6 });
+}
