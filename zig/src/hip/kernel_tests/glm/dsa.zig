@@ -766,6 +766,49 @@ test "GLM DSA: listed latent attention (indexer lists and dense rows) against fl
     std.debug.print("PASS listed latent attention over up to {d} tokens: within float64 tolerance, windows equal\n", .{w});
 }
 
+test "GLM DSA: rows under the dense limit get the same bits from a dense call and from a listed call" {
+    // lane F's cut across the 2,051-key limit: rows at 2,040 .. 2,050 (510 .. 512 complete pools: dense rows) attend in
+    // a dense call in one cut and inside a listed call in the other; there the select gives sparse 0, count P + 1
+    const t = try Rig.open(0x6309);
+    defer t.close();
+    const lw = dsa.lw;
+    const pos = 2040;
+    const rows = 11;
+    const w = dsa.width;
+    const n = dsa.partsFor(pos + rows);
+    const q = try t.bfs(rows * heads * lw, 1.0);
+    const dq = try t.dev(q);
+    const dc = try t.dev(try t.bfs((pos + rows) * lw, 1.0));
+    const dpos = try posDev(t, pos);
+    const row_bytes = heads * lw * 2;
+    const dense = try t.zeros(rows * row_bytes);
+    try dsa.attention(t.k, t.s(), dq, dc, dpos, 0, .dense, try parts(t, rows, n), dense, rows, heads, n, scale_qk);
+    // the select's form for these rows: sparse 0, count = position + 1, the list unused
+    const cnt = try t.a().alloc(i32, rows);
+    for (cnt, 0..) |*c, r| c.* = @intCast(pos + r + 1);
+    const zero = try t.a().alloc(i32, rows);
+    @memset(zero, 0);
+    const one = try t.a().alloc(i32, rows);
+    @memset(one, 1);
+    const tok = try t.a().alloc(i32, rows * w);
+    @memset(tok, -1);
+    for (0..rows) |r| for (0..pos + r + 1) |i| {
+        tok[r * w + i] = @intCast(i);
+    };
+    const dtok = try t.dev(tok);
+    const dcnt = try t.dev(cnt);
+    var name: [112]u8 = undefined;
+    for ([_]struct { sp: []const i32, what: []const u8 }{ .{ .sp = zero, .what = "sparse 0, count P + 1" }, .{ .sp = one, .what = "sparse 1, the list 0 .. P" } }) |c| {
+        const keys: dsa.Keys = .{ .listed = .{ .ids = dtok, .id_stride = w, .counts = dcnt, .sparse = try t.dev(c.sp) } };
+        for ([_]usize{ dsa.partsFor(w), dsa.partsFor(w) + 1 }) |np| {
+            const o = try t.zeros(rows * row_bytes);
+            try dsa.attention(t.k, t.s(), dq, dc, dpos, 0, keys, try parts(t, rows, np), o, rows, heads, np, scale_qk);
+            try sameBytes(t, try std.fmt.bufPrint(&name, "rows at 2,040 .. 2,050: dense call = listed call ({s}, {d} parts)", .{ c.what, np }), dense, o, rows * row_bytes);
+        }
+    }
+    std.debug.print("PASS dense rows across the limit: a dense call and a listed call (sparse 0 or a full list) give the same bits\n", .{});
+}
+
 /// Mean microseconds of `body` over `n` runs after 2 warm-ups (events on the stream).
 fn timeUs(t: *Rig, n: usize, ctx: anytype, comptime body: fn (*Rig, @TypeOf(ctx)) anyerror!void) !f64 {
     try body(t, ctx);
