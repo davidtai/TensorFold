@@ -80,15 +80,15 @@ pub const Forward = struct {
     host: std.mem.Allocator = std.heap.page_allocator,
     /// The last DSA block's intermediates in the arena (valid until the next block): an op-by-op check reads them.
     dsa_last: DsaLast = .{},
-
-    pub const DsaLast = struct { dp: u64 = 0, qr: u64 = 0, lat: u64 = 0, qq: u64 = 0, qa: u64 = 0, ol: u64 = 0, vn: u64 = 0 };
     /// TF_GLM_FORCE_PICKS (a diagnostic, never served): each MoE layer takes these picks and weights for its rows in
     /// place of its own router's, so a compare measures the numerics with the reference's routing.
     force: ?*const Force = null,
     /// The last MoE block's picks and weights in the arena (valid until the next block).
     moe_last: struct { pick: u64 = 0, wts: u64 = 0 } = .{},
 
-    /// Picks i32-able int16 and weights fp32, [router layers 46][rows][8] as G5's router_picks / router_weights hold
+    pub const DsaLast = struct { dp: u64 = 0, qr: u64 = 0, lat: u64 = 0, qq: u64 = 0, qa: u64 = 0, ol: u64 = 0, vn: u64 = 0 };
+
+    /// Picks int16 and weights fp32, [router layers 46][rows][8] as G5's router_picks / router_weights hold
     /// them (layer 45: the MTP layer; rows: sequence rows from the prompt's first).
     pub const Force = struct { picks: []const i16, wts: []const f32, rows: usize };
 
