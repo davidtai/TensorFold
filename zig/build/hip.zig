@@ -73,8 +73,21 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     hip_gpu_module.addCSourceFile(.{ .file = b.path("zig/src/hip/device_arch.c"), .flags = &.{"-D__HIP_PLATFORM_AMD__"} });
     hip_gpu_module.addImport("hip_probe", hip_probe);
     const hip_gpu_test = b.addTest(.{ .root_module = hip_gpu_module });
-    b.step("hip-gpu-build", "Compile HIP runtime tests without running GPU work").dependOn(&hip_gpu_test.step);
-    b.step("hip-gpu-test", "Real HIP copies, fills and architecture-selected module launches").dependOn(&b.addRunArtifact(hip_gpu_test).step);
+    // The cooperative launch runs in a binary of its own (coop_tests.zig): after it, a process can hang in its next
+    // module load, so it runs in a second process, after the other runtime tests and never beside them.
+    const hip_coop_module = b.createModule(.{ .root_source_file = b.path("zig/src/hip/coop_tests.zig"), .target = target, .link_libc = true });
+    hip_coop_module.addIncludePath(.{ .cwd_relative = hip_include });
+    hip_coop_module.addCSourceFile(.{ .file = b.path("zig/src/hip/device_arch.c"), .flags = &.{"-D__HIP_PLATFORM_AMD__"} });
+    hip_coop_module.addImport("hip_probe", hip_probe);
+    const hip_coop_test = b.addTest(.{ .root_module = hip_coop_module });
+    const hip_gpu_build = b.step("hip-gpu-build", "Compile HIP runtime tests without running GPU work");
+    hip_gpu_build.dependOn(&hip_gpu_test.step);
+    hip_gpu_build.dependOn(&hip_coop_test.step);
+    const run_gpu = b.addRunArtifact(hip_gpu_test);
+    const run_coop_after = b.addRunArtifact(hip_coop_test);
+    run_coop_after.step.dependOn(&run_gpu.step);
+    b.step("hip-gpu-test", "Real HIP copies, fills and architecture-selected module launches, then the cooperative launch in its own process").dependOn(&run_coop_after.step);
+    b.step("hip-gpu-coop-test", "The cooperative launch alone, in its own process").dependOn(&b.addRunArtifact(hip_coop_test).step);
     const affine_compile = b.addSystemCommand(&.{ hipcc, "--genco", b.fmt("--offload-arch={s}", .{hip_arch}), "-O2", "-ffp-contract=off" });
     affine_compile.addFileArg(b.path("zig/kernels/hip/affine.hip"));
     affine_compile.addArg("-o");
