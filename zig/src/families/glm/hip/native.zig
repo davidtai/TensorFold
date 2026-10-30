@@ -1,10 +1,14 @@
-//! GLM-5.3-Flash for the native server on HIP: the checkpoint admitted (EXL3, the whole shape); no forward yet.
+//! GLM-5.3-Flash for the native server on HIP: the checkpoint admitted (EXL3, the whole shape), loaded, served by the
+//! lane core over lane F's forward (serve.zig): one device, serial decode.
 const std = @import("std");
 const hip = @import("hip");
 const lanes = @import("lanes");
 const modelopt = @import("core").modelopt;
 const config = @import("../config.zig");
 const exl3_admit = @import("../exl3_admit.zig");
+const load = @import("load.zig");
+const serve = @import("serve.zig");
+const state = @import("state.zig");
 
 pub const model_type = "glm5_next";
 /// Mia-AiLab's EXL3 checkpoint: 4-bit mcg routed experts, every other weight bf16 (exl3_admit.zig).
@@ -26,9 +30,6 @@ pub const Loaded = struct {
 };
 
 pub const Refused = error{Refused};
-
-/// Why the HIP family stops after admission until the loader and the forward land.
-pub const not_wired = "GLM-5.3-Flash on HIP: the forward is not wired yet";
 
 fn refuse(a: std.mem.Allocator, problem: *[]const u8, comptime fmt: []const u8, args: anytype) Refused {
     problem.* = std.fmt.allocPrint(a, fmt, args) catch fmt;
@@ -62,6 +63,37 @@ fn check(a: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, dir: []const 
     return admit(a, gpa, dir, text, problem);
 }
 
+/// The window rows a forward takes at once where the policy names none (the HIP default is 1,024): lane F's 2,048,
+/// the largest its buffers take (state.prompt_rows); the logits are the same at every chunk (numerics=exact).
+pub const policy_prefill_step: u32 = state.prompt_rows;
+/// Serial decode: no draft head yet, so --mtp-drafts past 0 is refused before the load.
+pub const max_drafts: u32 = 0;
+pub const confidence_refusal = "--mtp-confidence: GLM-5.3-Flash on HIP drafts nothing yet (serial decode); serve it without --mtp-confidence";
+
+/// MemAvailable the streams leave at least: the load's floor (the harness watchdog stops a server under 6 GiB).
+const floor: u64 = (load.Options{}).floor;
+
+fn gib(n: u64) f64 {
+    return @as(f64, @floatFromInt(n)) / (1 << 30);
+}
+
+/// The engine and the lane backend `open` hands the server, freed together.
+const Owned = struct {
+    gpa: std.mem.Allocator,
+    e: *serve.Engine,
+    h: *serve.Hip,
+    startup: []const u8,
+
+    fn release(p: *anyopaque) void {
+        const o: *Owned = @ptrCast(@alignCast(p));
+        o.h.deinit();
+        o.e.deinit();
+        o.gpa.free(o.startup);
+        o.gpa.destroy(o);
+    }
+};
+
+/// The engine for `dir` on `dev`: admitted, loaded, its streams sized by what MemAvailable leaves over the floor.
 pub fn open(
     a: std.mem.Allocator,
     gpa: std.mem.Allocator,
@@ -71,12 +103,72 @@ pub fn open(
     o: anytype,
     problem: *[]const u8,
 ) anyerror!Loaded {
-    _ = dev;
-    _ = o;
     _ = try check(a, gpa, io, dir, problem);
-    return refuse(a, problem, not_wired, .{});
+    if (o.world > 1) return refuse(a, problem, "GLM-5.3-Flash on HIP runs on one device: serve it with --tp 1", .{});
+    if (o.cache_gib) |g| if (g > 0) return refuse(a, problem, "GLM-5.3-Flash on HIP keeps no prompt cache yet: serve it with --prompt-cache-gib 0", .{});
+    const capacity = std.mem.alignForward(usize, o.window + 8, 64); // cuda_state.zig's align64(context + 8)
+    const chunk: usize = @min(@max(dev.policy.prefill_step, 64), state.prompt_rows);
+    problem.* = "";
+    const e = serve.Engine.create(gpa, a, io, dev.index, dir, capacity, chunk, problem) catch |err| {
+        if (problem.len == 0) return refuse(a, problem, "the native HIP engine cannot load GLM-5.3-Flash from {s} ({t})", .{ dir, err });
+        return error.Refused;
+    };
+    errdefer e.deinit();
+    const weights = e.opened.ck.layout.slabBytes();
+    const scratch = e.scratchBytes();
+    const per: u64 = state.State.bytes(capacity);
+    const before = load.memAvailable() orelse return refuse(a, problem, "cannot read MemAvailable", .{});
+    const usable = before -| floor;
+    var streams: usize = @max(o.streams, 1);
+    while (streams > 1 and streams * per > usable) streams -= 1;
+    if (streams * per > usable) return refuse(
+        a,
+        problem,
+        "one GLM-5.3-Flash stream at a {d}-token window takes {d:.2} GiB, and MemAvailable is {d:.2} GiB after the " ++
+            "model's {d:.2} GiB and {d:.2} GiB of scratch, under the {d:.0} GiB floor with it: lower --context",
+        .{ o.window, gib(per), gib(before), gib(weights), gib(scratch), gib(floor) },
+    );
+    if (streams < o.streams and o.fixed) return refuse(
+        a,
+        problem,
+        "--parallel {d} needs {d:.2} GiB at a {d}-token window and MemAvailable leaves {d:.2} GiB over the {d:.0} " ++
+            "GiB floor: serve --parallel {d}, or lower --context",
+        .{ o.streams, gib(o.streams * per), o.window, gib(usable), gib(floor), streams },
+    );
+    const h = serve.Hip.init(gpa, e, streams) catch |err| return refuse(a, problem, "the native HIP engine cannot make GLM's streams ({t})", .{err});
+    errdefer h.deinit();
+    const after = load.memAvailable() orelse 0;
+    const startup = try std.fmt.allocPrint(gpa, "HIP {s} device {d}: GLM-5.3-Flash weights {d:.3} GiB (loaded in " ++
+        "{d:.1} s), scratch {d:.2} GiB (prompt chunks of {d} rows); {d} stream{s} at a {d}-token window, {d:.3} " ++
+        "GiB each; MemAvailable {d:.2} GiB left (floor {d:.0} GiB); serial decode (no drafts), no prompt cache", .{
+        hip.kernels.arch,
+        dev.index,
+        gib(weights),
+        e.opened.w.stats.seconds,
+        gib(scratch),
+        chunk,
+        streams,
+        if (streams == 1) "" else "s",
+        o.window,
+        gib(per),
+        gib(after),
+        gib(floor),
+    });
+    errdefer gpa.free(startup);
+    const own = try gpa.create(Owned);
+    own.* = .{ .gpa = gpa, .e = e, .h = h, .startup = startup };
+    return .{
+        .backend = h.backend(),
+        .facts = h.facts(),
+        .rows = serve.max_window,
+        .ctx = own,
+        .deinit = Owned.release,
+        .streams = streams,
+        .startup = startup,
+    };
 }
 
+/// One device only: no rank follows.
 pub fn follow(
     a: std.mem.Allocator,
     gpa: std.mem.Allocator,
@@ -89,7 +181,7 @@ pub fn follow(
     _ = dev;
     _ = o;
     _ = try check(a, gpa, io, dir, problem);
-    return refuse(a, problem, not_wired, .{});
+    return refuse(a, problem, "GLM-5.3-Flash on HIP runs on one device: serve it with --tp 1", .{});
 }
 
 test "GLM on HIP admits EXL3 4-bit mcg at the whole shape and refuses the rest by name" {
