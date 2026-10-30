@@ -22,6 +22,8 @@ pub const serve = @import("hip/serve.zig");
 /// The eager forward (prompt chunks, decode rows, the MTP layer) and the per-stream state and buffers it runs on.
 pub const forward = @import("hip/forward.zig");
 pub const state = @import("hip/state.zig");
+/// TF_GLM_PROFILE: the forward's GPU time by layer and op group.
+pub const profile = @import("hip/profile.zig");
 
 test {
     _ = config;
@@ -40,4 +42,5 @@ test {
     _ = forward;
     _ = state;
     _ = @import("hip/fwd_test.zig");
+    _ = profile;
 }
