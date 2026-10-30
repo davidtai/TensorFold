@@ -23,19 +23,6 @@ const usage =
 
 const gib = load.gib;
 
-fn configOf(a: std.mem.Allocator, io: std.Io, dir: []const u8) !glm.Config {
-    const path = try std.fs.path.join(a, &.{ dir, "config.json" });
-    const text = try std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(1 << 24));
-    var why: @import("core").modelopt.Why = .{};
-    glm.exl3_admit.admit("HIP", a, text, &why) catch |err| {
-        std.debug.print("{s}: {s}\n", .{ path, why.text() });
-        return err;
-    };
-    const c = try glm.config.parse(a, text);
-    if (!glm.config.whole(c)) return error.NotWholeGlm53Flash;
-    return c;
-}
-
 fn printPlan(l: *const layout.Layout) void {
     std.debug.print("{s:<26} {s:>12} {s:>12} {s:>8}\n", .{ "class", "stored GiB", "on GPU GiB", "tensors" });
     for (0..layout.class_count) |i| {
@@ -58,23 +45,21 @@ fn printPlan(l: *const layout.Layout) void {
     std.debug.print("\nslabs: {d}, {d:.3} GiB on the GPU (tensors {d:.3} GiB, expert tables and 256-byte alignment the rest)\n", .{ l.slabs.len, gib(l.slabBytes()), gib(on) });
 }
 
-fn planOf(a: std.mem.Allocator, io: std.Io, dir: []const u8) !struct { glm.hip_load.shards.Index, layout.Layout } {
-    const c = try configOf(a, io, dir);
-    const index = try glm.hip_load.shards.read(a, io, dir);
-    var why: []const u8 = "";
-    const l = layout.plan(a, &index, c, &why) catch |err| {
-        std.debug.print("the placement refuses {s}: {t}\n", .{ why, err });
+fn planOf(gpa: std.mem.Allocator, a: std.mem.Allocator, io: std.Io, dir: []const u8) !*glm.hip_load.open.Checkpoint {
+    var problem: []const u8 = "";
+    return glm.hip_load.open.plan(gpa, a, io, dir, &problem) catch |err| {
+        std.debug.print("{s}\n", .{problem});
         return err;
     };
-    return .{ index, l };
 }
 
 fn plan(init: std.process.Init, dir: []const u8) !void {
     var arena = std.heap.ArenaAllocator.init(init.gpa);
     defer arena.deinit();
-    const index, const l = try planOf(arena.allocator(), init.io, dir);
-    std.debug.print("{s}: {d} shards, {d} tensors\n", .{ dir, index.files.len, index.tensors.count() });
-    printPlan(&l);
+    const ck = try planOf(init.gpa, arena.allocator(), init.io, dir);
+    defer ck.deinit();
+    std.debug.print("{s}: {d} shards, {d} tensors\n", .{ dir, ck.index.files.len, ck.index.tensors.count() });
+    printPlan(&ck.layout);
     std.debug.print("PLAN OK\n", .{});
 }
 
@@ -95,13 +80,16 @@ fn loadAll(init: std.process.Init, dir: []const u8, o: LoadArgs) !void {
     var arena = std.heap.ArenaAllocator.init(init.gpa);
     defer arena.deinit();
     const a = arena.allocator();
-    const index, const l = try planOf(a, init.io, dir);
-    printPlan(&l);
+    const ck = try planOf(init.gpa, a, init.io, dir);
+    defer ck.deinit();
+    const index = &ck.index;
+    const l = &ck.layout;
+    printPlan(l);
     var r = try hip.Runtime.open();
     defer r.close();
     var ctx = try hip.Context.init(&r, 0);
     defer ctx.deinit();
-    var w = try load.load(init.gpa, &r, &index, &l, .{ .chunk = o.chunk, .floor = o.floor });
+    var w = try load.load(init.gpa, &r, index, l, .{ .chunk = o.chunk, .floor = o.floor });
     defer w.deinit();
     const s = w.stats;
     std.debug.print("\nLOAD {d:.1} s: {d:.3} GiB placed ({d:.3} GiB read, {d:.2} GB/s), {d:.3} GiB of slabs\n", .{ s.seconds, gib(s.placed_bytes), gib(s.read_bytes), @as(f64, @floatFromInt(s.read_bytes)) / s.seconds / 1e9, gib(s.slab_bytes) });
@@ -117,7 +105,7 @@ fn loadAll(init: std.process.Init, dir: []const u8, o: LoadArgs) !void {
     const m = w.model;
     std.debug.print("model: embed 0x{x}, head [{d}, {d}] at 0x{x}, layer 3 experts gate table 0x{x}, MTP eh [{d}, {d}]\n", .{ m.embed, m.head.n, m.head.k, m.head.w, m.layers[3].ffn.moe.experts.gate, m.mtp.eh.n, m.mtp.eh.k });
     const t0 = std.Io.Timestamp.now(init.io, .awake).nanoseconds;
-    const rep = try glm.hip_load.verify.check(init.gpa, &index, &l, w.slabs, o.every);
+    const rep = try glm.hip_load.verify.check(init.gpa, index, l, w.slabs, o.every);
     defer if (rep.first_bad) |n| init.gpa.free(n);
     const secs = @as(f64, @floatFromInt(std.Io.Timestamp.now(init.io, .awake).nanoseconds - t0)) / 1e9;
     std.debug.print("VERIFY sha256: {d} tensors ({d:.3} GiB) against the files, {d} differ; {d} expert tables, {d} wrong ({d:.1} s)\n", .{ rep.tensors, gib(rep.bytes), rep.mismatched, rep.tables, rep.bad_tables, secs });
