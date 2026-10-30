@@ -17,6 +17,9 @@ pub const hip_load = struct {
     /// A checkpoint directory to `Opened.model` in one call.
     pub const open = @import("hip/open.zig");
 };
+/// The eager forward (prompt chunks, decode rows, the MTP layer) and the per-stream state and buffers it runs on.
+pub const forward = @import("hip/forward.zig");
+pub const state = @import("hip/state.zig");
 
 test {
     _ = config;
@@ -29,4 +32,7 @@ test {
     @import("std").testing.refAllDecls(hip_load.verify);
     @import("std").testing.refAllDecls(hip_load.shards);
     @import("std").testing.refAllDecls(hip_load.open);
+    _ = forward;
+    _ = state;
+    _ = @import("hip/fwd_test.zig");
 }

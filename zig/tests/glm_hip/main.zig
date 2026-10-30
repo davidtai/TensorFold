@@ -250,6 +250,8 @@ pub fn main(init: std.process.Init) !u8 {
         })
     else if (args.len == 4 and std.mem.eql(u8, args[1], "dump-echo"))
         echo(init, args[2], args[3])
+    else if (args.len >= 4 and std.mem.eql(u8, args[1], "forward"))
+        @import("forward.zig").run(init, args[2..])
     else {
         std.debug.print(usage, .{});
         return 2;
