@@ -1,6 +1,6 @@
 //! GLM-5.3-Flash's weights on the GPU as the HIP kernels take them: device addresses into the slabs layout.zig plans.
 //! Every tensor is as stored (dtype and bytes). BF16 linears are rows [n, k] (out, in) for G4's bf16Arg/bf16Go;
-//! fused projections are the row stacks layout.zig places together. Routed experts as G1's hip.exl3.Experts takes them.
+//! fused projections are the row stacks layout.zig places together. Routed experts as hip.exl3.Experts.
 
 const std = @import("std");
 const config = @import("../config.zig");
@@ -65,25 +65,9 @@ pub const Dense = struct {
     down: Bf16,
 };
 
-/// A layer's EXL3 routed experts, field for field G1's hip.exl3.Experts (zig/src/hip/exl3.zig on glm-halo/g1-exl3):
-/// gate, up, down are u64 tables [count] of each expert's trellis address (int16 [K/16][N/16][64]).
-pub const Experts = struct {
-    gate: u64,
-    up: u64,
-    down: u64,
-    suh_g: u64, // fp16 [count][dims]
-    suh_u: u64,
-    svh_g: u64, // fp16 [count][width]
-    svh_u: u64,
-    suh_d: u64, // fp16 [count][width]
-    svh_d: u64, // fp16 [count][dims]
-    count: usize,
-    dims: usize,
-    width: usize,
-    /// Every expert's gate and up suh are the same bytes (the loader compares them): a row rotates once.
-    shared_input: bool,
-    limit: f32 = 0,
-};
+/// A layer's EXL3 routed experts as G1's kernels take them (zig/src/hip/exl3.zig): gate, up, down are u64 tables
+/// [count] of each expert's trellis address (int16 [K/16][N/16][64]); suh and svh fp16 stacked by expert id.
+pub const Experts = @import("hip").exl3.Experts;
 
 /// The stacked trellis the tables point into: expert e's at base + e x stride.
 pub const Stacks = struct { gate: u64, up: u64, down: u64, stride_gu: u64, stride_d: u64 };
