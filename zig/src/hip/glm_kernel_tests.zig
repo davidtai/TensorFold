@@ -7,4 +7,8 @@ test {
     _ = @import("kernel_tests/glm/copy.zig");
     _ = @import("kernel_tests/kda.zig");
     _ = @import("kernel_tests/exl3.zig");
+    _ = @import("kernel_tests/glm/bf16.zig");
+    _ = @import("kernel_tests/glm/hc.zig");
+    _ = @import("kernel_tests/glm/router.zig");
+    _ = @import("kernel_tests/glm/mtp.zig");
 }

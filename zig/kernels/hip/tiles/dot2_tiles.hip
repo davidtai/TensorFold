@@ -6,6 +6,7 @@
 #include "tiles/stream.hpp"
 #include "tiles/matrix_gemm.hpp"
 #include "quant/mlx_tiles.hpp"
+#include "quant/bf16_tiles.hpp"
 
 namespace tf {
 namespace rocm {
@@ -391,6 +392,26 @@ template __global__ void affine_dot2_stream_list<Dot, 4, 4, 4, false>(Affine, St
 #define TF_HELD(R, CB) template __global__ void affine_dot2_stream_held<Dot, 4, R, CB>(Affine, StreamSides, int, int);
 TF_HELD(4, 1) TF_HELD(4, 2) TF_HELD(4, 4)
 TF_HELD(8, 2) TF_HELD(8, 4)
+
+// GLM-5.3-Flash's BF16 linears (quant/bf16_tiles.hpp): the stream tile at 1, 2, 4 rows and 1, 2 columns a lane (16
+// words a chunk), the SwiGLU pair at 2; the WMMA tile at each K of the model (launches/affine.zig bf16_ks)
+#if TF_DOT2_BF16
+#define TF_BF16_STREAM(R)                                                              \
+    template __global__ void bf16_stream<R, 1, false>(Affine, StreamSides, int, int); \
+    template __global__ void bf16_stream<R, 2, false>(Affine, StreamSides, int, int); \
+    template __global__ void bf16_stream<R, 2, true>(Affine, StreamSides, int, int);
+TF_BF16_STREAM(1) TF_BF16_STREAM(2) TF_BF16_STREAM(4)
+#endif
+#if TF_MATRIX
+template __global__ void bf16_wmma<128>(Affine);
+template __global__ void bf16_wmma<512>(Affine);
+template __global__ void bf16_wmma<1536>(Affine);
+template __global__ void bf16_wmma<2048>(Affine);
+template __global__ void bf16_wmma<4096>(Affine);
+template __global__ void bf16_wmma<8192>(Affine);
+template __global__ void bf16_wmma<12288>(Affine);
+template __global__ void bf16_wmma<16384>(Affine);
+#endif
 
 TF_TILES(2)
 TF_TILES(3)

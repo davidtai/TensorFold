@@ -208,6 +208,11 @@ pub const Kernels = struct {
     dense_inexact: [inexact_ks.len]?Function,
     /// A prompt's MoE router (bf16 rows, K 2560) on the same tile, the weights copied (numerics=inexact).
     router_inexact: ?Function,
+    /// BF16 weight rows (quant/bf16_tiles.hpp, bits 16): the stream tile by rows (stream_rows) and columns a lane 1, 2;
+    /// its SwiGLU pair at 2 columns; the WMMA tile at each of bf16_ks. Null where the GPU has no BF16 dot2 or matrix.
+    bf16_stream: [stream_rows.len][2]?Function,
+    bf16_pair: [stream_rows.len]?Function,
+    bf16_wmma: [bf16_ks.len]?Function,
     kp: [bit_widths.len][kp_tiles.len]Function,
     span: [2]Function,
     fold: Function,
@@ -253,6 +258,15 @@ pub const Kernels = struct {
             k.dense_inexact[i] = if (k.matrix) try tiles_obj.function(std.fmt.comptimePrint(r ++ "25affine_wmma_dense_inexactILi{d}EEEvNS0_6AffineE", .{dk})) else null;
         }
         k.router_inexact = if (k.matrix) try tiles_obj.function(r ++ "18affine_wmma_routerILi2560EEEvNS0_6AffineE") else null;
+        inline for (stream_rows, 0..) |rows, i| {
+            inline for (.{ 1, 2 }, 0..) |cb, c| {
+                k.bf16_stream[i][c] = if (wmma) try tiles_obj.function(std.fmt.comptimePrint(r ++ "11bf16_streamILi{d}ELi{d}ELb0EEEvNS0_6AffineENS0_11StreamSidesEii", .{ rows, cb })) else null;
+            }
+            k.bf16_pair[i] = if (wmma) try tiles_obj.function(std.fmt.comptimePrint(r ++ "11bf16_streamILi{d}ELi2ELb1EEEvNS0_6AffineENS0_11StreamSidesEii", .{rows})) else null;
+        }
+        inline for (bf16_ks, 0..) |bk, i| {
+            k.bf16_wmma[i] = if (k.matrix) try tiles_obj.function(std.fmt.comptimePrint(r ++ "9bf16_wmmaILi{d}EEEvNS0_6AffineE", .{bk})) else null;
+        }
         return k;
     }
 
@@ -444,7 +458,9 @@ pub const Kernels = struct {
         s: abi.Stream,
         relu2: bool,
     ) Error!void {
-        const b = bitIndex(a.bits).?;
+        const b16 = a.bits == 16; // BF16 rows: the rule below keeps them at 1 or 2 columns a lane (16 words a chunk)
+        if (b16 and (relu2 or k.bf16_stream[0][0] == null)) return refuse("bf16 stream");
+        const b = if (b16) 0 else bitIndex(a.bits).?;
         var sides = sides_in;
         // a pair's lane carries half as many output columns: a gate column and its up column make one
         const pair_div: c_int = if (sides.pair_cols > 0) 2 else 1;
@@ -521,7 +537,7 @@ pub const Kernels = struct {
             else => 2,
         }));
         const table = if (sides.pair_cols > 0) &k.pairs else if (relu2) &k.relu2 else &k.stream;
-        const f = table[b][ri][pick].?;
+        const f = if (b16) (if (sides.pair_cols > 0) k.bf16_pair[ri] else k.bf16_stream[ri][pick]).? else table[b][ri][pick].?;
         const grid: hl.Dim3 = if (sides.row_blocks > 1)
             .{ .x = row_blocks, .y = blocks, .z = @intCast(items) }
         else
@@ -722,6 +738,42 @@ pub const Kernels = struct {
         try args.add(a);
         try go(r, f, .{ .x = cdiv(n, 128) * cdiv(m, 256) }, .{ .x = 256 }, s, &args);
         return true;
+    }
+
+    /// The K the BF16 WMMA tile compiles (bf16_wmma): GLM-5.3-Flash's linears (KDA f_b and g_b 128, kv_b 512, q_b and the
+    /// indexer's wq_b 1,536, the shared expert's down 2,048, hidden 4,096, KDA o and eh_proj 8,192, the dense MLP's
+    /// down 12,288, MLA o 16,384).
+    pub const bf16_ks = [_]c_int{ 128, 512, 1536, 2048, 4096, 8192, 12288, 16384 };
+
+    pub fn bf16Index(k: c_int) ?usize {
+        for (bf16_ks, 0..) |d, i| if (d == k) return i;
+        return null;
+    }
+
+    /// A product of BF16 weight rows: out (m, n) = x (m, k) bf16 . w (n, k) bf16, fp32 into `out` or (with `out16`) bf16.
+    pub fn bf16Arg(x: u64, w: u64, out: u64, out16: u64, m: c_int, n: c_int, k: c_int) Arg {
+        return .{ .x = x, .words = w, .scale = .{ .p = 0, .kind = 1 }, .bias = .{ .p = 0, .kind = 1 }, .out = out, .m = m, .n = n, .k = k, .bits = 16, .group = 32, .fp16 = 0, .out16 = out16 };
+    }
+
+    /// A product of BF16 rows (bf16Arg): with `prompt` on the WMMA tile of its K (one chain over K), else on the stream
+    /// tile (a lane's 32-element chunks, folded by shuffle). x rows k apart, 16-byte aligned; k a multiple of 32 (64 on
+    /// the WMMA tile). The two tiles sum in different orders: their bits differ.
+    pub fn bf16Go(k: *const Kernels, r: *const runtime.Runtime, a: Arg, prompt: bool, s: abi.Stream) Error!void {
+        if (a.bits != 16 or a.m < 1 or a.n < 1 or @rem(a.k, 32) != 0 or a.x % 16 != 0) return refuse("bf16 shape");
+        if (!prompt) return k.streamGo(r, a, .{}, a.n, 1, s);
+        const f = k.bf16_wmma[bf16Index(a.k) orelse return refuse("bf16 K")] orelse return refuse("bf16 wmma tile");
+        if (a.words % 16 != 0) return refuse("bf16 rows unaligned");
+        var args: hl.Args = .{};
+        try args.add(a);
+        try go(r, f, .{ .x = cdiv(a.n, 128) * cdiv(a.m, 256) }, .{ .x = 256 }, s, &args);
+    }
+
+    /// Decode's (gate | up) product of BF16 rows on the stream tile: `w` is gate (cols, k) then up (cols, k), act (m, cols)
+    /// bf16 = silu(min(g, limit)) * clamp(u, +-limit) (limit 0: no clamp), the product rounded once to bf16.
+    pub fn bf16PairGo(k: *const Kernels, r: *const runtime.Runtime, x: u64, w: u64, act: u64, m: c_int, cols: c_int, kk: c_int, limit: f32, s: abi.Stream) Error!void {
+        const a = bf16Arg(x, w, 0, act, m, 2 * cols, kk);
+        if (m < 1 or cols < 1 or @rem(kk, 32) != 0 or x % 16 != 0) return refuse("bf16 pair shape");
+        return k.streamGo(r, a, .{ .pair_cols = cols, .limit = limit }, cols, 1, s);
     }
 
     pub fn denseInexactGo(k: *const Kernels, r: *const runtime.Runtime, a: Arg, s: abi.Stream) Error!void {

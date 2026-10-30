@@ -6,6 +6,7 @@
 #include <cstdint>
 
 // Lane topics: one #include "<topic>.hpp" each.
+#include "glue.hpp"  // G4: mHC (Sinkhorn), norms, residual, stream mean, embedding
 
 // Rows of bf16 values copied as stored (16-bit words, no conversion): `rows` rows of `cols` values from `src` at a row
 // stride of `src_stride` values to `dst` at `dst_stride`. The loader's self-test, and the row placement of its buffers.

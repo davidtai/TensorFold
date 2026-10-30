@@ -42,6 +42,8 @@ pub const flashnext = @import("launches/flashnext.zig");
 const mamba = @import("launches/mamba.zig");
 const nemotron_moe = @import("launches/nemotron_moe.zig");
 pub const exl3 = @import("launches/exl3.zig");
+/// GLM-5.3-Flash's glue: mHC pre and post, the residual, norms, stream mean, embedding (glm/glue.hpp).
+pub const glm = @import("launches/glm.zig");
 
 pub const ConvArgs = conv.ConvArgs;
 pub const PlanArgs = plan.PlanArgs;
@@ -99,6 +101,8 @@ pub const Launcher = struct {
     nemo: nemotron_moe.Fns,
     /// The EXL3 routed experts' kernels (quant/exl3.hip).
     exl3: exl3.Fns,
+    /// GLM-5.3-Flash's glue kernels (glm/glue.hpp, the "glm" group).
+    glm: glm.Fns,
 
     const PlanFns = struct {
         kv_write: Function,
@@ -317,6 +321,7 @@ pub const Launcher = struct {
         try l.affine.fillByteLut(r, dot2);
         try l.affine.fillHcGate(r);
         l.fnx = try flashnext.Fns.load(l.mods[@backingInt(kernels.Group.flashnext)]);
+        l.glm = try glm.Fns.load(l.mods[@backingInt(kernels.Group.glm)]);
         return l;
     }
 
