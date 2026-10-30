@@ -162,6 +162,20 @@ fn mm(a: std.mem.Allocator, x: []const f64, xs: usize, x0: usize, rows: usize, w
     return out;
 }
 
+/// sum over k of |x[r][k] w[j][k]| for rows 0..rows and outputs 0..n: the BF16 product bound's magnitude.
+fn mmAbs(a: std.mem.Allocator, x: []const f64, xs: usize, rows: usize, w: []const f64, n: usize, k: usize) ![]f64 {
+    const out = try a.alloc(f64, rows * n);
+    for (0..rows) |r| {
+        const xr = x[r * xs ..][0..k];
+        for (0..n) |j| {
+            var s: f64 = 0;
+            for (xr, w[j * k ..][0..k]) |p, q| s += @abs(p * q);
+            out[r * n + j] = s;
+        }
+    }
+    return out;
+}
+
 fn roundAll(v: []f64) void {
     for (v) |*x| x.* = rb(x.*);
 }
@@ -354,17 +368,19 @@ test "glm fwd: a KDA layer (20 prompt rows, then a decode row) against float64; 
         // the conv window: the last 3 rows' q | k | v projections
         const win = try t.get(u16, st.convAt(0), 3 * 3 * n_kda);
         const p = try mm(a, x.val[18 * D ..], D, 0, 3, kw.proj, 0, 3 * n_kda, D);
-        // fp32 sums over K 4,096 fall on the other side of a bf16 rounding boundary now and then: each value within
-        // one bf16 ulp of float64's (2^-7 of its size), the flips counted
+        const mag = try mmAbs(a, x.val[18 * D ..], D, 3, kw.proj, 3 * n_kda, D);
+        // each value within G4's BF16 product bound (kernel_tests/glm/bf16.zig): fp32 accumulation over K in any order,
+        // (K + 8) 2^-24 sum |x w|, plus one bf16 rounding, 2^-8 of the value; the values off float64's rounding counted
         var flips: usize = 0;
-        for (win, p, 0..) |g, w, i| {
+        for (win, p, mag, 0..) |g, w, ms, i| {
             flips += @intFromBool(g != bfBits(w));
-            if (!(@abs(bfVal(g) - w) <= @abs(w) * std.math.pow(f64, 2, -7) + 1e-30)) {
-                std.debug.print("FAIL glm fwd KDA block: conv window value {d}: {d} not within a bf16 ulp of {d}\n", .{ i, bfVal(g), w });
+            const tol = (D + 8) * std.math.pow(f64, 2, -24) * ms + @abs(w) * std.math.pow(f64, 2, -8) + 1e-30;
+            if (!(@abs(bfVal(g) - w) <= tol)) {
+                std.debug.print("FAIL glm fwd KDA block: conv window value {d}: {d} not {d} (tolerance {e})\n", .{ i, bfVal(g), w, tol });
                 return error.TestExpectedApproxEq;
             }
         }
-        std.debug.print("RESULT glm fwd KDA block: conv window = the last 3 rows' projections, each within a bf16 ulp; {d} of {d} on the other side of float64's rounding\n", .{ flips, win.len });
+        std.debug.print("RESULT glm fwd KDA block: conv window = the last 3 rows' projections within the BF16 product bound; {d} of {d} off float64's rounding\n", .{ flips, win.len });
     }
     // 2. a window's bits do not depend on its cut
     {
