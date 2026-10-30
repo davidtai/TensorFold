@@ -135,7 +135,9 @@ test "glm exl3 fold (F-K6): the prompt GEMM's 64-k groups within float64's bound
         var full: []f32 = undefined;
         for ([_]bool{ false, true }, 0..) |chain, which| {
             const got = try c.run(t, 0, m, chain);
-            if (chain) gpa.free(got) else full = got;
+            // the fold's result stays as the cuts' reference (freed after them); the chain's after its checks
+            defer if (chain) gpa.free(got);
+            if (!chain) full = got;
             var name: [80]u8 = undefined;
             var w: check.Worst = .{ .name = try std.fmt.bufPrint(&name, "exl3 gemm {s} {d} x [K {d}, N {d}]", .{ if (chain) "one chain" else "fold G64", m, k, n }) };
             for (0..m * n) |i| {
