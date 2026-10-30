@@ -228,21 +228,24 @@ fn headProducts(t: *Rig, x: []const u16, xs: usize, kvb: []const u16, rows: usiz
     return .{ .want = want, .tol = tol, .chain = chain };
 }
 
-/// Each bf16 output is the float64 value rounded to nearest, or (only where the value is within `chain`, the fp32
-/// accumulation's bound, of a rounding midpoint) the neighbour on the far side of that midpoint: the output error is
-/// one bf16 rounding of an fp32 sum, nothing more.
+/// Each bf16 output is the rounding to nearest of a value within `chain` (the fp32 accumulation's bound) of the
+/// float64 value: a bf16 value from round(w - chain) to round(w + chain). Where the chain spans no rounding midpoint
+/// that is the float64 value rounded to nearest: the output error is one bf16 rounding of an fp32 sum, nothing more.
 fn roundedOnce(t: *Rig, name: []const u8, p: u64, want: []const f64, chain: []const f64) !void {
     const got = try t.backAs(u16, p, want.len);
     var nearest: usize = 0;
-    var near_mid: usize = 0;
+    var other: usize = 0;
+    var forced: usize = 0; // the chain spans no midpoint: only the nearest is allowed
     for (want, chain, 0..) |w, c, i| {
-        const lo = bfBits(@floatCast(w - c));
-        const hi = bfBits(@floatCast(w + c));
-        const g = got[i];
-        try expect(g == lo or g == hi, "{s}: output {d} is 0x{x:0>4}; float64 {e} rounds to 0x{x:0>4} (0x{x:0>4} within the fp32 chain)", .{ name, i, g, w, bfBits(@floatCast(w)), if (lo == bfBits(@floatCast(w))) hi else lo });
-        if (g == bfBits(@floatCast(w))) nearest += 1 else near_mid += 1;
+        const lo = bfValue(bfBits(@floatCast(w - c)));
+        const hi = bfValue(bfBits(@floatCast(w + c)));
+        const g = bfValue(got[i]);
+        const n = bfBits(@floatCast(w));
+        try expect(g >= lo and g <= hi, "{s}: output {d} is 0x{x:0>4} ({e}); float64 {e} rounds to 0x{x:0>4}, the fp32 chain allows {e} .. {e}", .{ name, i, got[i], g, w, n, lo, hi });
+        if (lo == hi) forced += 1;
+        if (got[i] == n) nearest += 1 else other += 1;
     }
-    std.debug.print("ROUNDED {s}: {d} of {d} outputs are float64 rounded to nearest bf16, {d} the neighbour within the fp32 chain of a midpoint\n", .{ name, nearest, want.len, near_mid });
+    std.debug.print("ROUNDED {s}: {d} of {d} outputs are float64 rounded to nearest bf16 ({d} where the fp32 chain spans no midpoint, all of them nearest); {d} another value within the chain\n", .{ name, nearest, want.len, forced, other });
 }
 
 test "GLM DSA: absorb and expand by kv_b as stored against float64; rows alone equal their rows in a wide call" {
