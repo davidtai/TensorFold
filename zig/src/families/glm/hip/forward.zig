@@ -19,6 +19,7 @@ const config = @import("../config.zig");
 const weights = @import("weights.zig");
 const dump = @import("dump.zig");
 const state = @import("state.zig");
+const profile = @import("profile.zig");
 
 const glue = hip.launches.glm;
 const dsa = hip.launches.glm_dsa;
@@ -90,6 +91,12 @@ pub const Forward = struct {
     moe_last: struct { pick: u64 = 0, wts: u64 = 0 } = .{},
     /// Inside `window`: the KDA layers hold their states and save the rows for `keep`.
     hold: bool = false,
+    /// Inside `draft`: the head's profile mark is the draft head's.
+    drafting: bool = false,
+    /// TF_GLM_PROFILE: GPU time by layer and op group (profile.zig); null: no events recorded.
+    prof: ?*profile.Prof = null,
+    /// The layer the marks name (-1: embed and tail; 45: the MTP layer).
+    cur: i16 = -1,
 
     pub const DsaLast = struct { dp: u64 = 0, qr: u64 = 0, lat: u64 = 0, qq: u64 = 0, qa: u64 = 0, ol: u64 = 0, vn: u64 = 0 };
 
@@ -122,6 +129,15 @@ pub const Forward = struct {
             return glue.swiglu(f.l, c(both), m(act), int(rows), int(cols), limit, f.s);
         }
         try f.l.affine.bf16GluGo(f.l.r, x, gu.w, act, f.l.glm.silu, int(rows), int(cols), @intCast(gu.k), limit, f.s);
+    }
+
+    /// A profile mark closing op group `op` (no-op without TF_GLM_PROFILE).
+    fn pm(f: *Forward, op: profile.Op, rows: usize, bytes: u64) !void {
+        if (f.prof) |p| try p.mark(f.cur, op, rows, bytes);
+    }
+
+    fn wb(w: weights.Bf16) u64 {
+        return @as(u64, w.n) * w.k * 2;
     }
 
     pub fn sync(f: *const Forward) !void {
@@ -172,6 +188,8 @@ pub const Forward = struct {
         const wr = state.window_rows;
         try f.l.tf_kda_keep(mf(st.rec), @intCast(State.rec_layer), cf(st.save_k), c(st.save_v), cf(st.save_g), cf(st.save_b), @intCast(wr * kda_n), @intCast(wr * kda_heads), int(rows), int(state.kda_layers), int(kda_heads), f.s);
         try f.l.tf_kda_conv_shift(m(st.conv), c(st.proj), @intCast(rows), @intCast(State.conv_layer), @intCast(wr * W), @intCast(W), @intCast(3 * kda_n), int(state.kda_layers), f.s);
+        f.cur = -1;
+        try f.pm(.mtp_keep, rows, state.kda_layers * State.rec_layer * 4 * 2);
         st.pending = 0;
         try st.setPos(f.s, st.pos + rows);
     }
@@ -185,11 +203,15 @@ pub const Forward = struct {
         try st.ready(f.s, R);
         try f.upload(b.ids, std.mem.sliceAsBytes(ids));
         try glue.embed(f.l, c(b.ids), c(f.w.embed), m(b.x), int(R), int(D), int(streams), f.s);
+        f.cur = -1;
+        try f.pm(.embed, R, 0);
         var li: usize = 0;
         var di: usize = 0;
         for (f.w.layers, 0..) |ly, j| {
             const hc = ly.attn_hc.?;
+            f.cur = @intCast(j);
             try glue.hcPre(f.l, c(b.x), c(hc.fn_w), c(hc.base), c(hc.scale), c(ly.in_norm), m(b.normed), m(b.post), m(b.comb), m(b.hcpart), cfg.eps, cfg.hc_eps, @intCast(cfg.sinkhorn), int(R), f.s);
+            try f.pm(.hc_pre, R, 24 * 16384 * 2);
             try f.dumpRows(j, 0, b.normed, R);
             switch (ly.mixer) {
                 .kda => |w| {
@@ -203,9 +225,11 @@ pub const Forward = struct {
             }
             try f.dumpRows(j, 1, b.part, R);
             try glue.hcPost(f.l, c(b.x), m(b.x), c(b.part), 1, 0, c(b.post), c(b.comb), int(R), f.s);
+            try f.pm(.hc_post, R, 0);
             try f.dumpStreams(j, 0, R);
             const fh = ly.ffn_hc.?;
             try glue.hcPre(f.l, c(b.x), c(fh.fn_w), c(fh.base), c(fh.scale), c(ly.post_norm), m(b.normed), m(b.post), m(b.comb), m(b.hcpart), cfg.eps, cfg.hc_eps, @intCast(cfg.sinkhorn), int(R), f.s);
+            try f.pm(.hc_pre, R, 24 * 16384 * 2);
             try f.dumpRows(j, 2, b.normed, R);
             switch (ly.ffn) {
                 .dense => |w| try f.denseBlock(w, R),
@@ -213,11 +237,14 @@ pub const Forward = struct {
             }
             try f.dumpRows(j, 3, b.part, R);
             try glue.hcPost(f.l, c(b.x), m(b.x), c(b.part), 1, 0, c(b.post), c(b.comb), int(R), f.s);
+            try f.pm(.hc_post, R, 0);
             try f.dumpStreams(j, 1, R);
         }
         // finish: the stream mean, the final norm (cuda_forward.zig whole's tail and finish)
         try glue.streamMean(f.l, c(b.x), m(b.hidden), int(R), f.s);
         try glue.rms(f.l, c(b.hidden), @intCast(D), c(f.w.norm), m(b.fnormed), @intCast(D), int(R), int(D), cfg.eps, f.s);
+        f.cur = -1;
+        try f.pm(.tail, R, 0);
     }
 
     /// cuda_kda_block.zig body + fill: projections, the chain (prep, scan, gated norm), the conv window's commit, o_proj
@@ -251,16 +278,22 @@ pub const Forward = struct {
         try f.l.tf_copy_cols(c(p), @intCast(W), @intCast(fa + 128), m(xg), 2, int(R), 128, f.s);
         try f.lin(xa, w.f_b, R, ka, true);
         try f.lin(xg, w.g_b, R, kg, true);
+        try f.pm(.kda_proj, R, wb(w.proj) + wb(w.f_b) + wb(w.g_b));
         const conv = st.convAt(li);
         try f.l.tf_kda_prep(c(p), @intCast(W), @intCast(fa + 256), c(ka), @intCast(n), c(conv), c(w.conv), cf(w.a_log), cf(w.dt_bias), f.cfg.lower_bound, mf(q), mf(k), m(v), mf(g), mf(beta), int(R), int(kda_heads), f.s);
+        try f.pm(.kda_prep, R, 0);
         if (f.hold) {
             try f.l.tf_kda_hold(cf(q), cf(k), c(v), cf(g), cf(beta), mf(st.recAt(li)), mf(y), int(R), int(kda_heads), f.s);
         } else try f.l.tf_kda(cf(q), cf(k), c(v), cf(g), cf(beta), mf(st.recAt(li)), mf(y), int(R), int(kda_heads), f.s, null, 0);
+        try f.pm(.kda_scan, R, State.rec_layer * 4 * 2);
         try f.l.tf_kda_out(cf(y), c(kg), @intCast(n), c(w.o_norm), f.cfg.eps, m(out), int(R), int(kda_heads), f.s);
+        try f.pm(.kda_out, R, 0);
         // every row kept: the conv window becomes the last 3 inputs (cuda_kda_block.zig bodyProfile); a held window's
         // waits for keep
         if (!f.hold) try f.l.tf_kda_conv_shift(m(conv), c(p), @intCast(R), @intCast(State.conv_layer), @intCast(R * W), @intCast(W), @intCast(3 * n), 1, f.s);
+        try f.pm(.kda_conv, R, 0);
         try f.lin(out, w.o, R, b.part, false);
+        try f.pm(.kda_oproj, R, wb(w.o));
     }
 
     /// cuda_dsa_block.zig body + fill on cache set `cs` at device position `pos` (host_pos on the host): projections,
@@ -289,10 +322,13 @@ pub const Forward = struct {
         try glue.rms(f.l, c(dp + ql * 2), @intCast(X), c(w.kv_norm), m(lat), @intCast(lw), int(R), int(lw), cfg.eps, f.s);
         try f.lin(qr, w.qr, R, qq, true);
         try f.lin(b.normed, w.index.gate, R, igr, false);
+        try f.pm(.dsa_proj, R, wb(w.x) + wb(w.qr) + wb(w.index.gate));
         try dsa.absorbQ(f.k, f.s, qq, Q, dsa.kvKeys(w.kv_b.w), dsa.kv_head, qa, R, H);
+        try f.pm(.dsa_absorb, R, wb(w.kv_b) / 2);
         try dsa.latentWrite(f.k, f.s, lat, lw, cs.lc, pos, 0, R);
         const wk_col = ql + lw; // the indexer's key rows, then its head weights, in the xProj rows
         try dsa.indexUpdate(f.k, f.s, dp + wk_col * 2, X, igr, w.index.ln_w, w.index.ln_b, w.index.ape, cs.ik, cs.ig, cs.pk, pos, 0, R);
+        try f.pm(.dsa_cache, R, 0);
         // rows past the dense limit (2,051 keys) select their tokens; a window that has none attends densely
         const listed = host_pos + R - 1 >= cfg.keyWidth();
         const B: usize = @min(R, state.att_rows);
@@ -312,6 +348,7 @@ pub const Forward = struct {
                 try dsa.selectTokens(f.k, f.s, qq + (r0 * Q + cfg.mla_heads * cfg.nope) * 2, Q, dp + (r0 * X + wk_col + cfg.i_dim) * 2, X, cs.pk, pos, r0, host_pos, n, np, sc, tokens + r0 * dsa.width * 4, counts + r0 * 4, sparse + r0 * 4);
             }
         }
+        try f.pm(.dsa_select, R, 0);
         const pt: dsa.Partials = .{ .po = try ar.of(f32, B * H * state.att_parts * lw), .pms = try ar.of(f32, B * H * state.att_parts * 2) };
         var r0: usize = 0;
         while (r0 < R) : (r0 += B) {
@@ -321,9 +358,12 @@ pub const Forward = struct {
             const off = r0 * H * lw * 2;
             try dsa.attention(f.k, f.s, qa + off, cs.lc, pos, r0, keys, pt, ol + off, n, H, parts, att_scale);
         }
+        try f.pm(.dsa_attn, R, (host_pos + R) * lw * 2);
         try dsa.expandV(f.k, f.s, ol, dsa.kvValues(w.kv_b.w), dsa.kv_head, vn, R, H);
+        try f.pm(.dsa_expand, R, wb(w.kv_b) / 2);
         f.dsa_last = .{ .dp = dp, .qr = qr, .lat = lat, .qq = qq, .qa = qa, .ol = ol, .vn = vn };
         try f.lin(vn, w.o, R, b.part, false);
+        try f.pm(.dsa_oproj, R, wb(w.o));
     }
 
     /// cuda_mlp.zig: [gate | up], SwiGLU, down into b.part fp32.
@@ -333,7 +373,9 @@ pub const Forward = struct {
         const width: usize = w.down.k;
         const act = try b.arena.of(u16, R * width);
         try f.swiglu(b.normed, w.gu, width, R, act);
+        try f.pm(.dense_gu, R, wb(w.gu));
         try f.lin(act, w.down, R, b.part, false);
+        try f.pm(.dense_down, R, wb(w.down));
     }
 
     /// cuda_moe.zig body + fill: router logits, top-8 by sigmoid + bias (normed, x 2.5), the plan, the routed EXL3
@@ -351,6 +393,7 @@ pub const Forward = struct {
         try f.lin(b.normed, w.router, R, mlog, false);
         try nemo.select(f.l, cf(mlog), cf(w.bias), mi(pick), mf(wts), null, null, 0, int(R), int(E), int(top_k), f.cfg.routed_scale, f.cfg.norm_topk, f.s);
         if (f.force) |fc| try f.forcePicks(fc, layer, R, pick, wts);
+        try f.pm(.moe_router, R, wb(w.router));
         f.moe_last = .{ .pick = pick, .wts = wts };
         // the plan over the routed pairs (experts + 1 as G1's tests plan them); 128 pairs an item in a prompt
         const tile: usize = if (b.prompt) 128 else 8;
@@ -359,14 +402,20 @@ pub const Forward = struct {
         const items = try ar.of(i32, 3 * cap);
         const scratch: u64 = if (pairs >= 4 * hip.Launcher.route_seg) try ar.take(hip.Launcher.routeScratch(pairs, E + 1)) else 0;
         try f.l.tf_moe_route_wide(ci(pick), int(pairs), int(E + 1), int(tile), mi(members), mi(items), int(cap), scratch, f.s);
+        try f.pm(.moe_plan, R, 0);
         const ey = try ar.of(f32, pairs * D);
         try hip.exl3.run(f.ops(), exl3Experts(w.experts), b.normed, D, .{ .pick = pick, .items = items, .count = cap, .members = members, .tile = tile }, R, top_k, b.prompt, ey);
+        try f.pm(.exl3, R, 0);
+        if (f.prof) |p| try p.keepPicks(pick, R);
         const sw: usize = w.shared_down.k;
         const sact = try ar.of(u16, R * sw);
         try f.swiglu(b.normed, w.shared_gu, sw, R, sact);
+        try f.pm(.shared_gu, R, wb(w.shared_gu));
         const sy = try ar.of(f32, R * D);
         try f.lin(sact, w.shared_down, R, sy, false);
+        try f.pm(.shared_down, R, wb(w.shared_down));
         try nemo.combine(f.l, cf(ey), cf(wts), cf(sy), m(b.part), 0, int(R), int(top_k), int(D), f.s);
+        try f.pm(.moe_combine, R, 0);
         if (f.seq) |s| try f.dumpRouter(s, layer, pick, wts, R);
     }
 
@@ -396,6 +445,8 @@ pub const Forward = struct {
         f.b.arena.reset();
         const out = try f.b.arena.of(f32, rows * V);
         try f.lin(x, f.w.head, rows, out, false);
+        f.cur = -1;
+        try f.pm(if (f.drafting) .draft_head else .head, rows, wb(f.w.head));
         return out;
     }
 
@@ -417,18 +468,22 @@ pub const Forward = struct {
         try glue.rms(f.l, c(hin), @intCast(D), c(t.hnorm), m(b.mcat + D * 2), @intCast(2 * D), int(n), int(D), cfg.eps, f.s);
         try f.lin(b.mcat, t.eh, n, b.mx, true);
         try glue.rms(f.l, c(b.mx), @intCast(D), c(ly.in_norm), m(b.normed), @intCast(D), int(n), int(D), cfg.eps, f.s);
+        f.cur = 45;
+        try f.pm(.mtp_in, n, wb(t.eh));
         try f.dumpMtp(0, b.normed, true, n);
         try f.dsaBlock(st.mtp, st.mtp_pos_dev, st.mtp_len, ly.mixer.mla, n);
         try f.dumpMtp(1, b.part, false, n);
         try glue.residual(f.l, c(b.mx), m(b.mx), c(b.part), 1, 0, int(n), int(D), f.s);
         try f.dumpMtpStream(0, n);
         try glue.rms(f.l, c(b.mx), @intCast(D), c(ly.post_norm), m(b.normed), @intCast(D), int(n), int(D), cfg.eps, f.s);
+        try f.pm(.mtp_residual, n, 0);
         try f.dumpMtp(2, b.normed, true, n);
         try f.moeBlock(ly.ffn.moe, dump.router_layers - 1, n);
         try f.dumpMtp(3, b.part, false, n);
         try glue.residual(f.l, c(b.mx), m(b.mx), c(b.part), 1, 0, int(n), int(D), f.s);
         try f.dumpMtpStream(1, n);
         try glue.rms(f.l, c(b.mx), @intCast(D), c(t.norm), m(b.fnormed), @intCast(D), int(n), int(D), cfg.eps, f.s);
+        try f.pm(.mtp_residual, n, 0);
         try st.setMtpLen(f.s, st.mtp_len + n);
     }
 
@@ -453,6 +508,8 @@ pub const Forward = struct {
         if (depth == 0) return 0;
         if (follow.len == 0) return error.BadDraft;
         const kept = st.mtp_len;
+        f.drafting = true;
+        defer f.drafting = false;
         const lg = try f.host.alloc(f32, V);
         defer f.host.free(lg);
         for (0..depth) |j| {

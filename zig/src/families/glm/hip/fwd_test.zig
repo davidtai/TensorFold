@@ -14,6 +14,7 @@ const config = @import("../config.zig");
 const weights = @import("weights.zig");
 const forward = @import("forward.zig");
 const state = @import("state.zig");
+const profile = @import("profile.zig");
 
 const fmt = core.exl3_format;
 const State = state.State;
@@ -842,6 +843,30 @@ test "glm fwd: an MoE layer (router, top-8 of 288, EXL3 experts, shared) against
         try f.moeBlock(mw, 3, rows);
         const other = try t.get(f32, b.part, rows * D);
         if (std.mem.eql(u8, std.mem.sliceAsBytes(other), std.mem.sliceAsBytes(free))) return error.ForceNotLive;
+    }
+    // TF_GLM_PROFILE: with the events recorded and the picks copied aside, the block gives the same bits
+    {
+        var b = try Buffers.init(&t.r, rows, true, 64);
+        defer b.deinit();
+        var f = try t.fwd(&b);
+        try t.put(b.normed, std.mem.sliceAsBytes(x.bits[0 .. rows * D]));
+        try f.moeBlock(mw, 3, rows);
+        const off = try t.get(f32, b.part, rows * D);
+        var pf = try profile.Prof.init(std.heap.page_allocator, &t.r, t.s.handle, 64, 1 << 16);
+        defer pf.deinit();
+        f.prof = &pf;
+        f.cur = 3;
+        try t.put(b.normed, std.mem.sliceAsBytes(x.bits[0 .. rows * D]));
+        try pf.start();
+        try f.moeBlock(mw, 3, rows);
+        const on = try t.get(f32, b.part, rows * D);
+        const got = try pf.collect(a);
+        try expectSame("glm fwd MoE block with TF_GLM_PROFILE = without", std.mem.sliceAsBytes(off), std.mem.sliceAsBytes(on));
+        if (got.len != 6) return error.ProfileGroups; // router, plan, exl3, shared gu, shared down, combine
+        for (got) |g| {
+            std.debug.print("RESULT glm fwd profile MoE group {t}: {d:.1} us, {d} bytes\n", .{ g.op, g.us, g.bytes });
+            if (g.op == .exl3 and (g.bytes == 0 or g.bytes % profile.expert_bytes != 0)) return error.ProfileBytes;
+        }
     }
 }
 

@@ -70,6 +70,7 @@ fn opts(args: []const [:0]const u8) !Opts {
 /// The device side of a run: one stream's state, the prompt and decode windows, every row's hidden.
 const Run = struct {
     r: *const hip.Runtime,
+    io: std.Io,
     s: hip.Stream,
     st: State,
     pb: Buffers,
@@ -90,6 +91,8 @@ const Run = struct {
     /// Forward.keep's time by kept rows (host-timed between stream syncs), microseconds.
     keep_us: [glm.state.window_rows + 1]f64 = @splat(0),
     keep_n: [glm.state.window_rows + 1]usize = @splat(0),
+    /// TF_GLM_PROFILE: each window's GPU time by op group; null: off.
+    prof: ?*Profiler = null,
 
     fn now(io: std.Io) f64 {
         return @as(f64, @floatFromInt(std.Io.Timestamp.now(io, .awake).nanoseconds)) / 1e9;
@@ -101,7 +104,10 @@ const Run = struct {
         while (r0 < n) : (r0 += glm.state.head_rows) {
             const k: usize = @min(glm.state.head_rows, n - r0);
             const lg = try f.head(x + r0 * D * 2, k);
+            if (run.prof != null) try f.sync(); // the download alone in its time
+            const d0 = Run.now(run.io);
             try f.download(f32, lg, run.logits[0 .. k * V]);
+            if (run.prof) |pr| pr.dl += Run.now(run.io) - d0;
             for (0..k) |j| {
                 const row = run.logits[j * V ..][0..V];
                 run.hash.update(std.mem.sliceAsBytes(row));
@@ -214,6 +220,7 @@ fn promptRows(run: *Run, q: *Seq, from: usize, to: usize, chunk: usize) !void {
         const n = @min(chunk, to - at);
         run.fp.seq = q.dump;
         run.fp.row0 = at;
+        if (run.prof) |pr| try pr.begin();
         try run.fp.run(&run.st, q.ids[at..][0..n]);
         try run.keep(&run.fp, at, n);
         if (q.tf or q.dump != null) {
@@ -221,6 +228,7 @@ fn promptRows(run: *Run, q: *Seq, from: usize, to: usize, chunk: usize) !void {
         } else if (at + n == t) {
             try run.heads(&run.fp, run.fp.b.fnormed + (n - 1) * D * 2, 1, PromptRows{ .q = q, .at = t - 1 }, PromptRows.each);
         }
+        if (run.prof) |pr| try pr.end(.chunk, at, n);
     }
 }
 
@@ -293,6 +301,8 @@ fn mtpRounds(a: std.mem.Allocator, io: std.Io, run: *Run, q: *Seq, d: usize) !vo
     const r0 = Run.now(io);
     while (q.gen.items.len < q.max_gen and !q.isEos(q.gen.items[q.gen.items.len - 1])) {
         const depth = @min(d, q.max_gen - q.gen.items.len - 1);
+        const p0 = t + q.gen.items.len - 1;
+        if (run.prof) |pr| try pr.begin();
         const n = try fm.draft(&run.st, hin, follow, depth, &drafts);
         ids[0] = q.gen.items[q.gen.items.len - 1];
         @memcpy(ids[1..][0..n], drafts[0..n]);
@@ -308,6 +318,7 @@ fn mtpRounds(a: std.mem.Allocator, io: std.Io, run: *Run, q: *Seq, d: usize) !vo
         var kept: usize = 1;
         while (kept < R and out[kept - 1] == drafts[kept - 1]) kept += 1;
         try keepTimed(run, io, kept);
+        if (run.prof) |pr| try pr.end(.round, p0, kept);
         for (0..kept) |r| {
             if (q.gen.items.len >= q.max_gen or q.isEos(q.gen.items[q.gen.items.len - 1])) break;
             run.hash.update(std.mem.sliceAsBytes(run.logits[r * V ..][0..V]));
@@ -350,9 +361,11 @@ fn runSeq(a: std.mem.Allocator, io: std.Io, run: *Run, q: *Seq, chunk: usize, mt
         const row = t + q.gen.items.len - 1;
         run.fd.seq = q.dump;
         run.fd.row0 = row;
+        if (run.prof) |pr| try pr.begin();
         try run.fd.run(&run.st, q.gen.items[q.gen.items.len - 1 ..]);
         try run.keep(&run.fd, row, 1);
         try run.heads(&run.fd, run.fd.b.fnormed, 1, Greedy{ .q = q, .a = a }, Greedy.each);
+        if (run.prof) |pr| try pr.end(.step, row, 1);
     }
     try run.fd.sync();
     const t2 = Run.now(io);
@@ -371,8 +384,10 @@ fn runSeq(a: std.mem.Allocator, io: std.Io, run: *Run, q: *Seq, chunk: usize, mt
             const n = @min(chunk, rows - j0);
             run.fp.seq = q.dump;
             run.fp.row0 = j0;
+            if (run.prof) |pr| try pr.begin();
             try run.fp.mtp(&run.st, next[j0..][0..n], run.hid.base() + j0 * D * 2);
             try run.heads(&run.fp, run.fp.b.fnormed, n, MtpRows{ .q = q, .at = j0 }, MtpRows.each);
+            if (run.prof) |pr| try pr.end(.mtp, j0, n);
         }
     }
     var sum: [32]u8 = undefined;
@@ -433,6 +448,7 @@ pub fn command(init: std.process.Init, args: []const [:0]const u8) !void {
     defer l.unload();
     var rn: Run = .{
         .r = &r,
+        .io = io,
         .s = try hip.Stream.init(&r),
         .st = undefined,
         .pb = undefined,
@@ -472,6 +488,22 @@ pub fn command(init: std.process.Init, args: []const [:0]const u8) !void {
         mb = try Buffers.init(&r, glm.state.window_rows, false, capacity);
         rn.fm = try fwd.Forward.init(&l, opened.model(), cfg, rn.s.handle, &mb.?);
     }
+    // TF_GLM_PROFILE=1: GPU time by layer and op group, each window (no result changes); TSV in TF_GLM_PROFILE_OUT
+    var profiler: Profiler = undefined;
+    const prof_on = if (std.c.getenv("TF_GLM_PROFILE")) |v| std.mem.eql(u8, std.mem.span(v), "1") else false;
+    if (prof_on) {
+        profiler = .{ .p = try glm.profile.Prof.init(init.gpa, &r, rn.s.handle, 4096, 8 << 20), .a = a, .io = io };
+        rn.prof = &profiler;
+        rn.fp.prof = &profiler.p;
+        rn.fd.prof = &profiler.p;
+        if (rn.fv) |*f| f.prof = &profiler.p;
+        if (rn.fm) |*f| f.prof = &profiler.p;
+        std.debug.print("PROFILE on: GPU events between op groups\n", .{});
+    }
+    defer if (rn.prof) |pr| {
+        pr.report(if (std.c.getenv("TF_GLM_PROFILE_OUT")) |path| std.mem.span(path) else "profile.tsv") catch |err| std.debug.print("PROFILE report failed: {t}\n", .{err});
+        pr.p.deinit();
+    };
     if (dumps) |*d| {
         // TF_GLM_FORCE_PICKS=<run dir> (a diagnostic): the teacher-forced prompts take <dir>/<name>/router_picks.npy and
         // router_weights.npy at every MoE layer (G5's or a HIP dump's); greedy prompts run free
@@ -524,6 +556,99 @@ fn forceOf(a: std.mem.Allocator, io: std.Io, dir: []const u8, name: []const u8, 
     @memcpy(std.mem.sliceAsBytes(wts), wt.data);
     return .{ .picks = picks, .wts = wts, .rows = pk.shape[1] };
 }
+
+/// TF_GLM_PROFILE's windows: each prompt chunk, decode step and MTP chunk, its op groups' GPU time (profile.zig), its
+/// host wall time and the host's logits download.
+const Profiler = struct {
+    p: glm.profile.Prof,
+    a: std.mem.Allocator,
+    io: std.Io,
+    t0: f64 = 0,
+    dl: f64 = 0,
+    rows: std.ArrayList(Line) = .empty,
+    wins: std.ArrayList(Win) = .empty,
+
+    /// A prompt chunk, a serial decode step, an MTP-layer chunk, an MTP round (--mtp-draft: draft, verify window,
+    /// head, keep; its rows the kept rows).
+    const Kind = enum { chunk, step, mtp, round };
+    const Line = struct { win: usize, row: glm.profile.Row };
+    const Win = struct { kind: Kind, pos: usize, rows: usize, gpu_us: f64, wall_us: f64, dl_us: f64, class_us: [glm.profile.classes.len]f64 };
+
+    fn begin(pr: *Profiler) !void {
+        pr.dl = 0;
+        pr.t0 = Run.now(pr.io);
+        try pr.p.start();
+    }
+
+    fn end(pr: *Profiler, kind: Kind, pos: usize, rows: usize) !void {
+        const got = try pr.p.collect(pr.a);
+        var w: Win = .{ .kind = kind, .pos = pos, .rows = rows, .gpu_us = 0, .wall_us = (Run.now(pr.io) - pr.t0) * 1e6, .dl_us = pr.dl * 1e6, .class_us = @splat(0) };
+        for (got) |row| {
+            w.gpu_us += row.us;
+            for (glm.profile.classes, 0..) |c, i| if (std.mem.eql(u8, c, row.op.class())) {
+                w.class_us[i] += row.us;
+            };
+            try pr.rows.append(pr.a, .{ .win = pr.wins.items.len, .row = row });
+        }
+        try pr.wins.append(pr.a, w);
+    }
+
+    fn summary(pr: *const Profiler, label: []const u8, ws: []const Win) void {
+        if (ws.len == 0) return;
+        var cls: [glm.profile.classes.len]f64 = @splat(0);
+        var gpu: f64 = 0;
+        var wall: f64 = 0;
+        var dl: f64 = 0;
+        for (ws) |w| {
+            for (&cls, w.class_us) |*o, v| o.* += v;
+            gpu += w.gpu_us;
+            wall += w.wall_us;
+            dl += w.dl_us;
+        }
+        const nf: f64 = @floatFromInt(ws.len);
+        std.debug.print("PROFILE {s} ({d} window{s}, {d} rows): GPU {d:.1} ms, host wall {d:.1} ms, host logits download {d:.2} ms (means)\n", .{ label, ws.len, if (ws.len == 1) "" else "s", ws[0].rows, gpu / nf / 1e3, wall / nf / 1e3, dl / nf / 1e3 });
+        for (glm.profile.classes, cls) |c, v| if (v > 0) std.debug.print("  {s:<16} {d:>10.1} us {d:>6.2} %\n", .{ c, v / nf, 100 * v / gpu });
+        _ = pr;
+    }
+
+    fn report(pr: *const Profiler, path: []const u8) !void {
+        var t: std.Io.Writer.Allocating = .init(pr.a);
+        try t.writer.writeAll("window\tpos\twin_rows\tlayer\top\tclass\trows\tus\tbytes\n");
+        for (pr.rows.items) |ln| {
+            const w = pr.wins.items[ln.win];
+            try t.writer.print("{t}\t{d}\t{d}\t{d}\t{t}\t{s}\t{d}\t{d:.2}\t{d}\n", .{ w.kind, w.pos, w.rows, ln.row.layer, ln.row.op, ln.row.op.class(), ln.row.rows, ln.row.us, ln.row.bytes });
+        }
+        for (pr.wins.items) |w| try t.writer.print("{t}\t{d}\t{d}\t-\twindow\tgpu {d:.1} us; host wall {d:.1} us; host logits download {d:.1} us\t{d}\t{d:.2}\t0\n", .{ w.kind, w.pos, w.rows, w.gpu_us, w.wall_us, w.dl_us, w.rows, w.gpu_us });
+        try std.Io.Dir.cwd().writeFile(pr.io, .{ .sub_path = path, .data = t.written() });
+        std.debug.print("PROFILE TSV {s}: {d} groups in {d} windows\n", .{ path, pr.rows.items.len, pr.wins.items.len });
+        // the cases: the first and the last prompt chunk, the decode steps, the MTP chunks
+        var first: ?usize = null;
+        var last: ?usize = null;
+        var steps: std.ArrayList(Win) = .empty;
+        var mtps: std.ArrayList(Win) = .empty;
+        var rounds: std.ArrayList(Win) = .empty;
+        for (pr.wins.items, 0..) |w, i| switch (w.kind) {
+            .chunk => {
+                if (first == null) first = i;
+                last = i;
+            },
+            .step => try steps.append(pr.a, w),
+            .mtp => try mtps.append(pr.a, w),
+            .round => try rounds.append(pr.a, w),
+        };
+        var buf: [64]u8 = undefined;
+        if (first) |i| pr.summary(try std.fmt.bufPrint(&buf, "prompt chunk at {d}", .{pr.wins.items[i].pos}), pr.wins.items[i .. i + 1]);
+        if (last) |i| if (i != first.?) pr.summary(try std.fmt.bufPrint(&buf, "prompt chunk at {d}", .{pr.wins.items[i].pos}), pr.wins.items[i .. i + 1]);
+        pr.summary("decode step", steps.items);
+        pr.summary("MTP chunk", mtps.items);
+        pr.summary("MTP round", rounds.items);
+        if (rounds.items.len > 0) {
+            var kept: usize = 0;
+            for (rounds.items) |w| kept += w.rows;
+            std.debug.print("PROFILE MTP rounds: {d:.2} kept rows a round\n", .{@as(f64, @floatFromInt(kept)) / @as(f64, @floatFromInt(rounds.items.len))});
+        }
+    }
+};
 
 fn gib(n: usize) f64 {
     return @as(f64, @floatFromInt(n)) / (1 << 30);
