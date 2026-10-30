@@ -810,3 +810,119 @@ test "glm fwd: an MoE layer (router, top-8 of 288, EXL3 experts, shared) against
     }
     try expectSame("glm fwd MoE block: 300 rows = 100 x 3", std.mem.sliceAsBytes(outs[0]), std.mem.sliceAsBytes(outs[1]));
 }
+
+// ---- the DSA block on real weights, op by op (TF_GLM_DIR: the checkpoint; TF_GLM_FWD_DUMP: a TF_GLM_DUMP prompt dir) ----
+
+/// A checkpoint's tensors by name through model.safetensors.index.json (the shards mapped on first use).
+const Shards = struct {
+    dir: []const u8,
+    index: std.json.Parsed(std.json.Value),
+    files: std.StringHashMapUnmanaged(core.safetensors.File) = .empty,
+
+    fn open(a: std.mem.Allocator, dir: []const u8) !Shards {
+        const text = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, try std.fs.path.join(a, &.{ dir, "model.safetensors.index.json" }), a, .limited(1 << 28));
+        return .{ .dir = dir, .index = try std.json.parseFromSlice(std.json.Value, a, text, .{}) };
+    }
+
+    fn get(s: *Shards, a: std.mem.Allocator, name: []const u8) !core.safetensors.Tensor {
+        const shard = (s.index.value.object.get("weight_map").?.object.get(name) orelse return error.NoTensor).string;
+        const f = try s.files.getOrPut(a, shard);
+        if (!f.found_existing) f.value_ptr.* = try core.safetensors.File.open(a, std.testing.io, try std.fs.path.join(a, &.{ s.dir, shard }));
+        return f.value_ptr.get(name) orelse error.NoTensor;
+    }
+
+    /// Tensors one after another in one device buffer (G0's pieces: a row stack when they share K).
+    fn stack(s: *Shards, t: *Rig, names: []const []const u8) !u64 {
+        const a = t.a();
+        var bytes: std.ArrayList(u8) = .empty;
+        for (names) |n| try bytes.appendSlice(a, (try s.get(a, try std.fmt.allocPrint(a, "model.language_model.{s}", .{n}))).bytes);
+        return t.up(bytes.items);
+    }
+};
+
+fn cat(a: std.mem.Allocator, p: []const u8, s: []const u8) []const u8 {
+    return std.fmt.allocPrint(a, "{s}{s}", .{ p, s }) catch unreachable;
+}
+
+fn oneTensor(sh: *Shards, t: *Rig, p: []const u8, name: []const u8) !u64 {
+    return sh.stack(t, &.{cat(t.a(), p, name)});
+}
+
+fn writeNpy(a: std.mem.Allocator, dir: []const u8, name: []const u8, comptime T: type, shape: []const usize, data: []const T) !void {
+    const dump = @import("dump.zig");
+    const bytes = try dump.npyBytes(a, T, shape, data);
+    const path = try std.fs.path.join(a, &.{ dir, name });
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data = bytes });
+}
+
+test "glm fwd: layer 3's DSA block on the checkpoint's weights from a dumped mixer input, every intermediate written for the float64 op check" {
+    const dir = std.mem.span(std.c.getenv("TF_GLM_DIR") orelse return error.SkipZigTest);
+    const dump_dir = std.mem.span(std.c.getenv("TF_GLM_FWD_DUMP") orelse return error.SkipZigTest);
+    const out_dir = std.mem.span(std.c.getenv("TF_GLM_FWD_OUT") orelse return error.SkipZigTest);
+    const t = try Rig.open();
+    defer t.close();
+    const a = t.a();
+    const L = 3;
+    const R = 64;
+    var sh = try Shards.open(a, dir);
+    const pre = try std.fmt.allocPrint(a, "layers.{d}.self_attn.", .{L});
+    const c: config.Config = .{};
+    const xw = try sh.stack(t, &.{ cat(a, pre, "q_a_proj.weight"), cat(a, pre, "kv_a_proj_with_mqa.weight"), cat(a, pre, "indexer.wk.weight"), cat(a, pre, "indexer.weights_proj.weight") });
+    const qr = try sh.stack(t, &.{ cat(a, pre, "q_b_proj.weight"), cat(a, pre, "indexer.wq_b.weight") });
+    const kvb = try oneTensor(&sh, t, pre, "kv_b_proj.weight");
+    const sub_x = weights.Bf16{ .w = xw, .n = 1, .k = D };
+    const w: weights.Mla = .{
+        .x = .{ .w = xw, .n = c.xProj(), .k = D },
+        .q_a = sub_x,
+        .kv_a = sub_x,
+        .qr = .{ .w = qr, .n = c.qrProj(), .k = c.q_lora },
+        .q_b = .{ .w = qr, .n = 1, .k = c.q_lora },
+        .q_norm = try oneTensor(&sh, t, pre, "q_a_layernorm.weight"),
+        .kv_norm = try oneTensor(&sh, t, pre, "kv_a_layernorm.weight"),
+        .kv_b = .{ .w = kvb, .n = 32768, .k = 512 },
+        .o = .{ .w = try oneTensor(&sh, t, pre, "o_proj.weight"), .n = D, .k = 16384 },
+        .index = .{
+            .wk = sub_x,
+            .weights = sub_x,
+            .wq_b = sub_x,
+            .ln_w = try oneTensor(&sh, t, pre, "indexer.k_norm.weight"),
+            .ln_b = try oneTensor(&sh, t, pre, "indexer.k_norm.bias"),
+            .gate = .{ .w = try oneTensor(&sh, t, pre, "indexer.index_kpool_compress_gate"), .n = 128, .k = D },
+            .ape = try oneTensor(&sh, t, pre, "indexer.index_kpool_compress_ape"),
+        },
+    };
+    // the dumped mixer input of layer L (sublayers [L][j][0], j = positions 0..63): bf16 values held as fp32
+    const sub_bytes = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, try std.fs.path.join(a, &.{ dump_dir, "sublayers.npy" }), a, .limited(1 << 32));
+    const arr = try core.npy.parse(sub_bytes);
+    const P = arr.shape[1];
+    const vals = std.mem.bytesAsSlice(f32, arr.data);
+    const xin = try a.alloc(u16, R * D);
+    for (0..R) |j| for (0..D) |k| {
+        const v: u32 = @bitCast(vals[((L * P + j) * 4 + 0) * D + k]);
+        if (v & 0xffff != 0) return error.NotBf16;
+        xin[j * D + k] = @intCast(v >> 16);
+    };
+    var st = try State.init(&t.r, 128);
+    defer st.deinit();
+    try st.reset(t.s.handle);
+    var b = try Buffers.init(&t.r, R, true, 128);
+    defer b.deinit();
+    var f = try t.fwd(&b);
+    try t.put(b.normed, std.mem.sliceAsBytes(xin));
+    try st.ready(t.s.handle, R);
+    try f.dsaBlock(st.caches[0], st.pos_dev, 0, w, R);
+    const d = f.dsa_last;
+    const H: usize = 64;
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, out_dir);
+    try writeNpy(a, out_dir, "x.npy", u16, &.{ R, D }, xin);
+    try writeNpy(a, out_dir, "dp.npy", u16, &.{ R, c.xProj() }, try t.get(u16, d.dp, R * c.xProj()));
+    try writeNpy(a, out_dir, "qr.npy", u16, &.{ R, c.q_lora }, try t.get(u16, d.qr, R * c.q_lora));
+    try writeNpy(a, out_dir, "lat.npy", u16, &.{ R, 512 }, try t.get(u16, d.lat, R * 512));
+    try writeNpy(a, out_dir, "cache.npy", u16, &.{ R, 512 }, try t.get(u16, st.caches[0].lc, R * 512));
+    try writeNpy(a, out_dir, "qq.npy", u16, &.{ R, c.qrProj() }, try t.get(u16, d.qq, R * c.qrProj()));
+    try writeNpy(a, out_dir, "qa.npy", u16, &.{ R, H, 512 }, try t.get(u16, d.qa, R * H * 512));
+    try writeNpy(a, out_dir, "ol.npy", u16, &.{ R, H, 512 }, try t.get(u16, d.ol, R * H * 512));
+    try writeNpy(a, out_dir, "vn.npy", u16, &.{ R, H * 256 }, try t.get(u16, d.vn, R * H * 256));
+    try writeNpy(a, out_dir, "part.npy", f32, &.{ R, D }, try t.get(f32, b.part, R * D));
+    std.debug.print("RESULT glm fwd DSA layer {d} on real weights: {d} rows, intermediates in {s}\n", .{ L, R, out_dir });
+}
