@@ -70,6 +70,14 @@ pub const policy_prefill_step: u32 = state.prompt_rows;
 pub const max_drafts: u32 = 0;
 pub const confidence_refusal = "--mtp-confidence: GLM-5.3-Flash on HIP drafts nothing yet (serial decode); serve it without --mtp-confidence";
 
+/// The GLM forward launches the exact kernels only (lane F's launcher, numerics=exact): another policy is refused.
+pub const inexact_refusal = "GLM-5.3-Flash on HIP runs numerics=exact only (no inexact path yet): serve it without --policy numerics=inexact";
+
+/// Why `policy` cannot serve GLM-5.3-Flash on HIP, or null.
+pub fn numericsRefused(policy: hip.Policy) ?[]const u8 {
+    return if (policy.numerics != .exact) inexact_refusal else null;
+}
+
 /// MemAvailable the streams leave at least: the load's floor (the harness watchdog stops a server under 6 GiB).
 const floor: u64 = (load.Options{}).floor;
 
@@ -104,6 +112,7 @@ pub fn open(
     problem: *[]const u8,
 ) anyerror!Loaded {
     _ = try check(a, gpa, io, dir, problem);
+    if (numericsRefused(dev.policy)) |why| return refuse(a, problem, "{s}", .{why});
     if (o.world > 1) return refuse(a, problem, "GLM-5.3-Flash on HIP runs on one device: serve it with --tp 1", .{});
     if (o.cache_gib) |g| if (g > 0) return refuse(a, problem, "GLM-5.3-Flash on HIP keeps no prompt cache yet: serve it with --prompt-cache-gib 0", .{});
     const capacity = std.mem.alignForward(usize, o.window + 8, 64); // cuda_state.zig's align64(context + 8)
@@ -195,4 +204,12 @@ test "GLM on HIP admits EXL3 4-bit mcg at the whole shape and refuses the rest b
     try std.testing.expectStringStartsWith(problem, "d/config.json: EXL3 at 3 bits: the HIP family reads 4-bit EXL3 experts");
     try std.testing.expectError(error.Refused, admit(a, std.testing.allocator, "d", "{\"quantization_config\": {\"quant_method\": \"exl3\", \"bits\": 4, \"codebook\": \"mcg\"}}", &problem));
     try std.testing.expectStringStartsWith(problem, "d is not a GLM-5.3-Flash checkpoint");
+}
+
+test "GLM on HIP serves numerics=exact only: an inexact policy is refused by name" {
+    var p: hip.Policy = .{};
+    try std.testing.expect(numericsRefused(p) == null);
+    p.numerics = .inexact;
+    try std.testing.expectEqualStrings(inexact_refusal, numericsRefused(p).?);
+    try std.testing.expect(std.mem.indexOf(u8, numericsRefused(p).?, "numerics=exact only") != null);
 }
