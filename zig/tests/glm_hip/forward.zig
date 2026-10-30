@@ -1,5 +1,6 @@
 //! tf-glm-hip-test forward: GLM-5.3-Flash's eager forward (zig/src/families/glm/hip/forward.zig) on a whole checkpoint.
-//!   forward <checkpoint> <ids.u32> [--gen N] [--chunk R] [--tf] [--mtp] [--decode-from P [--decode-to E [--resume-mark]]]
+//!   forward <checkpoint> <ids.u32> [--gen N] [--chunk R] [--tf] [--mtp] [--mtp-draft d]
+//!           [--decode-from P [--decode-to E [--resume-mark]] [--window W --keep K]]
 //!     ids.u32: uint32 little-endian token ids (G5's <prompt>/ids.u32). The prompt in chunks of R rows (default
 //!     2,048), then N greedy tokens (default 16; the first from the last prompt row), ties to the lower id.
 //!     --tf: lm_head over every prompt row: teacher-forced NLL, perplexity and top-1 (G5's teacher_forced).
@@ -10,6 +11,12 @@
 //!     --decode-to E (default: the prompt's end): rows E .. on the prompt path again, from the decode cut.
 //!     --resume-mark: the state is kept at P (a prompt-path mark); after the decode rows (their heads and dumps
 //!     discarded) it is restored and rows P .. on the prompt path again: a next turn re-prefilling the reply.
+//!     --window W --keep K: the decode rows from P in verify windows of W rows (Forward.window, at most 8), each
+//!     keeping its first K (Forward.keep; the next window starts there and rewrites the rest): the MTP rounds' window
+//!     and rollback on the given ids. The kept rows' heads as prompt rows'.
+//!     --mtp-draft d: greedy decode in MTP rounds (Forward.draft, window, keep): d drafts (at most 3) from the MTP
+//!     layer, the pending token and the drafts in one window, the rows up to the first rejected draft kept. The ids
+//!     and the LOGITS sha (the kept rows') equal the plain greedy run's when a window row has a serial row's bits.
 //!     Prints the generated ids and sha256 of every logits row computed (the numerics=exact hash; the same for any R).
 //!   forward <checkpoint> - [--chunk R]   with TF_GLM_DUMP and TF_GLM_DUMP_REF set: every prompt of the reference
 //!     run, as run_ref.py runs it (teacher-forced prompt, greedy gen, the MTP pass), dumped in G5-ref.md section 4's
@@ -27,15 +34,15 @@ const V: usize = dump.V;
 
 const usage =
     \\usage: tf-glm-hip-test forward <checkpoint> <ids.u32 | -> [--gen N] [--chunk R] [--tf] [--mtp]
-    \\       [--decode-from P [--decode-to E [--resume-mark]]]
+    \\       [--mtp-draft d] [--decode-from P [--decode-to E [--resume-mark]] [--window W --keep K]]
     \\       (ids "-": the prompts of TF_GLM_DUMP_REF, dumped into TF_GLM_DUMP)
     \\
 ;
 
-const Opts = struct { gen: usize = 16, chunk: usize = glm.state.prompt_rows, tf: bool = false, mtp: bool = false, seam: Seam = .{} };
+const Opts = struct { gen: usize = 16, chunk: usize = glm.state.prompt_rows, tf: bool = false, mtp: bool = false, seam: Seam = .{}, draft: ?usize = null };
 
-/// The prompt/decode seam test's cuts (all null: the plain run).
-const Seam = struct { from: ?usize = null, to: ?usize = null, mark: bool = false };
+/// The prompt/decode seam test's cuts (all null: the plain run); `window` > 0: the decode rows in verify windows.
+const Seam = struct { from: ?usize = null, to: ?usize = null, mark: bool = false, window: usize = 0, keep: usize = 0 };
 
 fn opts(args: []const [:0]const u8) !Opts {
     var o: Opts = .{};
@@ -45,13 +52,18 @@ fn opts(args: []const [:0]const u8) !Opts {
         if (std.mem.eql(u8, a, "--tf")) o.tf = true else if (std.mem.eql(u8, a, "--mtp")) o.mtp = true else if (std.mem.eql(u8, a, "--resume-mark")) o.seam.mark = true else {
             if (i + 1 >= args.len) return error.MissingArgument;
             const v = try std.fmt.parseInt(usize, args[i + 1], 10);
-            if (std.mem.eql(u8, a, "--gen")) o.gen = v else if (std.mem.eql(u8, a, "--chunk")) o.chunk = v else if (std.mem.eql(u8, a, "--decode-from")) o.seam.from = v else if (std.mem.eql(u8, a, "--decode-to")) o.seam.to = v else return error.UnknownOption;
+            if (std.mem.eql(u8, a, "--gen")) o.gen = v else if (std.mem.eql(u8, a, "--chunk")) o.chunk = v else if (std.mem.eql(u8, a, "--decode-from")) o.seam.from = v else if (std.mem.eql(u8, a, "--decode-to")) o.seam.to = v else if (std.mem.eql(u8, a, "--window")) o.seam.window = v else if (std.mem.eql(u8, a, "--keep")) o.seam.keep = v else if (std.mem.eql(u8, a, "--mtp-draft")) o.draft = v else return error.UnknownOption;
             i += 1;
         }
     }
     if (o.chunk == 0 or o.chunk > glm.state.prompt_rows) return error.BadChunk;
     if ((o.seam.to != null or o.seam.mark) and o.seam.from == null) return error.DecodeToWithoutDecodeFrom;
     if (o.seam.mark and o.seam.to == null) return error.ResumeMarkWithoutDecodeTo;
+    if (o.seam.window > 0 or o.seam.keep > 0) {
+        if (o.seam.from == null or o.seam.mark) return error.WindowNeedsDecodeFromWithoutMark;
+        if (o.seam.window > glm.state.window_rows or o.seam.keep == 0 or o.seam.keep > o.seam.window) return error.BadWindowKeep;
+    }
+    if (o.draft) |d| if (d > fwd.Forward.max_drafts or o.mtp or o.seam.from != null) return error.BadMtpDraft;
     return o;
 }
 
@@ -71,6 +83,13 @@ const Run = struct {
     /// --resume-mark: the state's leading part (positions, KDA conv windows and states, the KDA window buffers) at
     /// the mark; the DSA caches past the mark are rewritten before they are read.
     mark: ?hip.DeviceBuffer = null,
+    /// --window, --mtp-draft: the verify windows' Forward (decode buffers of state.window_rows rows) and the MTP
+    /// drafts' (their own buffers: a draft reads the window's final-normed rows).
+    fv: ?fwd.Forward = null,
+    fm: ?fwd.Forward = null,
+    /// Forward.keep's time by kept rows (host-timed between stream syncs), microseconds.
+    keep_us: [glm.state.window_rows + 1]f64 = @splat(0),
+    keep_n: [glm.state.window_rows + 1]usize = @splat(0),
 
     fn now(io: std.Io) f64 {
         return @as(f64, @floatFromInt(std.Io.Timestamp.now(io, .awake).nanoseconds)) / 1e9;
@@ -205,6 +224,37 @@ fn promptRows(run: *Run, q: *Seq, from: usize, to: usize, chunk: usize) !void {
     }
 }
 
+/// Forward.keep of `rows`, timed.
+fn keepTimed(run: *Run, io: std.Io, rows: usize) !void {
+    const f = &run.fv.?;
+    try f.sync();
+    const k0 = Run.now(io);
+    try f.keep(&run.st, rows);
+    try f.sync();
+    run.keep_us[rows] += (Run.now(io) - k0) * 1e6;
+    run.keep_n[rows] += 1;
+}
+
+/// The prompt's rows [from, to) in verify windows of `w` rows on the given ids, each keeping its first `k` (the
+/// last window what is left): the kept rows' heads as prompt rows'.
+fn windowRows(run: *Run, io: std.Io, q: *Seq, from: usize, to: usize, w: usize, k: usize) !void {
+    const t = q.ids.len;
+    const f = &run.fv.?;
+    var at = from;
+    while (at < to) {
+        const n = @min(w, to - at);
+        const kept = @min(k, n);
+        f.seq = q.dump;
+        f.row0 = at;
+        try f.window(&run.st, q.ids[at..][0..n]);
+        try run.keep(f, at, kept);
+        for (0..kept) |r| if (q.tf or q.dump != null or at + r + 1 == t)
+            try run.heads(f, f.b.fnormed + r * D * 2, 1, PromptRows{ .q = q, .at = at + r }, PromptRows.each);
+        try keepTimed(run, io, kept);
+        at += kept;
+    }
+}
+
 /// The prompt's rows [from, to) one at a time on the decode path (the given ids); `discard`: no heads, no dumps.
 fn decodeRows(run: *Run, q: *Seq, from: usize, to: usize, discard: bool) !void {
     const t = q.ids.len;
@@ -218,7 +268,62 @@ fn decodeRows(run: *Run, q: *Seq, from: usize, to: usize, discard: bool) !void {
     }
 }
 
-fn runSeq(a: std.mem.Allocator, io: std.Io, run: *Run, q: *Seq, chunk: usize, mtp: bool, seam: Seam) !void {
+/// Greedy decode in MTP rounds after the prompt (q.gen holds the first token): the MTP layer absorbs the prompt's
+/// rows j < t - 1 on the prompt path, then each round drafts, verifies the pending token and the drafts in one
+/// window, keeps the rows up to the first rejected draft, and hashes the kept rows' logits (the plain run's rows).
+fn mtpRounds(a: std.mem.Allocator, io: std.Io, run: *Run, q: *Seq, d: usize) !void {
+    const t = q.ids.len;
+    const fv = &run.fv.?;
+    const fm = &run.fm.?;
+    // the prompt's pairs (h_j, token j + 1) for j < t - 1, on the prompt buffers (the server's prefill)
+    var j0: usize = 0;
+    while (j0 + 1 < t) : (j0 += run.fp.b.rows) {
+        const n = @min(run.fp.b.rows, t - 1 - j0);
+        run.fp.seq = null;
+        try run.fp.mtp(&run.st, q.ids[j0 + 1 ..][0..n], run.hid.base() + j0 * D * 2);
+    }
+    var drafts: [fwd.Forward.max_drafts]u32 = undefined;
+    var ids: [fwd.Forward.max_drafts + 1]u32 = undefined;
+    var out: [fwd.Forward.max_drafts + 1]u32 = undefined;
+    var hin: u64 = run.hid.base() + (t - 1) * D * 2; // the first draft: the last prompt row and the first token
+    var follow: []const u32 = q.gen.items[0..1];
+    var rounds: usize = 0;
+    var drafted: usize = 0;
+    var accepted: usize = 0;
+    const r0 = Run.now(io);
+    while (q.gen.items.len < q.max_gen and !q.isEos(q.gen.items[q.gen.items.len - 1])) {
+        const depth = @min(d, q.max_gen - q.gen.items.len - 1);
+        const n = try fm.draft(&run.st, hin, follow, depth, &drafts);
+        ids[0] = q.gen.items[q.gen.items.len - 1];
+        @memcpy(ids[1..][0..n], drafts[0..n]);
+        const R = n + 1;
+        const row = t + q.gen.items.len - 1;
+        fv.seq = null;
+        fv.row0 = row;
+        try fv.window(&run.st, ids[0..R]);
+        try run.keep(fv, row, R);
+        const lg = try fv.head(fv.b.fnormed, R);
+        try fv.download(f32, lg, run.logits[0 .. R * V]);
+        for (0..R) |r| out[r] = @intCast(dump.top8(run.logits[r * V ..][0..V]).ids[0]);
+        var kept: usize = 1;
+        while (kept < R and out[kept - 1] == drafts[kept - 1]) kept += 1;
+        try keepTimed(run, io, kept);
+        for (0..kept) |r| {
+            if (q.gen.items.len >= q.max_gen or q.isEos(q.gen.items[q.gen.items.len - 1])) break;
+            run.hash.update(std.mem.sliceAsBytes(run.logits[r * V ..][0..V]));
+            try q.gen.append(a, out[r]);
+        }
+        rounds += 1;
+        drafted += n;
+        accepted += kept - 1;
+        hin = fv.b.fnormed;
+        follow = out[0..kept];
+    }
+    const secs = Run.now(io) - r0;
+    std.debug.print("MTP-DRAFT d {d}: {d} rounds in {d:.2} s, {d} of {d} drafts accepted ({d:.3}), {d:.2} tokens a round, {d:.2} tok/s\n", .{ d, rounds, secs, accepted, drafted, @as(f64, @floatFromInt(accepted)) / @as(f64, @floatFromInt(@max(drafted, 1))), @as(f64, @floatFromInt(q.gen.items.len - 1)) / @as(f64, @floatFromInt(@max(rounds, 1))), @as(f64, @floatFromInt(q.gen.items.len - 1)) / secs });
+}
+
+fn runSeq(a: std.mem.Allocator, io: std.Io, run: *Run, q: *Seq, chunk: usize, mtp: bool, seam: Seam, draft: ?usize) !void {
     const t = q.ids.len;
     try run.st.reset(run.s.handle);
     run.hash = .init(.{});
@@ -230,16 +335,18 @@ fn runSeq(a: std.mem.Allocator, io: std.Io, run: *Run, q: *Seq, chunk: usize, mt
     const mark = seam.mark and e > p;
     try promptRows(run, q, 0, p, chunk);
     const at_mark: ?State = if (mark) try run.saveMark() else null;
-    try decodeRows(run, q, p, e, mark);
+    if (seam.window > 0) try windowRows(run, io, q, p, e, seam.window, seam.keep) else try decodeRows(run, q, p, e, mark);
     if (at_mark) |m| try run.restoreMark(m);
     try promptRows(run, q, if (mark) p else e, t, chunk);
     try run.fp.sync();
     try run.fd.sync();
-    if (p < t) std.debug.print("SEAM rows {d}-{d} by serial decode{s}; prompt rows {d}-{d} after it{s}\n", .{ p, e -| 1, if (mark) " (discarded)" else "", if (mark) p else e, t -| 1, if (mark) ", from the state kept at the mark" else ", from the decode cut" });
+    if (p < t) std.debug.print("SEAM rows {d}-{d} by {s}{s}; prompt rows {d}-{d} after it{s}\n", .{ p, e -| 1, if (seam.window > 0) "verify windows" else "serial decode", if (mark) " (discarded)" else "", if (mark) p else e, t -| 1, if (mark) ", from the state kept at the mark" else ", from the decode cut" });
+    if (seam.window > 0) std.debug.print("SEAM windows of {d} rows keeping {d}\n", .{ seam.window, seam.keep });
     const t1 = Run.now(io);
-    // 2. greedy: the first token from the last prompt row, then one row a step
+    // 2. greedy: the first token from the last prompt row, then one row a step (or MTP rounds)
     try q.gen.append(a, q.last);
-    while (q.gen.items.len < q.max_gen and !q.isEos(q.gen.items[q.gen.items.len - 1])) {
+    if (draft) |d| try mtpRounds(a, io, run, q, d);
+    while (draft == null and q.gen.items.len < q.max_gen and !q.isEos(q.gen.items[q.gen.items.len - 1])) {
         const row = t + q.gen.items.len - 1;
         run.fd.seq = q.dump;
         run.fd.row0 = row;
@@ -351,6 +458,20 @@ pub fn command(init: std.process.Init, args: []const [:0]const u8) !void {
     std.debug.print("FORWARD context {d}: state {d:.3} GiB, prompt buffers {d:.3} GiB\n", .{ capacity, gib(State.bytes(capacity)), gib(rn.pb.arena.len + rn.pb.buf.len) });
     rn.fp = try fwd.Forward.init(&l, opened.model(), cfg, rn.s.handle, &rn.pb);
     rn.fd = try fwd.Forward.init(&l, opened.model(), cfg, rn.s.handle, &rn.db);
+    // --window, --mtp-draft: the verify windows' and the MTP drafts' decode buffers
+    var wb: ?Buffers = null;
+    var mb: ?Buffers = null;
+    defer if (wb) |*b| b.deinit();
+    defer if (mb) |*b| b.deinit();
+    if (o.seam.window > 0 or o.draft != null) {
+        wb = try Buffers.init(&r, glm.state.window_rows, false, capacity);
+        rn.fv = try fwd.Forward.init(&l, opened.model(), cfg, rn.s.handle, &wb.?);
+    }
+    if (o.draft != null) {
+        if (dumps != null) return error.MtpDraftWithDump;
+        mb = try Buffers.init(&r, glm.state.window_rows, false, capacity);
+        rn.fm = try fwd.Forward.init(&l, opened.model(), cfg, rn.s.handle, &mb.?);
+    }
     if (dumps) |*d| {
         // TF_GLM_FORCE_PICKS=<run dir> (a diagnostic): the teacher-forced prompts take <dir>/<name>/router_picks.npy and
         // router_weights.npy at every MoE layer (G5's or a HIP dump's); greedy prompts run free
@@ -367,7 +488,7 @@ pub fn command(init: std.process.Init, args: []const [:0]const u8) !void {
             }
             std.debug.print("== {s}: {d} ids, gen {d}{s}\n", .{ p.name, p.ids.len, p.gen, if (forced) ", routing FORCED" else "" });
             if (forced) std.debug.print("FORCED picks and weights from {s}/{s}\n", .{ force_dir.?, p.name });
-            try runSeq(a, io, &rn, &q, o.chunk, true, o.seam);
+            try runSeq(a, io, &rn, &q, o.chunk, true, o.seam, null);
             rn.fp.force = null;
             rn.fd.force = null;
             try sq.close();
@@ -377,7 +498,8 @@ pub fn command(init: std.process.Init, args: []const [:0]const u8) !void {
         return;
     }
     var q: Seq = .{ .ids = ids, .max_gen = @max(o.gen, 1), .eos = eos, .tf = o.tf, .dump = null };
-    try runSeq(a, io, &rn, &q, o.chunk, o.mtp, o.seam);
+    try runSeq(a, io, &rn, &q, o.chunk, o.mtp, o.seam, o.draft);
+    for (rn.keep_n, rn.keep_us, 0..) |n, us, k| if (n > 0) std.debug.print("KEEP {d} rows: {d} keeps, {d:.1} us each (host-timed between syncs)\n", .{ k, n, us / @as(f64, @floatFromInt(n)) });
     std.debug.print("FORWARD OK\n", .{});
 }
 

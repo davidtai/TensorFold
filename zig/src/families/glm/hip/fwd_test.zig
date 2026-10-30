@@ -845,6 +845,182 @@ test "glm fwd: an MoE layer (router, top-8 of 288, EXL3 experts, shared) against
     }
 }
 
+// ---- verify windows (the MTP rounds): a window's rows and its keep = the serial decode rows (LANES.md contract 7) ----
+
+/// The windows: (rows, kept) from the first decode row on; each starts at the rows kept so far. A rejected row
+/// completes a DSA pool (at 2,056 + 1: rows 2,057-2,060 keep 2), and every keep 1-4 occurs.
+const sched = [_][2]usize{ .{ 3, 1 }, .{ 4, 2 }, .{ 2, 2 }, .{ 4, 3 }, .{ 3, 3 }, .{ 2, 1 }, .{ 4, 4 } };
+const sched_rows = 16; // the serial rows the windows read: the last starts at 12 with 4 rows
+
+fn sameRows(name: []const u8, at: usize, got: []const f32, want: []const f32) !void {
+    const gb: []const u32 = @ptrCast(got);
+    const wb: []const u32 = @ptrCast(want);
+    if (std.mem.eql(u32, gb, wb)) return;
+    var first: usize = 0;
+    while (gb[first] == wb[first]) first += 1;
+    std.debug.print("FAIL {s}: the window from decode row {d}: row {d} value {d}: {d} not {d}\n", .{ name, at, first / D, first % D, got[first], want[first] });
+    return error.TestExpectedEqual;
+}
+
+test "glm fwd: verify windows (2-4 decode rows) and keep 1-4 = the serial decode rows, bit for bit: KDA (state, conv window), DSA (dense, listed with a rejected row completing a pool)" {
+    const t = try Rig.open();
+    defer t.close();
+    const a = t.a();
+    var rng: Rng = .{ .state = 0x3e_71f7 };
+    // KDA: 20 prompt rows, then 16 decode rows serially / in the windows; the state and conv window after each keep
+    {
+        const kw = try KdaW.make(t, &rng);
+        const cap = 512;
+        const pre = 20;
+        const x = try bfs(t, &rng, (pre + sched_rows) * D, 1.0);
+        const S = heads * dk * dk;
+        const C = 3 * 3 * n_kda;
+        const sp = try a.alloc(f32, sched_rows * D);
+        const srec = try a.alloc(f32, sched_rows * S);
+        const sconv = try a.alloc(u16, sched_rows * C);
+        {
+            var st = try State.init(&t.r, cap);
+            defer st.deinit();
+            var pb = try Buffers.init(&t.r, pre, true, cap);
+            defer pb.deinit();
+            var db = try Buffers.init(&t.r, 1, false, cap);
+            defer db.deinit();
+            var fp = try t.fwd(&pb);
+            var fd = try t.fwd(&db);
+            try t.put(pb.normed, std.mem.sliceAsBytes(x.bits[0 .. pre * D]));
+            try fp.kdaBlock(&st, 0, kw.w, pre);
+            for (0..sched_rows) |r| {
+                try t.put(db.normed, std.mem.sliceAsBytes(x.bits[(pre + r) * D ..][0..D]));
+                try fd.kdaBlock(&st, 0, kw.w, 1);
+                @memcpy(sp[r * D ..][0..D], try t.get(f32, db.part, D));
+                @memcpy(srec[r * S ..][0..S], try t.get(f32, st.recAt(0), S));
+                @memcpy(sconv[r * C ..][0..C], try t.get(u16, st.convAt(0), C));
+            }
+        }
+        var st = try State.init(&t.r, cap);
+        defer st.deinit();
+        var pb = try Buffers.init(&t.r, pre, true, cap);
+        defer pb.deinit();
+        var wb = try Buffers.init(&t.r, state.window_rows, false, cap);
+        defer wb.deinit();
+        var fp = try t.fwd(&pb);
+        var fw = try t.fwd(&wb);
+        try t.put(pb.normed, std.mem.sliceAsBytes(x.bits[0 .. pre * D]));
+        try fp.kdaBlock(&st, 0, kw.w, pre);
+        var at: usize = 0;
+        for (sched) |rk| {
+            const R = rk[0];
+            const k = rk[1];
+            try t.put(wb.normed, std.mem.sliceAsBytes(x.bits[(pre + at) * D ..][0 .. R * D]));
+            fw.hold = true;
+            try fw.kdaBlock(&st, 0, kw.w, R);
+            fw.hold = false;
+            st.pending = R;
+            try sameRows("glm fwd KDA window rows", at, try t.get(f32, wb.part, R * D), sp[at * D ..][0 .. R * D]);
+            try fw.keep(&st, k);
+            at += k;
+            if (!std.mem.eql(f32, try t.get(f32, st.recAt(0), S), srec[(at - 1) * S ..][0..S])) {
+                std.debug.print("FAIL glm fwd KDA keep {d} of {d}: the state differs from the serial state after decode row {d}\n", .{ k, R, at - 1 });
+                return error.TestExpectedEqual;
+            }
+            if (!std.mem.eql(u16, try t.get(u16, st.convAt(0), C), sconv[(at - 1) * C ..][0..C])) {
+                std.debug.print("FAIL glm fwd KDA keep {d} of {d}: the conv window differs from the serial one after decode row {d}\n", .{ k, R, at - 1 });
+                return error.TestExpectedEqual;
+            }
+        }
+        std.debug.print("RESULT glm fwd KDA: {d} windows of 2-4 rows, keep 1-4: every window row, the state and the conv window after each keep = serial, bit for bit\n", .{sched.len});
+    }
+    // DSA: the decode rows from 24 (dense) and from 2,056 (listed: past the 2,051-key limit, pools of 4)
+    const dw = try DsaW.make(t, &rng);
+    for ([_]usize{ 24, 2056 }) |pre| {
+        const cap = std.mem.alignForward(usize, pre + sched_rows + 8, 64);
+        const x = try bfs(t, &rng, (pre + sched_rows) * D, 1.0);
+        const sp = try a.alloc(f32, sched_rows * D);
+        for (0..2) |mode| {
+            var st = try State.init(&t.r, cap);
+            defer st.deinit();
+            var pb = try Buffers.init(&t.r, @min(pre, 2048), true, cap);
+            defer pb.deinit();
+            var db = try Buffers.init(&t.r, if (mode == 0) 1 else state.window_rows, false, cap);
+            defer db.deinit();
+            var fp = try t.fwd(&pb);
+            var fd = try t.fwd(&db);
+            try st.reset(t.s.handle);
+            while (st.pos < pre) {
+                const n = @min(pb.rows, pre - st.pos);
+                try t.put(pb.normed, std.mem.sliceAsBytes(x.bits[st.pos * D ..][0 .. n * D]));
+                try st.ready(t.s.handle, n);
+                try fp.dsaBlock(st.caches[0], st.pos_dev, st.pos, dw.w, n);
+                try st.setPos(t.s.handle, st.pos + n);
+            }
+            if (mode == 0) {
+                for (0..sched_rows) |r| {
+                    try t.put(db.normed, std.mem.sliceAsBytes(x.bits[(pre + r) * D ..][0..D]));
+                    try st.ready(t.s.handle, 1);
+                    try fd.dsaBlock(st.caches[0], st.pos_dev, st.pos, dw.w, 1);
+                    @memcpy(sp[r * D ..][0..D], try t.get(f32, db.part, D));
+                    try st.setPos(t.s.handle, st.pos + 1);
+                }
+                continue;
+            }
+            // a window writes its rows' latent and index rows at [pos, pos + R); a keep moves pos; the next window
+            // rewrites the rejected rows
+            var at: usize = 0;
+            for (sched) |rk| {
+                const R = rk[0];
+                try t.put(db.normed, std.mem.sliceAsBytes(x.bits[(pre + at) * D ..][0 .. R * D]));
+                try st.ready(t.s.handle, R);
+                try fd.dsaBlock(st.caches[0], st.pos_dev, st.pos, dw.w, R);
+                try sameRows(if (pre < 2051) "glm fwd DSA window rows (dense)" else "glm fwd DSA window rows (listed)", at, try t.get(f32, db.part, R * D), sp[at * D ..][0 .. R * D]);
+                at += rk[1];
+                try st.setPos(t.s.handle, pre + at);
+            }
+        }
+        std.debug.print("RESULT glm fwd DSA from position {d} ({s}): {d} windows of 2-4 rows, keep 1-4: every window row = serial, bit for bit\n", .{ pre, if (pre < 2051) "dense" else "listed", sched.len });
+    }
+}
+
+test "glm fwd: decode windows of 2, 3, 4 and 8 rows = the same rows one at a time, bit for bit: the dense MLP, the MoE (router, EXL3 GEMV, shared)" {
+    const t = try Rig.open();
+    defer t.close();
+    const a = t.a();
+    var rng: Rng = .{ .state = 0x3e_71f8 };
+    const rows = state.window_rows;
+    const x = try bfs(t, &rng, rows * D, 1.0);
+    const w: usize = 12288;
+    const gu = try Lin.make(t, &rng, 2 * w, D, null);
+    const down = try Lin.make(t, &rng, D, w, null);
+    const dense: weights.Dense = .{ .gu = gu.w, .down = down.w };
+    const ex = try Experts.make(t, &rng, 6);
+    const router = try Lin.make(t, &rng, 288, D, null);
+    const bias = try a.alloc(f32, 288);
+    for (bias) |*v| v.* = @floatCast((rng.uniform() - 0.5) * 0.1);
+    const sgu = try Lin.make(t, &rng, 2 * 2048, D, null);
+    const sdown = try Lin.make(t, &rng, D, 2048, null);
+    const moe: weights.Moe = .{ .router = router.w, .bias = try t.up(bias), .shared_gu = sgu.w, .shared_down = sdown.w, .experts = ex.e, .stacks = undefined };
+    var one = try Buffers.init(&t.r, 1, false, 64);
+    defer one.deinit();
+    var win = try Buffers.init(&t.r, rows, false, 64);
+    defer win.deinit();
+    var f1 = try t.fwd(&one);
+    var fw = try t.fwd(&win);
+    for (0..2) |blk| {
+        const name = if (blk == 0) "glm fwd dense MLP decode window" else "glm fwd MoE decode window";
+        const serial = try a.alloc(f32, rows * D);
+        for (0..rows) |r| {
+            try t.put(one.normed, std.mem.sliceAsBytes(x.bits[r * D ..][0..D]));
+            if (blk == 0) try f1.denseBlock(dense, 1) else try f1.moeBlock(moe, 3, 1);
+            @memcpy(serial[r * D ..][0..D], try t.get(f32, one.part, D));
+        }
+        for ([_]usize{ 2, 3, 4, 8 }) |R| {
+            try t.put(win.normed, std.mem.sliceAsBytes(x.bits[0 .. R * D]));
+            if (blk == 0) try fw.denseBlock(dense, R) else try fw.moeBlock(moe, 3, R);
+            try sameRows(name, 0, try t.get(f32, win.part, R * D), serial[0 .. R * D]);
+        }
+        std.debug.print("RESULT {s}: 2, 3, 4 and 8 rows = one at a time, bit for bit\n", .{name});
+    }
+}
+
 // ---- the DSA block on real weights, op by op (TF_GLM_DIR: the checkpoint; TF_GLM_FWD_DUMP: a TF_GLM_DUMP prompt dir) ----
 
 /// A checkpoint's tensors by name through model.safetensors.index.json (the shards mapped on first use).

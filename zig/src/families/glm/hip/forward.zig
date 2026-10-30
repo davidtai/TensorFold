@@ -9,6 +9,9 @@
 //!   Nemotron-H's sigmoid pick and combine (nemotron_moe.hpp), as G4's router test runs them.
 //! Every product of a prompt window runs on the WMMA tiles (`Buffers.prompt`), of a decode window on the stream tiles:
 //! a row's bits do not depend on the chunk it is in. Under TF_GLM_DUMP `seq` receives the per-layer dumps.
+//! The MTP rounds (cuda_engine.zig draft/verify/keep, cuda_forward.zig commit): `draft` chains the MTP layer's greedy
+//! drafts, `window` runs the pending token and the drafts as one decode window that holds the KDA states, `keep`
+//! commits its first rows. A kept window row has the bits of the same row run serially (LANES.md code contract 7).
 
 const std = @import("std");
 const hip = @import("hip");
@@ -85,6 +88,8 @@ pub const Forward = struct {
     force: ?*const Force = null,
     /// The last MoE block's picks and weights in the arena (valid until the next block).
     moe_last: struct { pick: u64 = 0, wts: u64 = 0 } = .{},
+    /// Inside `window`: the KDA layers hold their states and save the rows for `keep`.
+    hold: bool = false,
 
     pub const DsaLast = struct { dp: u64 = 0, qr: u64 = 0, lat: u64 = 0, qq: u64 = 0, qa: u64 = 0, ol: u64 = 0, vn: u64 = 0 };
 
@@ -137,8 +142,42 @@ pub const Forward = struct {
     // ---- the layers ----
 
     /// forward.forward of `ids` on `st` at st.pos: the final-normed rows in b.fnormed; the KDA layers and the position
-    /// committed (a window keeps every row: the eager forward has no rollback).
+    /// committed (every row kept).
     pub fn run(f: *Forward, st: *State, ids: []const u32) !void {
+        if (st.pending != 0) return error.WindowNotKept;
+        try f.layers(st, ids);
+        try st.setPos(f.s, st.pos + ids.len);
+    }
+
+    /// A verify window (cuda_engine.zig verify): `ids` (the pending token, then the drafts; at most
+    /// state.window_rows) from st.pos on decode buffers, the final-normed rows in b.fnormed (lm_head: `head`). Nothing
+    /// is committed: the KDA layers hold their states (tf_kda_hold) and save each row's projection and k, v, decay and
+    /// beta in st; the DSA latent, index and pool rows are written at [pos, pos + R), which a later window rewrites;
+    /// st.pos stays and st.pending = R until `keep`.
+    pub fn window(f: *Forward, st: *State, ids: []const u32) !void {
+        if (f.b.prompt or ids.len > state.window_rows) return error.BadWindow;
+        if (st.pending != 0) return error.WindowNotKept;
+        f.hold = true;
+        defer f.hold = false;
+        try f.layers(st, ids);
+        st.pending = ids.len;
+    }
+
+    /// forward.commit (cuda_forward.zig commit) of the last window's first `rows`: each KDA layer's state runs in place
+    /// through its first `rows` saved rows (tf_kda_keep: the serial rows' sums), the conv windows take the kept
+    /// projections, the position moves by `rows`. The window's later rows are rewritten by the next window.
+    pub fn keep(f: *Forward, st: *State, rows: usize) !void {
+        if (rows == 0 or rows > st.pending) return error.BadKeep;
+        const W = state.kda_width;
+        const wr = state.window_rows;
+        try f.l.tf_kda_keep(mf(st.rec), @intCast(State.rec_layer), cf(st.save_k), c(st.save_v), cf(st.save_g), cf(st.save_b), @intCast(wr * kda_n), @intCast(wr * kda_heads), int(rows), int(state.kda_layers), int(kda_heads), f.s);
+        try f.l.tf_kda_conv_shift(m(st.conv), c(st.proj), @intCast(rows), @intCast(State.conv_layer), @intCast(wr * W), @intCast(W), @intCast(3 * kda_n), int(state.kda_layers), f.s);
+        st.pending = 0;
+        try st.setPos(f.s, st.pos + rows);
+    }
+
+    /// The 45 layers and the final norm of `ids` at st.pos (run's and window's body); the position not moved.
+    fn layers(f: *Forward, st: *State, ids: []const u32) !void {
         const R = ids.len;
         const b = f.b;
         const cfg = f.cfg;
@@ -179,11 +218,12 @@ pub const Forward = struct {
         // finish: the stream mean, the final norm (cuda_forward.zig whole's tail and finish)
         try glue.streamMean(f.l, c(b.x), m(b.hidden), int(R), f.s);
         try glue.rms(f.l, c(b.hidden), @intCast(D), c(f.w.norm), m(b.fnormed), @intCast(D), int(R), int(D), cfg.eps, f.s);
-        try st.setPos(f.s, st.pos + R);
     }
 
     /// cuda_kda_block.zig body + fill: projections, the chain (prep, scan, gated norm), the conv window's commit, o_proj
-    /// into b.part fp32. The scan runs layer `li`'s state in place (G2: one state copy).
+    /// into b.part fp32. The scan runs layer `li`'s state in place (G2: one state copy). Under `hold` (a verify
+    /// window) the scan leaves the state (tf_kda_hold), the projection rows and k, v, decay and beta go to st's window
+    /// saves, and the conv window waits for `keep`.
     pub fn kdaBlock(f: *Forward, st: *State, li: usize, w: weights.Kda, R: usize) !void {
         const b = f.b;
         const ar = &b.arena;
@@ -191,16 +231,17 @@ pub const Forward = struct {
         const W = state.kda_width;
         const n = kda_n;
         const fa = 3 * n;
-        const p = try ar.of(u16, R * W);
+        const wr = state.window_rows;
+        const p = if (f.hold) st.proj + li * wr * W * 2 else try ar.of(u16, R * W);
         const xa = try ar.of(u16, R * 128);
         const xg = try ar.of(u16, R * 128);
         const ka = try ar.of(u16, R * n);
         const kg = try ar.of(u16, R * n);
         const q = try ar.of(f32, R * n);
-        const k = try ar.of(f32, R * n);
-        const v = try ar.of(u16, R * n);
-        const g = try ar.of(f32, R * n);
-        const beta = try ar.of(f32, R * kda_heads);
+        const k = if (f.hold) st.save_k + li * wr * n * 4 else try ar.of(f32, R * n);
+        const v = if (f.hold) st.save_v + li * wr * n * 2 else try ar.of(u16, R * n);
+        const g = if (f.hold) st.save_g + li * wr * n * 4 else try ar.of(f32, R * n);
+        const beta = if (f.hold) st.save_b + li * wr * kda_heads * 4 else try ar.of(f32, R * kda_heads);
         const y = try ar.of(f32, R * n);
         const out = try ar.of(u16, R * n);
         try f.lin(b.normed, w.proj, R, p, true);
@@ -212,10 +253,13 @@ pub const Forward = struct {
         try f.lin(xg, w.g_b, R, kg, true);
         const conv = st.convAt(li);
         try f.l.tf_kda_prep(c(p), @intCast(W), @intCast(fa + 256), c(ka), @intCast(n), c(conv), c(w.conv), cf(w.a_log), cf(w.dt_bias), f.cfg.lower_bound, mf(q), mf(k), m(v), mf(g), mf(beta), int(R), int(kda_heads), f.s);
-        try f.l.tf_kda(cf(q), cf(k), c(v), cf(g), cf(beta), mf(st.recAt(li)), mf(y), int(R), int(kda_heads), f.s, null, 0);
+        if (f.hold) {
+            try f.l.tf_kda_hold(cf(q), cf(k), c(v), cf(g), cf(beta), mf(st.recAt(li)), mf(y), int(R), int(kda_heads), f.s);
+        } else try f.l.tf_kda(cf(q), cf(k), c(v), cf(g), cf(beta), mf(st.recAt(li)), mf(y), int(R), int(kda_heads), f.s, null, 0);
         try f.l.tf_kda_out(cf(y), c(kg), @intCast(n), c(w.o_norm), f.cfg.eps, m(out), int(R), int(kda_heads), f.s);
-        // the window keeps every row: its conv window becomes the last 3 inputs (cuda_kda_block.zig bodyProfile)
-        try f.l.tf_kda_conv_shift(m(conv), c(p), @intCast(R), @intCast(State.conv_layer), @intCast(R * W), @intCast(W), @intCast(3 * n), 1, f.s);
+        // every row kept: the conv window becomes the last 3 inputs (cuda_kda_block.zig bodyProfile); a held window's
+        // waits for keep
+        if (!f.hold) try f.l.tf_kda_conv_shift(m(conv), c(p), @intCast(R), @intCast(State.conv_layer), @intCast(R * W), @intCast(W), @intCast(3 * n), 1, f.s);
         try f.lin(out, w.o, R, b.part, false);
     }
 
@@ -386,6 +430,52 @@ pub const Forward = struct {
         try f.dumpMtpStream(1, n);
         try glue.rms(f.l, c(b.mx), @intCast(D), c(t.norm), m(b.fnormed), @intCast(D), int(n), int(D), cfg.eps, f.s);
         try st.setMtpLen(f.s, st.mtp_len + n);
+    }
+
+    /// The most drafts a round chains (cuda_engine.zig max_drafts).
+    pub const max_drafts = 3;
+
+    /// decode.draft (cuda_engine.zig draft): the MTP layer absorbs the pairs (row j of `hin`, bf16 [rows][D] the main
+    /// model's final-normed rows; follow[j], the token after it) at mtp_len, then chains `depth` greedy drafts from the
+    /// last pair into `out` (the BF16 lm_head's top-1, ties to the lower id); returns depth. The draft steps' MTP rows
+    /// are not kept: mtp_len ends at the absorbed rows, and the next absorb rewrites them. On buffers of its own
+    /// (decode, rows >= follow.len): `hin` is usually the window's b.fnormed. Needs mtp_len + follow.len = st.pos.
+    pub fn draft(f: *Forward, st: *State, hin: u64, follow: []const u32, depth: usize, out: []u32) !usize {
+        if (f.b.prompt or depth > max_drafts or depth > out.len) return error.BadDraft;
+        if (st.mtp_len + follow.len != st.pos) return error.MtpOutOfStep;
+        var s0: usize = 0;
+        var last: u64 = 0;
+        while (s0 < follow.len) : (s0 += f.b.rows) {
+            const part = follow[s0..@min(follow.len, s0 + f.b.rows)];
+            try f.mtp(st, part, hin + s0 * D * 2);
+            last = f.b.fnormed + (part.len - 1) * D * 2;
+        }
+        if (depth == 0) return 0;
+        if (follow.len == 0) return error.BadDraft;
+        const kept = st.mtp_len;
+        const lg = try f.host.alloc(f32, V);
+        defer f.host.free(lg);
+        for (0..depth) |j| {
+            out[j] = try f.top1(last, lg);
+            if (j + 1 < depth) {
+                try f.mtp(st, out[j..][0..1], last);
+                last = f.b.fnormed;
+            }
+        }
+        try st.setMtpLen(f.s, kept);
+        return depth;
+    }
+
+    /// The greedy pick of one final-normed bf16 row at `x`: lm_head's fp32 row, its first largest value (ties to the
+    /// lower id, as dump.top8's first).
+    pub fn top1(f: *Forward, x: u64, lg: []f32) !u32 {
+        const at = try f.head(x, 1);
+        try f.download(f32, at, lg[0..V]);
+        var best: usize = 0;
+        for (lg[0..V], 0..) |v, i| if (v > lg[best]) {
+            best = i;
+        };
+        return @intCast(best);
     }
 
     // ---- TF_GLM_DUMP (inert when `seq` is null) ----

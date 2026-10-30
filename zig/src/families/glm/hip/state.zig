@@ -58,7 +58,9 @@ pub const State = struct {
     mtp_pos_dev: u64, // i32
     conv: u64, // bf16 [kda layers][3][3 x 8,192]
     rec: u64, // fp32 [kda layers][64][128 v][128 k], one copy
-    // a verify window's rows until its keep (the MTP rounds' step; unused by the eager forward)
+    /// The rows of the last verify window (Forward.window) not yet kept (Forward.keep); 0 outside a window.
+    pending: usize = 0,
+    // a verify window's rows until its keep (the MTP rounds' step)
     proj: u64, // bf16 [kda layers][window rows][kda width]
     save_k: u64, // fp32 [kda layers][window rows][64][128]
     save_v: u64, // bf16, as save_k
@@ -105,6 +107,7 @@ pub const State = struct {
         st.capacity = capacity;
         st.pos = 0;
         st.mtp_len = 0;
+        st.pending = 0;
         st.base = 0;
         st.mtp_base = 0;
         st.pos_dev = c.take(4);
@@ -140,6 +143,7 @@ pub const State = struct {
         try hip.runtime.check(api.hipMemsetAsync(@ptrFromInt(st.conv), 0, kda_layers * conv_layer * 2, s));
         try hip.runtime.check(api.hipMemsetAsync(@ptrFromInt(st.rec), 0, kda_layers * rec_layer * 4, s));
         st.setBases(0, 0);
+        st.pending = 0;
         try st.setPos(s, 0);
         try st.setMtpLen(s, 0);
     }
