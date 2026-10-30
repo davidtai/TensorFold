@@ -63,10 +63,10 @@ fn check(a: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, dir: []const 
     return admit(a, gpa, dir, text, problem);
 }
 
-/// The prompt rows a forward takes at once where the policy names none (the HIP default is 1,024): 2,048, lane F's
-/// chunk; `--policy prefill_step=` takes up to state.prompt_rows (8,192). A row's bytes do not depend on the chunk
-/// (contract 7).
-pub const policy_prefill_step: u32 = 2048;
+/// The prompt rows a forward takes at once where the policy names none (the HIP default is 1,024): state.prompt_rows
+/// (8,192; +7 % prefill on the 16K coding workload against 2,048, scratch 4.44 GiB). `--policy prefill_step=` takes
+/// a smaller chunk. A row's bytes do not depend on the chunk (contract 7).
+pub const policy_prefill_step: u32 = state.prompt_rows;
 /// Serial decode: no draft head yet, so --mtp-drafts past 0 is refused before the load.
 pub const max_drafts: u32 = 0;
 pub const confidence_refusal = "--mtp-confidence: GLM-5.3-Flash on HIP drafts nothing yet (serial decode); serve it without --mtp-confidence";
