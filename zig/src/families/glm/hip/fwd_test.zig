@@ -746,21 +746,20 @@ test "glm fwd: an MoE layer (router, top-8 of 288, EXL3 experts, shared) against
         for (order[0..8]) |e| {
             const wt = sigmoid(lg[r * E + e]) / total * 2.5;
             const i = e % distinct;
-            var act: [2048]f64 = undefined;
-            for (&act, 0..) |*v, j| {
-                var g: f64 = 0;
-                var u: f64 = 0;
-                for (0..D) |kk| {
-                    g += x.val[r * D + kk] * mats[i][0][kk * 2048 + j];
-                    u += x.val[r * D + kk] * mats[i][1][kk * 2048 + j];
-                }
-                v.* = swigluRef(g, u);
+            // x [D] . gate and up [D][2048], then act [2048] . down [2048][D], rows of W contiguous
+            var g: [2048]f64 = @splat(0);
+            var u: [2048]f64 = @splat(0);
+            for (0..D) |kk| {
+                const xv = x.val[r * D + kk];
+                for (&g, mats[i][0][kk * 2048 ..][0..2048]) |*o, wv| o.* += xv * wv;
+                for (&u, mats[i][1][kk * 2048 ..][0..2048]) |*o, wv| o.* += xv * wv;
             }
-            for (0..D) |j| {
-                var y: f64 = 0;
-                for (act, 0..) |v, kk| y += v * mats[i][2][kk * D + j];
-                want[r * D + j] += wt * y;
+            var y: [D]f64 = @splat(0);
+            for (g, u, 0..) |gv, uv, kk| {
+                const av = swigluRef(gv, uv);
+                for (&y, mats[i][2][kk * D ..][0..D]) |*o, wv| o.* += av * wv;
             }
+            for (want[r * D ..][0..D], y) |*o, yv| o.* += wt * yv;
         }
     }
     for ([_]bool{ true, false }) |prompt| {
