@@ -199,19 +199,22 @@ test "GLM DSA: the latent cache write copies each row into its slot and nothing 
     std.debug.print("PASS latent cache write: {d} rows at {d} exact, other slots untouched\n", .{ rows, pos + row0 });
 }
 
-/// float64 y[r][h][n] = sum_k x[r][h][k] w[h][k][n] (wt: w is [h][n][k]); bound: bf16 out + (K + 8) 2^-24 sum |x w|.
-fn headProducts(t: *Rig, x: []const u16, w: []const u16, rows: usize, kd: usize, nd: usize, wt: bool) !struct { want: []f64, tol: []f64 } {
+/// float64 y[r][h][n] = sum_k x[r][h k + k] W_h[k][n] over kv_b as stored (absorb: W_h[k][n] = kv_b[512 h + k][n];
+/// expand, `values`: W_h[k][n] = kv_b[512 h + 256 + n][k]); x rows `xs` values apart. Bound: bf16 out + (K + 8) 2^-24
+/// sum |x w|.
+fn headProducts(t: *Rig, x: []const u16, xs: usize, kvb: []const u16, rows: usize, kd: usize, nd: usize, values: bool) !struct { want: []f64, tol: []f64 } {
     const want = try t.a().alloc(f64, rows * heads * nd);
     const tol = try t.a().alloc(f64, rows * heads * nd);
-    const wd = try t.f64s(w);
+    const wd = try t.f64s(kvb);
     const xd = try t.f64s(x);
+    const per = dsa.qk + dsa.dv;
     for (0..rows) |r| for (0..heads) |h| {
-        const xr = xd[(r * heads + h) * kd ..][0..kd];
+        const xr = xd[r * xs + h * kd ..][0..kd];
         for (0..nd) |n| {
             var sum: f64 = 0;
             var abs: f64 = 0;
             for (0..kd) |k| {
-                const wv = if (wt) wd[(h * nd + n) * kd + k] else wd[(h * kd + k) * nd + n];
+                const wv = if (values) wd[(h * per + dsa.qk + n) * dsa.lw + k] else wd[(h * per + k) * dsa.lw + n];
                 sum += xr[k] * wv;
                 abs += @abs(xr[k] * wv);
             }
@@ -223,40 +226,41 @@ fn headProducts(t: *Rig, x: []const u16, w: []const u16, rows: usize, kd: usize,
     return .{ .want = want, .tol = tol };
 }
 
-test "GLM DSA: absorb and expand by kv_b against float64; rows alone equal their rows in a wide call" {
+test "GLM DSA: absorb and expand by kv_b as stored against float64; rows alone equal their rows in a wide call" {
     const t = try Rig.open(0x6302);
     defer t.close();
     const rows = 40;
+    // kv_b_proj as the loader places it: [64 x 512][512] bf16, per head 256 key rows then 256 value rows
+    const kvb = try t.bfs(heads * (dsa.qk + dsa.dv) * dsa.lw, 0.05);
+    const dkv = try t.dev(kvb);
     {
-        const q = try t.bfs(rows * heads * dsa.qk, 1.0);
-        const wk = try t.bfs(heads * dsa.qk * dsa.lw, 0.05);
+        // q in the [q_b | wq_b] rows of 16,384 + 4,096 values (q at column 0)
+        const qs = heads * dsa.qk + dsa.index_heads * dsa.index_dims;
+        const q = try t.bfs(rows * qs, 1.0);
         const dq = try t.dev(q);
-        const dw = try t.dev(wk);
         const out = try t.zeros(rows * heads * dsa.lw * 2);
-        try dsa.absorbQ(t.k, t.s(), dq, dw, out, rows, heads);
-        const ref = try headProducts(t, q, wk, rows, dsa.qk, dsa.lw, false);
-        try closeCols(t, "absorb_q 40 rows x 64 heads, [256] . [256, 512]", out, ref.want, ref.tol, dsa.lw);
+        try dsa.absorbQ(t.k, t.s(), dq, qs, dsa.kvKeys(dkv), dsa.kv_head, out, rows, heads);
+        const ref = try headProducts(t, q, qs, kvb, rows, dsa.qk, dsa.lw, false);
+        try closeCols(t, "absorb_q 40 rows x 64 heads, [256] . Wk_h [256, 512] in kv_b as stored", out, ref.want, ref.tol, dsa.lw);
         const row_bytes = heads * dsa.lw * 2;
         for ([_][2]usize{ .{ 0, 1 }, .{ 5, 3 }, .{ 17, 4 }, .{ 20, 17 } }) |w| {
             const o = try t.zeros(w[1] * row_bytes);
-            try dsa.absorbQ(t.k, t.s(), dq + w[0] * heads * dsa.qk * 2, dw, o, w[1], heads);
+            try dsa.absorbQ(t.k, t.s(), dq + w[0] * qs * 2, qs, dsa.kvKeys(dkv), dsa.kv_head, o, w[1], heads);
             var name: [96]u8 = undefined;
             try sameBytes(t, try std.fmt.bufPrint(&name, "absorb_q: rows {d}..{d} alone", .{ w[0], w[0] + w[1] - 1 }), out + w[0] * row_bytes, o, w[1] * row_bytes);
         }
     }
     {
         const ol = try t.bfs(rows * heads * dsa.lw, 1.0);
-        const wv = try t.bfs(heads * dsa.dv * dsa.lw, 0.05);
         const dol = try t.dev(ol);
-        const dw = try t.dev(wv);
         const out = try t.zeros(rows * heads * dsa.dv * 2);
-        try dsa.expandV(t.k, t.s(), dol, dw, out, rows, heads);
-        const ref = try headProducts(t, ol, wv, rows, dsa.lw, dsa.dv, true);
-        try closeCols(t, "expand_v 40 rows x 64 heads, [512] . [256, 512]^T", out, ref.want, ref.tol, dsa.dv);
+        try dsa.expandV(t.k, t.s(), dol, dsa.kvValues(dkv), dsa.kv_head, out, rows, heads);
+        const ref = try headProducts(t, ol, heads * dsa.lw, kvb, rows, dsa.lw, dsa.dv, true);
+        try closeCols(t, "expand_v 40 rows x 64 heads, [512] . Wv_h [256, 512]^T in kv_b as stored", out, ref.want, ref.tol, dsa.dv);
         const row_bytes = heads * dsa.dv * 2;
         for ([_][2]usize{ .{ 0, 1 }, .{ 5, 3 }, .{ 17, 4 }, .{ 20, 17 } }) |w| {
             const o = try t.zeros(w[1] * row_bytes);
-            try dsa.expandV(t.k, t.s(), dol + w[0] * heads * dsa.lw * 2, dw, o, w[1], heads);
+            try dsa.expandV(t.k, t.s(), dol + w[0] * heads * dsa.lw * 2, dsa.kvValues(dkv), dsa.kv_head, o, w[1], heads);
             var name: [96]u8 = undefined;
             try sameBytes(t, try std.fmt.bufPrint(&name, "expand_v: rows {d}..{d} alone", .{ w[0], w[0] + w[1] - 1 }), out + w[0] * row_bytes, o, w[1] * row_bytes);
         }
@@ -362,13 +366,19 @@ fn selection(t: *Rig, pos: usize, rows: usize, zero_pools: [2]usize, tie_pools: 
     const d = dsa.index_dims;
     const np = dsa.poolBucket(pos, rows, 1 << 20);
     const cols = dsa.scoreColumns(pos, rows, np);
-    const qi = try t.bfs(rows * hd * d, 1.0);
-    const wstride = d + hd; // the weights at column 128 of [wk | weights_proj] rows
+    // qi at column 16,384 of [q_b | wq_b] rows; the head weights at column 2,176 of [q_a | kv_a | wk | weights_proj] rows
+    const qs = heads * dsa.qk + hd * d;
+    const qcol = heads * dsa.qk;
+    const qrows = try t.bfs(rows * qs, 1.0);
+    const qi = try t.a().alloc(u16, rows * hd * d);
+    for (0..rows) |r| @memcpy(qi[r * hd * d ..][0 .. hd * d], qrows[r * qs + qcol ..][0 .. hd * d]);
+    const wcol = 1536 + 512 + d;
+    const wstride = wcol + hd;
     const wrows = try t.bfs(rows * wstride, 1.0);
     const pk = try t.bfs(np * d, 1.0);
     for (zero_pools[0]..zero_pools[1]) |p| @memset(pk[p * d ..][0..d], 0);
     for (tie_pools[0]..tie_pools[1]) |p| @memcpy(pk[p * d ..][0..d], pk[(tie_pools[0] - 1) * d ..][0..d]);
-    const dqi = try t.dev(qi);
+    const dqi = (try t.dev(qrows)) + qcol * 2;
     const dw = try t.dev(wrows);
     const dpk = try t.dev(pk);
     const dpos = try posDev(t, pos);
@@ -376,7 +386,7 @@ fn selection(t: *Rig, pos: usize, rows: usize, zero_pools: [2]usize, tie_pools: 
     const tokens = try t.filled(rows * dsa.width * 4, 0xff);
     const counts = try t.zeros(rows * 4);
     const sparse = try t.zeros(rows * 4);
-    try dsa.selectTokens(t.k, t.s(), dqi, dw + d * 2, wstride, dpk, dpos, 0, pos, rows, np, sc, tokens, counts, sparse);
+    try dsa.selectTokens(t.k, t.s(), dqi, qs, dw + wcol * 2, wstride, dpk, dpos, 0, pos, rows, np, sc, tokens, counts, sparse);
     const got = try t.backAs(f32, sc.scores, rows * np);
 
     // float64: sum_h w_h relu(scale q_h . k_p); bound: (128 + 8) 2^-24 scale sum |q k| a dot, 40 2^-24 sum |w_h relu|
@@ -400,7 +410,7 @@ fn selection(t: *Rig, pos: usize, rows: usize, zero_pools: [2]usize, tie_pools: 
             var bound: f64 = 0;
             var spread: f64 = 0;
             for (0..hd) |h| {
-                const w = bfValue(wrows[row * wstride + d + h]) * wscale;
+                const w = bfValue(wrows[row * wstride + wcol + h]) * wscale;
                 var dot: f64 = 0;
                 var abs: f64 = 0;
                 for (0..d) |i| {
@@ -461,7 +471,7 @@ fn selection(t: *Rig, pos: usize, rows: usize, zero_pools: [2]usize, tie_pools: 
     const c2 = try t.zeros(rows * 4);
     const s2 = try t.zeros(rows * 4);
     for ([_][2]usize{ .{ 0, half }, .{ half, rows - half } }) |w| {
-        try dsa.selectTokens(t.k, t.s(), dqi + w[0] * hd * d * 2, dw + (w[0] * wstride + d) * 2, wstride, dpk, dpos, w[0], pos, w[1], np, sc, t2 + w[0] * dsa.width * 4, c2 + w[0] * 4, s2 + w[0] * 4);
+        try dsa.selectTokens(t.k, t.s(), dqi + w[0] * qs * 2, qs, dw + (w[0] * wstride + wcol) * 2, wstride, dpk, dpos, w[0], pos, w[1], np, sc, t2 + w[0] * dsa.width * 4, c2 + w[0] * 4, s2 + w[0] * 4);
     }
     try sameBytes(t, try std.fmt.bufPrint(&name, "select at {d}: two calls' lists", .{pos}), tokens, t2, rows * dsa.width * 4);
     try sameBytes(t, try std.fmt.bufPrint(&name, "select at {d}: two calls' counts", .{pos}), counts, c2, rows * 4);
@@ -793,17 +803,17 @@ test "GLM DSA: speed facts at the model's shapes (no gate)" {
         const us = try timeUs(t, 10, C{ .rows = rows, .keys = .dense, .cache = cache, .qa = qa, .out = out, .p = p512, .pos = pos2k, .parts = nd }, attn);
         std.debug.print("SPEED dense latent attention, {d} rows at 1,536 x 64 heads: {d:.1} us\n", .{ rows, us });
     }
-    const wk = try t.dev(try t.bfs(heads * dsa.qk * lw, 0.05));
+    const wk = try t.dev(try t.bfs(heads * (dsa.qk + dsa.dv) * lw, 0.05)); // kv_b as stored
     const q = try t.dev(try t.bfs(most * heads * dsa.qk, 1.0));
     const P = struct { rows: usize, a: u64, w: u64, o: u64 };
     const absorb = struct {
         fn f(r: *Rig, c: P) anyerror!void {
-            try dsa.absorbQ(r.k, r.s(), c.a, c.w, c.o, c.rows, heads);
+            try dsa.absorbQ(r.k, r.s(), c.a, heads * dsa.qk, dsa.kvKeys(c.w), dsa.kv_head, c.o, c.rows, heads);
         }
     }.f;
     const expand = struct {
         fn f(r: *Rig, c: P) anyerror!void {
-            try dsa.expandV(r.k, r.s(), c.a, c.w, c.o, c.rows, heads);
+            try dsa.expandV(r.k, r.s(), c.a, dsa.kvValues(c.w), dsa.kv_head, c.o, c.rows, heads);
         }
     }.f;
     for ([_]usize{ 1, 4, 512, 2048 }) |rows| {
@@ -823,7 +833,7 @@ test "GLM DSA: speed facts at the model's shapes (no gate)" {
     const X = struct { rows: usize, qi: u64, wts: u64, pk: u64, pos: u64, np: usize, sc: dsa.Scratch, toks: u64, cts: u64, sps: u64 };
     const sel = struct {
         fn f(r: *Rig, c: X) anyerror!void {
-            try dsa.selectTokens(r.k, r.s(), c.qi, c.wts, hd, c.pk, c.pos, 0, ctx, c.rows, c.np, c.sc, c.toks, c.cts, c.sps);
+            try dsa.selectTokens(r.k, r.s(), c.qi, hd * dsa.index_dims, c.wts, hd, c.pk, c.pos, 0, ctx, c.rows, c.np, c.sc, c.toks, c.cts, c.sps);
         }
     }.f;
     for ([_]usize{ 1, 4, 512 }) |rows| {
