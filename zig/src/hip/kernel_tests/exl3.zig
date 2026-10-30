@@ -651,7 +651,7 @@ fn checkpointDir() ?[]const u8 {
 
 /// The GLM-shape cases' float64 references (D 4,096 x I 2,048) run only in an optimized build.
 fn heavySkipped() bool {
-    return @import("builtin").mode == .Debug;
+    return @import("builtin").mode == .debug;
 }
 
 test "EXL3 real weights: 9 of layer 3's experts, the oracle's dequantization, decode GEMV and prompt GEMM" {
