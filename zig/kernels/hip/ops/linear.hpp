@@ -1,6 +1,7 @@
 #pragma once
 
 #include "common.hpp"
+#include "recurrence/kda.hpp"
 
 // The linear attention's prefill: conv, gate and gated norm.
 
@@ -44,6 +45,7 @@ extern "C" __global__ void tf_conv_prefill(const void* x, int kind, const float*
 // L the channels L + 32 j, the squares summed in j order, the xor 16 ... 1 butterfly), v as the conv leaves it, the
 // conv's new state, and tf_gdn_gate_prefill's gate and beta. The chain's values, without the fp32 conv rows, 3 column
 // copies and 2 norm launches. Blocks: q/k heads x segments (8 waves a block), v channels x segments, gates, new state.
+// gate_dim 128 (GLM's KDA): a decay a key channel (tf_kda::decay with `lower`; dt_bias a channel) and beta a head.
 constexpr int kPrepSeg = 16;
 
 __device__ __forceinline__ float prep_window(const void* x, int kind, const float* state, int kept, int channels, int c,
@@ -56,12 +58,13 @@ extern "C" __global__ void __launch_bounds__(256)
 tf_gdn_prompt_prep(const void* x, int kind, const float* weight, const float* state, float* new_state, float* q_out,
                    float* k_out, float* v_out, const float* qw, const float* kw_w, float eps, int len, int kwidth,
                    int vwidth, int kernel, const void* a, const void* b, const float* a_log, const float* dt_bias,
-                   float* gate, float* beta, int heads) {
+                   float* gate, float* beta, int heads, int gate_dim, float lower) {
     const int channels = 2 * kwidth + vwidth, kept = kernel - 1;
     const int segs = (len + kPrepSeg - 1) / kPrepSeg;
     const int qk_heads = 2 * kwidth / 128;
     const int nA = (qk_heads * segs + 7) / 8, nB = ((vwidth + 255) / 256) * segs;
-    const int nC = (len * heads + 255) / 256;
+    const bool kda = gate_dim == tf_kda::kDim;
+    const int nC = (len * heads * (kda ? tf_kda::kDim : 1) + 255) / 256;
     int blk = blockIdx.x;
     if (blk < nA) {
         // q / k: a wave a head a segment
@@ -135,6 +138,16 @@ tf_gdn_prompt_prep(const void* x, int kind, const float* weight, const float* st
         return;
     }
     blk -= nB;
+    if (blk < nC && kda) {
+        // KDA: thread i the decay of channel i % 128 of (row, head) i / 128; the head's first channel its beta
+        const long long i = static_cast<long long>(blk) * 256 + threadIdx.x;
+        if (i >= static_cast<long long>(len) * heads * tf_kda::kDim) return;
+        const long long rh = i / tf_kda::kDim;
+        const int hc = static_cast<int>(i % (heads * tf_kda::kDim));
+        if (i % tf_kda::kDim == 0) beta[rh] = sigmoid(load(b, kind, rh));
+        gate[i] = tf_kda::decay(load(a, kind, i), dt_bias[hc], a_log[hc / tf_kda::kDim], lower);
+        return;
+    }
     if (blk < nC) {
         // tf_gdn_gate_prefill's gate and beta
         const long long i = static_cast<long long>(blk) * 256 + threadIdx.x;

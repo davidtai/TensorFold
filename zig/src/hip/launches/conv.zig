@@ -47,7 +47,14 @@ pub const ConvArgs = extern struct {
     slots: c_int = 1,
     /// A device i32: with row f >= 0, a window's start is the last window's snapshot after row f (states must be set).
     from: u64 = 0,
+    /// kda_dim (GLM's KDA): a decay a key channel, `gcount` x kda_dim of them, and beta a head; 0: a gate a head.
+    gate_dim: c_int = 0,
+    /// KDA's gate_lower_bound (GLM-5.3-Flash: -5).
+    lower: f32 = 0,
 };
+
+/// KDA's key and value channels a head (recurrence/kda.hpp kDim).
+pub const kda_dim = 128;
 
 pub fn tf_conv_decode(l: *const Launcher, x: CF, weight: CF, state: F, y: F, batch: c_int, channels: c_int, kernel: c_int, s: S) Error!void {
     var a: Args = .{};
@@ -76,9 +83,10 @@ pub fn tf_conv_rows(l: *const Launcher, x: CF, weight: CF, state: F, y: F, state
 /// A window's rows through the linear attention's conv, split into q, k and v, normed and gated when `c` asks.
 pub fn tf_conv_split(l: *const Launcher, c: ConvArgs, s: S) Error!void {
     if (c.kernel < 1 or c.kernel > 8 or (c.norm != 0 and (c.norm != 128 or @rem(c.kw, 128) != 0))) return invalid("conv split");
+    if (c.gate_dim != 0 and c.gate_dim != kda_dim) return invalid("conv split gate");
     var a: Args = .{};
     try a.add(c);
-    const gate_blocks = if (c.ga != 0) cdiv(c.gcount, 128) else 0;
+    const gate_blocks = if (c.ga != 0) cdiv(c.gcount * @max(c.gate_dim, 1), 128) else 0;
     try l.go(l.dec.conv_split, dim(cdiv(c.channels, 128) + gate_blocks, c.slots, 1), dim(128, 1, 1), 0, s, &a);
 }
 
@@ -103,9 +111,20 @@ pub fn tf_conv_prefill(l: *const Launcher, x: C, kind: c_int, weight: CF, state:
 /// gate and beta from a and b (`heads` a row). The values of tf_conv_prefill, two column copies, two tf_rms and
 /// tf_gdn_gate_prefill.
 pub fn tf_gdn_prompt_prep(l: *const Launcher, x: C, kind: c_int, weight: CF, state: CF, new_state: F, q: F, k: F, v: F, qw: CF, kw_w: CF, eps: f32, len: c_int, kwidth: c_int, vwidth: c_int, kernel: c_int, a: C, b: C, a_log: CF, dt_bias: CF, gate: F, beta: F, heads: c_int, s: S) Error!void {
+    return promptPrep(l, x, kind, weight, state, new_state, q, k, v, qw, kw_w, eps, len, kwidth, vwidth, kernel, a, b, a_log, dt_bias, gate, beta, heads, 0, 0, s);
+}
+
+/// GLM's KDA prompt prework: tf_gdn_prompt_prep's conv, split and q and k norms (L2 as the RMS norm of qkConstants),
+/// with a decay a key channel (`heads` x kda_dim a row, `lower` the gate's bound, dt_bias a channel) and beta a head.
+pub fn tf_kda_prompt_prep(l: *const Launcher, x: C, kind: c_int, weight: CF, state: CF, new_state: F, q: F, k: F, v: F, qw: CF, kw_w: CF, eps: f32, len: c_int, heads: c_int, kernel: c_int, a: C, b: C, a_log: CF, dt_bias: CF, gate: F, beta: F, lower: f32, s: S) Error!void {
+    const width = heads * kda_dim;
+    return promptPrep(l, x, kind, weight, state, new_state, q, k, v, qw, kw_w, eps, len, width, width, kernel, a, b, a_log, dt_bias, gate, beta, heads, kda_dim, lower, s);
+}
+
+fn promptPrep(l: *const Launcher, x: C, kind: c_int, weight: CF, state: CF, new_state: F, q: F, k: F, v: F, qw: CF, kw_w: CF, eps: f32, len: c_int, kwidth: c_int, vwidth: c_int, kernel: c_int, a: C, b: C, a_log: CF, dt_bias: CF, gate: F, beta: F, heads: c_int, gate_dim: c_int, lower: f32, s: S) Error!void {
     if (kernel < 1 or kernel > 8 or @rem(kwidth, 128) != 0 or len < 1) return invalid("gdn prompt prep");
     var args: Args = .{};
-    inline for (.{ ad(x), kind, ad(weight), ad(state), ad(new_state), ad(q), ad(k), ad(v), ad(qw), ad(kw_w), eps, len, kwidth, vwidth, kernel, ad(a), ad(b), ad(a_log), ad(dt_bias), ad(gate), ad(beta), heads }) |val| try args.add(val);
+    inline for (.{ ad(x), kind, ad(weight), ad(state), ad(new_state), ad(q), ad(k), ad(v), ad(qw), ad(kw_w), eps, len, kwidth, vwidth, kernel, ad(a), ad(b), ad(a_log), ad(dt_bias), ad(gate), ad(beta), heads, gate_dim, lower }) |val| try args.add(val);
     const n: usize = @intCast(len);
     const kwu: usize = @intCast(kwidth);
     const vwu: usize = @intCast(vwidth);
@@ -113,7 +132,8 @@ pub fn tf_gdn_prompt_prep(l: *const Launcher, x: C, kind: c_int, weight: CF, sta
     const qk_heads = 2 * kwu / 128;
     const per_v = (vwu + 255) / 256;
     const states = @as(usize, @intCast(kernel - 1)) * (2 * kwu + vwu);
-    const total = (qk_heads * segs + 7) / 8 + per_v * segs + (n * @as(usize, @intCast(heads)) + 255) / 256 + (states + 255) / 256;
+    const gates = n * @as(usize, @intCast(heads)) * @as(usize, if (gate_dim == kda_dim) kda_dim else 1);
+    const total = (qk_heads * segs + 7) / 8 + per_v * segs + (gates + 255) / 256 + (states + 255) / 256;
     const blocks: c_int = @intCast(total);
     try l.go(l.op.gdn_prompt_prep, dim(blocks, 1, 1), dim(256, 1, 1), 0, s, &args);
 }
