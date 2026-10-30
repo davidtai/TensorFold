@@ -95,20 +95,31 @@ pub fn latentWrite(k: Kernels, s: S, lat: u64, lat_stride: usize, cache: u64, po
     try k.go(k.lat_write, dim(rows, 1, 1), dim(64, 1, 1), s, &a);
 }
 
-/// latent.absorb_q: qa [rows][heads][512] bf16 = q [rows][heads][256] . wk [heads][256][512] (kv_b's key rows).
-pub fn absorbQ(k: Kernels, s: S, q: u64, wk: u64, qa: u64, rows: usize, heads: usize) Error!void {
+/// kv_b_proj as stored ([heads x 512][512] bf16: per head its 256 key rows, then its 256 value rows): Wk_h at
+/// kvKeys(kv_b) + h kv_head, Wv_h at kvValues(kv_b) + h kv_head (elements). cuda_weights.zig:186-192 splits the same rows.
+pub const kv_head: usize = (qk + dv) * lw;
+pub fn kvKeys(kv_b: u64) u64 {
+    return kv_b;
+}
+pub fn kvValues(kv_b: u64) u64 {
+    return kv_b + qk * lw * 2;
+}
+
+/// latent.absorb_q: qa [rows][heads][512] bf16 = q_h . Wk_h; q rows `q_stride` values apart (head h at column 256 h),
+/// Wk_h [256][512] at wk + h w_head elements.
+pub fn absorbQ(k: Kernels, s: S, q: u64, q_stride: usize, wk: u64, w_head: usize, qa: u64, rows: usize, heads: usize) Error!void {
     if (rows == 0) return;
     var a: Args = .{};
-    inline for (.{ q, wk, qa, @as(c_int, @intCast(rows)), @as(c_int, @intCast(heads)) }) |v| try a.add(v);
+    inline for (.{ q, @as(i64, @intCast(q_stride)), wk, @as(i64, @intCast(w_head)), qa, @as(c_int, @intCast(rows)), @as(c_int, @intCast(heads)) }) |v| try a.add(v);
     try k.go(k.absorb_q, dim(heads, lw / 256, cdiv(rows, 16)), dim(256, 1, 1), s, &a);
 }
 
-/// latent.expand_v: out [rows][heads][256] bf16 = o_lat [rows][heads][512] . wv [heads][256][512] (kv_b's value rows).
-pub fn expandV(k: Kernels, s: S, ol: u64, wv: u64, out: u64, rows: usize, heads: usize) Error!void {
+/// latent.expand_v: out [rows][heads][256] bf16 = o_lat [rows][heads][512] . Wv_h^T, Wv_h [256][512] at wv + h w_head.
+pub fn expandV(k: Kernels, s: S, ol: u64, wv: u64, w_head: usize, out: u64, rows: usize, heads: usize) Error!void {
     if (rows == 0) return;
-    try shape(wv % 16 == 0);
+    try shape(wv % 16 == 0 and w_head % 8 == 0);
     var a: Args = .{};
-    inline for (.{ ol, wv, out, @as(c_int, @intCast(rows)), @as(c_int, @intCast(heads)) }) |v| try a.add(v);
+    inline for (.{ ol, wv, @as(i64, @intCast(w_head)), out, @as(c_int, @intCast(rows)), @as(c_int, @intCast(heads)) }) |v| try a.add(v);
     try k.go(k.expand_v, dim(heads, dv / 32, cdiv(rows, 8)), dim(256, 1, 1), s, &a);
 }
 
@@ -151,14 +162,15 @@ pub fn scratchBytes(rows: usize, np: usize) usize {
 /// sparse.select_tokens for rows row0 .. row0 + rows - 1 of a window at pos (host_pos on the host): the pool scores,
 /// then each row's list (tokens i32 [rows][width], counts and sparse i32 [rows]). A row with more than 512 complete
 /// pools: sparse 1, its 512 best pools' tokens ascending (ties to the lower pool) then the incomplete pool's tail,
-/// count 4 512 + tail. Else sparse 0 and count = position + 1 (attend densely). qi bf16 [rows][32][128]; wts the head
-/// weights (bf16, row stride `w_stride`); pk the pooled keys. `np` = poolBucket(...) is the scores' row stride.
-pub fn selectTokens(k: Kernels, s: S, qi: u64, wts: u64, w_stride: usize, pk: u64, pos: u64, row0: usize, host_pos: usize, rows: usize, np: usize, sc: Scratch, tokens: u64, counts: u64, sparse: u64) Error!void {
+/// count 4 512 + tail. Else sparse 0 and count = position + 1 (attend densely). qi bf16 rows of 32 x 128, `qi_stride`
+/// values apart; wts the head weights (bf16, row stride `w_stride`); pk the pooled keys. `np` = poolBucket(...) is the
+/// scores' row stride.
+pub fn selectTokens(k: Kernels, s: S, qi: u64, qi_stride: usize, wts: u64, w_stride: usize, pk: u64, pos: u64, row0: usize, host_pos: usize, rows: usize, np: usize, sc: Scratch, tokens: u64, counts: u64, sparse: u64) Error!void {
     if (rows == 0) return;
     const cols = scoreColumns(host_pos + row0, rows, np);
     var a: Args = .{};
     const scale: f32 = @floatCast(1.0 / @sqrt(@as(f64, index_dims)));
-    inline for (.{ qi, wts, @as(i64, @intCast(w_stride)), pk, sc.scores, @as(i64, @intCast(np)), sc.complete, sc.ends, pos, @as(c_int, @intCast(row0)), @as(c_int, @intCast(cols)), scale, head_scale, @as(c_int, topk_pools) }) |v| try a.add(v);
+    inline for (.{ qi, @as(i64, @intCast(qi_stride)), wts, @as(i64, @intCast(w_stride)), pk, sc.scores, @as(i64, @intCast(np)), sc.complete, sc.ends, pos, @as(c_int, @intCast(row0)), @as(c_int, @intCast(cols)), scale, head_scale, @as(c_int, topk_pools) }) |v| try a.add(v);
     try k.go(k.scores, dim(rows, cdiv(cols, 64), 1), dim(128, 1, 1), s, &a);
     try selectLists(k, s, sc, np, rows, tokens, counts, sparse);
 }

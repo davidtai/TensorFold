@@ -31,25 +31,26 @@ tf_glm_lat_write(const uint16_t* __restrict__ lat, long long lat_stride, uint16_
     reinterpret_cast<uint4*>(cache + at * kLw)[threadIdx.x] = src[threadIdx.x];
 }
 
-// ---- The absorb: qa [rows][heads][512] bf16 = q [rows][heads][256] . wk [heads][256][512], fp32 fma in k order.
-// Block (head, 256 columns, RB rows), a thread a column: wk's rows read once a block, the rows' q in LDS.
+// ---- The absorb: qa [rows][heads][512] bf16 = q [rows][heads][256] . Wk_h [256][512], fp32 fma in k order. q rows are
+// q_stride values apart (q_b's columns of the [q_b | wq_b] rows); head h's Wk at wk + h w_head (kv_b as stored: Wk_h is
+// rows 512 h .. 512 h + 255, w_head 512 x 512). Block (head, 256 columns, RB rows), a thread a column.
 constexpr int kAbsorbRows = 16;
 
 extern "C" __global__ void __launch_bounds__(256)
-tf_glm_absorb_q(const uint16_t* __restrict__ q, const uint16_t* __restrict__ wk, uint16_t* __restrict__ qa, int rows,
-                int heads) {
+tf_glm_absorb_q(const uint16_t* __restrict__ q, long long q_stride, const uint16_t* __restrict__ wk, long long w_head,
+                uint16_t* __restrict__ qa, int rows, int heads) {
     __shared__ float qs[kAbsorbRows][kQk];
     const int h = blockIdx.x, n = blockIdx.y * 256 + threadIdx.x, r0 = blockIdx.z * kAbsorbRows;
     const int nr = min(kAbsorbRows, rows - r0);
     for (int i = threadIdx.x; i < nr * kQk; i += 256) {
         const int j = i / kQk, k = i % kQk;
-        qs[j][k] = bf16_to_float(q[(static_cast<long long>(r0 + j) * heads + h) * kQk + k]);
+        qs[j][k] = bf16_to_float(q[static_cast<long long>(r0 + j) * q_stride + h * kQk + k]);
     }
     __syncthreads();
     float acc[kAbsorbRows];
 #pragma unroll
     for (int j = 0; j < kAbsorbRows; ++j) acc[j] = 0.f;
-    const uint16_t* w = wk + static_cast<long long>(h) * kQk * kLw + n;
+    const uint16_t* w = wk + h * w_head + n;
     for (int k = 0; k < kQk; ++k) {
         const float wv = bf16_to_float(w[static_cast<long long>(k) * kLw]);
 #pragma unroll
@@ -58,14 +59,15 @@ tf_glm_absorb_q(const uint16_t* __restrict__ q, const uint16_t* __restrict__ wk,
     for (int j = 0; j < nr; ++j) qa[(static_cast<long long>(r0 + j) * heads + h) * kLw + n] = float_to_bf16(acc[j]);
 }
 
-// ---- The expand: out [rows][heads][256] bf16 = o_lat [rows][heads][512] . wv [heads][256][512]^T.
+// ---- The expand: out [rows][heads][256] bf16 = o_lat [rows][heads][512] . Wv_h [256][512]^T, head h's Wv at
+// wv + h w_head (kv_b as stored: rows 512 h + 256 .. 512 h + 511).
 // Block (head, 32 outputs, RB rows), 8 waves of 4 outputs: lane l holds latent columns 16 l .. 16 l + 15 of the
 // output's wv row, adds its 16 products in order, then the lanes by xor 16, 8, 4, 2, 1.
 constexpr int kExpandRows = 8;
 
 extern "C" __global__ void __launch_bounds__(256)
-tf_glm_expand_v(const uint16_t* __restrict__ ol, const uint16_t* __restrict__ wv, uint16_t* __restrict__ out, int rows,
-                int heads) {
+tf_glm_expand_v(const uint16_t* __restrict__ ol, const uint16_t* __restrict__ wv, long long w_head,
+                uint16_t* __restrict__ out, int rows, int heads) {
     __shared__ float os[kExpandRows][kLw];
     const int h = blockIdx.x, r0 = blockIdx.z * kExpandRows;
     const int lane = threadIdx.x & 31, wave = threadIdx.x >> 5;
@@ -77,7 +79,7 @@ tf_glm_expand_v(const uint16_t* __restrict__ ol, const uint16_t* __restrict__ wv
     __syncthreads();
     for (int o = 0; o < 4; ++o) {
         const int jo = blockIdx.y * 32 + wave * 4 + o;
-        const uint16_t* wrow = wv + (static_cast<long long>(h) * kDv + jo) * kLw + lane * 16;
+        const uint16_t* wrow = wv + h * w_head + static_cast<long long>(jo) * kLw + lane * 16;
         float w[16];
         const uint4 a = reinterpret_cast<const uint4*>(wrow)[0], b = reinterpret_cast<const uint4*>(wrow)[1];
         const uint32_t ws[8] = {a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w};
@@ -162,9 +164,9 @@ tf_glm_pool_keys(const uint16_t* ik, const uint16_t* ig, const uint16_t* __restr
 // for the row's complete pools (p < (P + 1) / 4, P = pos[0] + row0 + r); -inf from there up to the launch's columns.
 // Rows with at most `top` complete pools attend densely: none is scored. Block (row, 64 pools), 4 waves of 16 pools,
 // lane l holds dims 4 l .. 4 l + 3. The block of pools 0 also writes the row's complete (pools) and end (P + 1) for
-// tf_fn_idx_select. A score is written + 0 (so -0 is +0: the two are one order key, as sparse._order_key).
+// tf_fn_idx_select. qi rows are qi_stride values apart (wq_b's columns of [q_b | wq_b] rows). A score is written + 0 (so -0 is +0: the two are one order key, as sparse._order_key).
 extern "C" __global__ void __launch_bounds__(128)
-tf_glm_scores(const uint16_t* __restrict__ qi, const uint16_t* __restrict__ wts, long long w_stride,
+tf_glm_scores(const uint16_t* __restrict__ qi, long long qi_stride, const uint16_t* __restrict__ wts, long long w_stride,
               const uint16_t* __restrict__ pk, float* __restrict__ out, long long np, int* __restrict__ complete,
               int* __restrict__ ends, const int* __restrict__ pos, int row0, int cols, float scale, float wscale,
               int top) {
@@ -180,7 +182,7 @@ tf_glm_scores(const uint16_t* __restrict__ qi, const uint16_t* __restrict__ wts,
     }
     if (npool <= top) return;
     for (int i = threadIdx.x; i < kIdxHeads * kIdxD; i += 128)
-        qs[i / kIdxD][i % kIdxD] = bf16_to_float(qi[r * kIdxHeads * kIdxD + i]);
+        qs[i / kIdxD][i % kIdxD] = bf16_to_float(qi[r * qi_stride + i]);
     if (threadIdx.x < kIdxHeads) ws[threadIdx.x] = bf16_to_float(wts[r * w_stride + threadIdx.x]) * wscale;
     __syncthreads();
     const int lim = min(cols, static_cast<int>(np));
