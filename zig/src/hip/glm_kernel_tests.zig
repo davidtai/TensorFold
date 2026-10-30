@@ -12,4 +12,5 @@ test {
     _ = @import("kernel_tests/glm/router.zig");
     _ = @import("kernel_tests/glm/mtp.zig");
     _ = @import("kernel_tests/glm/swiglu.zig");
+    _ = @import("kernel_tests/glm/dsa.zig");
 }
