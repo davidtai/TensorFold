@@ -1,7 +1,9 @@
 //! GLM-5.3-Flash served by the lane core on HIP: the weights (open.zig), lane F's eager forward (forward.zig) for
-//! prompt chunks and decode windows, one state a stream, the draw on the head's fp32 logits. Serial decode: every
-//! window is the pending token alone (no drafts); `keepRows` of fewer rows than a window is the hook for the MTP
-//! verify and keep (an error until the forward has its rollback).
+//! prompt chunks and decode windows, one state a stream, the draw on the head's fp32 logits.
+//! A stream that drafts (MTP, d <= 3) runs lane F's rounds: the prompt's rows j < t - 1 through the MTP layer
+//! (`mtp`), a verify window of the pending token and the drafts (`window`, held: nothing kept), the keep of the
+//! accepted rows (`keep`), and the next drafts from the kept rows (`draft`). A stream that does not draft runs the
+//! serial forward (`run`), as before: its prompt and decode work is unchanged.
 
 const std = @import("std");
 const hip = @import("hip");
@@ -19,8 +21,10 @@ const glue = serve.backend;
 const D: usize = 4096;
 const V: usize = 154880;
 
-/// Rows a window holds at most: the pending token (serial decode).
-pub const max_window = 1;
+/// Drafts a round holds at most (the CUDA GLM path's 3, `cuda_engine.zig:25-26`).
+pub const max_drafts = 3;
+/// Rows a window holds at most: the pending token and the drafts.
+pub const max_window = 1 + max_drafts;
 
 /// The device side: the weights, the launcher, the prompt and decode windows of the forward.
 pub const Engine = struct {
@@ -32,8 +36,15 @@ pub const Engine = struct {
     opened: open.Opened,
     pb: state.Buffers,
     db: state.Buffers,
+    /// The draft rounds' own decode buffers (lane F: `draft` overwrites its Forward's rows).
+    mb: state.Buffers,
     fp: forward.Forward,
     fd: forward.Forward,
+    fm: forward.Forward,
+    /// A prompt chunk's final-normed rows, the MTP layer's input in the prompt pass (bf16 [chunk][D]).
+    phid: hip.DeviceBuffer,
+    /// Drafts a round asks for at most (0: no stream drafts; the MTP prompt pass is skipped).
+    drafts: usize,
     /// Positions a stream's state holds: align64(window + 8).
     capacity: usize,
     /// Prompt rows a forward takes at once.
@@ -42,12 +53,14 @@ pub const Engine = struct {
     row: []f32,
 
     /// The weights of `dir` on device `index`, then the windows; `problem` (in `a`) says why not.
-    pub fn create(gpa: std.mem.Allocator, a: std.mem.Allocator, io: std.Io, index: c_int, dir: []const u8, capacity: usize, chunk: usize, problem: *[]const u8) !*Engine {
+    pub fn create(gpa: std.mem.Allocator, a: std.mem.Allocator, io: std.Io, index: c_int, dir: []const u8, capacity: usize, chunk: usize, drafts: usize, problem: *[]const u8) !*Engine {
+        if (drafts > max_drafts) return error.TooManyDrafts;
         const e = try gpa.create(Engine);
         errdefer gpa.destroy(e);
         e.gpa = gpa;
         e.capacity = capacity;
         e.chunk = chunk;
+        e.drafts = drafts;
         e.r = try hip.Runtime.open();
         errdefer e.r.close();
         e.ctx = try hip.Context.init(&e.r, index);
@@ -63,9 +76,14 @@ pub const Engine = struct {
         errdefer e.pb.deinit();
         e.db = try state.Buffers.init(&e.r, state.window_rows, false, capacity);
         errdefer e.db.deinit();
+        e.mb = try state.Buffers.init(&e.r, state.window_rows, false, capacity);
+        errdefer e.mb.deinit();
+        e.phid = try hip.DeviceBuffer.alloc(&e.r, if (drafts > 0) chunk * D * 2 else 0);
+        errdefer e.phid.free();
         const cfg = e.opened.ck.config;
         e.fp = try forward.Forward.init(&e.l, e.opened.model(), cfg, e.stream.handle, &e.pb);
         e.fd = try forward.Forward.init(&e.l, e.opened.model(), cfg, e.stream.handle, &e.db);
+        e.fm = try forward.Forward.init(&e.l, e.opened.model(), cfg, e.stream.handle, &e.mb);
         e.row = try gpa.alloc(f32, V);
         return e;
     }
@@ -73,6 +91,8 @@ pub const Engine = struct {
     pub fn deinit(e: *Engine) void {
         e.stream.synchronize() catch {};
         e.gpa.free(e.row);
+        e.phid.free();
+        e.mb.deinit();
         e.db.deinit();
         e.pb.deinit();
         e.l.unload();
@@ -85,7 +105,7 @@ pub const Engine = struct {
 
     /// Device bytes of the two windows' buffers and arenas (the forward's scratch).
     pub fn scratchBytes(e: *const Engine) u64 {
-        return e.pb.buf.len + e.pb.arena.len + e.db.buf.len + e.db.arena.len;
+        return e.pb.buf.len + e.pb.arena.len + e.db.buf.len + e.db.arena.len + e.mb.buf.len + e.mb.arena.len + e.phid.len;
     }
 
     pub fn eos(e: *const Engine) []const u32 {
@@ -96,9 +116,15 @@ pub const Engine = struct {
 
 pub const Lane = struct {
     st: state.State,
-    /// Drafts held for the next window (none in serial decode).
-    held: [1]u32 = undefined,
+    /// The stream drafts (its request asks for drafts and the engine has them): lane F's MTP rounds.
+    mtp: bool = false,
+    /// The last window ran held (`window`): its keep goes through lane F's `keep`; else `run` kept every row.
+    windowed: bool = false,
+    /// Drafts held for the next window.
+    held: [max_drafts]u32 = undefined,
     held_n: usize = 0,
+    /// The rows the next draft absorbs: the last window's final-normed rows, or the prompt's last row (bf16 [rows][D]).
+    hidden: hip.DeviceBuffer,
     /// The prompt pass in progress, a chunk a call (null once it is in).
     fill: ?glue.Fill = null,
     /// The last window's rows until their keep.
@@ -180,17 +206,24 @@ pub const Hip = struct {
         for (0..count) |_| {
             const l = try gpa.create(Lane);
             errdefer gpa.destroy(l);
-            l.* = .{ .st = try state.State.init(&e.r, e.capacity) };
+            var st = try state.State.init(&e.r, e.capacity);
+            errdefer st.deinit();
+            var hidden = try hip.DeviceBuffer.alloc(&e.r, state.window_rows * D * 2);
+            errdefer hidden.free();
+            l.* = .{ .st = st, .hidden = hidden };
             try h.spare.append(gpa, l);
         }
         return h;
     }
 
+    fn drop(h: *Hip, l: *Lane) void {
+        l.hidden.free();
+        l.st.deinit();
+        h.gpa.destroy(l);
+    }
+
     fn dropAll(h: *Hip) void {
-        for (h.spare.items) |l| {
-            l.st.deinit();
-            h.gpa.destroy(l);
-        }
+        for (h.spare.items) |l| h.drop(l);
         h.spare.deinit(h.gpa);
     }
 
@@ -205,15 +238,17 @@ pub const Hip = struct {
         h.gpa.destroy(h);
     }
 
-    /// The facts the round loop reads: one-row windows, a stream a window, no draft head.
+    /// The facts the round loop reads: windows of the pending token and up to `drafts` drafts (each row the serial
+    /// row's bytes: contract 7), a stream a window, the MTP layer drafting from a verify's kept rows.
     pub fn facts(h: *const Hip) lanes.Model {
+        const drafting = h.e.drafts > 0;
         return .{
-            .exact_width = max_window,
+            .exact_width = @intCast(1 + h.e.drafts),
             .gpu_tokens = false,
-            .mtp = false,
-            .speculate = false,
+            .mtp = drafting,
+            .speculate = drafting,
             .speculate_early = false,
-            .drafts = 0,
+            .drafts = @intCast(h.e.drafts),
             .copy_drafts = false,
             .hidden_rows = false,
             .batch_rows = max_window,
@@ -231,10 +266,7 @@ pub const Hip = struct {
         l.first_row = null;
         l.fill = null;
         l.pending = null;
-        h.spare.append(h.gpa, l) catch {
-            l.st.deinit();
-            h.gpa.destroy(l);
-        };
+        h.spare.append(h.gpa, l) catch h.drop(l);
     }
 
     /// The stream's lane and its prompt pass begun from 0 (no prompt cache).
@@ -248,7 +280,8 @@ pub const Hip = struct {
         errdefer h.free(l);
         try l.st.reset(h.e.stream.handle);
         const st = l.st;
-        l.* = .{ .st = st };
+        const hidden = l.hidden;
+        l.* = .{ .st = st, .hidden = hidden, .mtp = s.drafts and h.e.drafts > 0 };
         gop.value_ptr.* = l;
         l.id = try h.streams.idOf(s);
         s.cached = 0;
@@ -266,8 +299,23 @@ pub const Hip = struct {
         return null;
     }
 
+    /// `n` bytes from device address `src` to `dst` on the engine's stream.
+    fn copy(e: *Engine, dst: u64, src: u64, n: usize) !void {
+        try hip.runtime.check(e.r.api.hipMemcpyDtoDAsync(@ptrFromInt(dst), @ptrFromInt(src), n, e.stream.handle));
+    }
+
+    /// A drafting stream's prompt rows [from, from + rows) through the MTP layer, each with the next prompt id
+    /// (lane F's `mtp`: row j is h_j and token j + 1). The prompt's last row waits for the first drawn token.
+    fn mtpPrompt(h: *Hip, l: *Lane, prompt: []const u32, from: usize, rows: usize) !void {
+        if (!l.mtp or rows == 0) return;
+        const e = h.e;
+        try copy(e, e.phid.base(), e.fp.b.fnormed, rows * D * 2);
+        try e.fp.mtp(&l.st, prompt[from + 1 ..][0..rows], e.phid.base());
+    }
+
     pub fn advance(h: *Hip, l: *Lane, prompt: []const u32, from: usize, to: usize, _: ?void) !void {
         try h.e.fp.run(&l.st, prompt[from..to]);
+        try h.mtpPrompt(l, prompt, from, to - from);
     }
 
     /// The prompt's last chunk; its last row's token drawn as `req` says (lm_head on that row alone, as lane F's CLI).
@@ -281,6 +329,11 @@ pub const Hip = struct {
             x.* = bf16(v);
         };
         const token = try drawRow(h.gpa, e.row, req);
+        if (l.mtp) {
+            // the last row is the first draft's to absorb (with the token just drawn); the rest go through now
+            try copy(e, l.hidden.base(), e.fp.b.fnormed + (n - 1) * D * 2, D * 2);
+            try h.mtpPrompt(l, prompt, from, n - 1);
+        }
         if (h.trace) std.log.info("glm trace {d} first at {d}: {d}", .{ l.id, prompt.len, token });
         return token;
     }
@@ -288,7 +341,9 @@ pub const Hip = struct {
     /// No prompt cache: a pass has no cuts.
     pub fn keepCut(_: *Hip, _: *Lane, _: []const u32, _: usize) !void {}
 
-    /// Each stream's window from its kept length, one forward a stream: the pending token, drawn per its request.
+    /// Each stream's window from its kept length, one forward a stream: the pending token and its drafts, each row
+    /// drawn per its request. A drafting stream's window is held (lane F's `window`) until its keep; its final-normed
+    /// rows are kept for the next draft. Another stream's window is the serial forward's one row.
     pub fn verify(h: *Hip, ws: []const be.Window, out: []be.Verified) !void {
         const e = h.e;
         for (ws, out) |w, *o| {
@@ -300,7 +355,14 @@ pub const Hip = struct {
             var reqs: [state.window_rows]draw.Request = undefined;
             glue.requests(w, &reqs);
             const pos = l.st.pos;
-            try e.fd.run(&l.st, toks[0..n]);
+            if (l.mtp) {
+                try e.fd.window(&l.st, toks[0..n]);
+                try copy(e, l.hidden.base(), e.fd.b.fnormed, n * D * 2);
+            } else {
+                if (n > 1) return error.WindowTooWide;
+                try e.fd.run(&l.st, toks[0..n]);
+            }
+            l.windowed = l.mtp;
             const lg = try e.fd.head(e.fd.b.fnormed, n);
             for (0..n) |r| {
                 try e.fd.download(f32, lg + r * V * 4, e.row);
@@ -308,25 +370,48 @@ pub const Hip = struct {
             }
             @memcpy(o.drafts, toks[1..n]);
             l.pending = .{ .rows = n };
-            if (h.trace) std.log.info("glm trace {d} at {d}: {d} -> {d}", .{ l.id, pos, toks[0], o.sampled[0] });
+            if (h.trace) std.log.info("glm trace {d} at {d}: {any} -> {any}", .{ l.id, pos, toks[0..n], o.sampled[0..n] });
         }
     }
 
-    /// The last window's first `rows` rows kept. The forward commits every row it runs, so a keep of fewer rows needs
-    /// its rollback (lane F's verify and KDA keep): until then that is an error.
-    pub fn keepRows(_: *Hip, l: *Lane, rows: usize) !void {
+    /// The last window's first `rows` rows kept: a held window through lane F's `keep` (the KDA states replayed
+    /// through the kept rows, the conv windows shifted, the position moved); the serial forward kept its one row.
+    pub fn keepRows(h: *Hip, l: *Lane, rows: usize) !void {
         const n = (l.pending orelse return).rows;
         if (rows == 0 or rows > n) return error.PositionMismatch;
-        if (rows < n) return error.NoRollbackYet;
+        if (l.windowed) {
+            try h.e.fd.keep(&l.st, rows);
+        } else if (rows < n) return error.PositionMismatch;
+        if (h.trace and l.windowed) std.log.info("glm trace {d} keep {d} of {d} at {d}", .{ l.id, rows, n, l.st.pos });
         l.pending = null;
     }
 
     /// The keeps land as they are marked.
     pub fn flush(_: *Hip) !void {}
 
-    /// No draft head in serial decode.
-    pub fn draft(_: *Hip, _: []const be.DraftRequest) !void {
-        return error.NoDraftHead;
+    /// Each stream's next drafts: its kept rows (the last window's, or the prompt's last row with the first drawn
+    /// token) absorbed by the MTP layer, then `depth` greedy drafts chained from the last pair (lane F's `draft`).
+    pub fn draft(h: *Hip, reqs: []const be.DraftRequest) !void {
+        const e = h.e;
+        for (reqs) |r| {
+            const l = try h.streams.get(r.stream);
+            try glue.keepFor(h, l, r);
+            l.held_n = 0;
+            if (!l.mtp) continue; // a stream that does not draft holds none (flashnext/hip/lanes.zig draftFn)
+            if (r.position != l.st.pos + 1) {
+                std.log.err("draft for {s} at {d}, the stream holds {d} positions", .{ r.stream.id, r.position, l.st.pos });
+                return error.PositionMismatch;
+            }
+            var first: [1]u32 = undefined;
+            const follow: []const u32 = if (r.rows != null) r.follow else blk: {
+                first[0] = try glue.firstToken(&h.streams.drawn, r);
+                break :blk &first;
+            };
+            if (follow.len == 0 or follow.len > state.window_rows) return error.PositionMismatch;
+            const depth = @min(r.depth, e.drafts);
+            l.held_n = try e.fm.draft(&l.st, l.hidden.base(), follow, depth, l.held[0..depth]);
+            if (h.trace) std.log.info("glm trace {d} draft at {d}: pairs {any} -> {any}", .{ l.id, l.st.pos, follow, l.held[0..l.held_n] });
+        }
     }
 
     pub fn release(h: *Hip, l: *Lane) void {

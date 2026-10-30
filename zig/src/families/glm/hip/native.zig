@@ -67,9 +67,25 @@ fn check(a: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, dir: []const 
 /// (8,192; +7 % prefill on the 16K coding workload against 2,048, scratch 4.44 GiB). `--policy prefill_step=` takes
 /// a smaller chunk. A row's bytes do not depend on the chunk (contract 7).
 pub const policy_prefill_step: u32 = state.prompt_rows;
-/// Serial decode: no draft head yet, so --mtp-drafts past 0 is refused before the load.
-pub const max_drafts: u32 = 0;
-pub const confidence_refusal = "--mtp-confidence: GLM-5.3-Flash on HIP drafts nothing yet (serial decode); serve it without --mtp-confidence";
+/// Drafts a round holds at most (the MTP layer's chain, lane F's `draft`): --mtp-drafts past it is refused before the
+/// load.
+pub const max_drafts: u32 = serve.max_drafts;
+/// The MTP policy where neither --mtp-drafts, --mtp-confidence nor the mtp_depth key names one (the HIP default is 3
+/// drafts under 0.3): 3 drafts, the lane core's depth rule, no confidence floor. The draft head gives no probabilities
+/// yet, so the policy's confidence is never read: --mtp-confidence is refused, and --mtp-drafts alone drafts the
+/// lane core's depth with no floor.
+pub const policy_mtp: struct { drafts: u8, confidence: f64, depth: hip.policy.MtpDepth } = .{ .drafts = 3, .confidence = 0, .depth = .rule };
+pub const confidence_refusal = "--mtp-confidence: GLM-5.3-Flash on HIP drafts a fixed chain (its draft head gives no " ++
+    "probabilities yet); serve it without --mtp-confidence";
+
+/// Why `policy`'s MTP settings cannot serve GLM-5.3-Flash on HIP, or null: a gated chain stops on the draft head's
+/// probabilities.
+pub fn mtpRefused(policy: hip.Policy) ?[]const u8 {
+    if (policy.mtp.drafts > 0 and policy.mtp_depth == .gated)
+        return "mtp_depth=gated: GLM-5.3-Flash on HIP drafts a fixed chain (its draft head gives no probabilities yet); " ++
+            "serve it with the depth rule (no mtp_depth key, or mtp_depth=rule)";
+    return null;
+}
 
 /// The GLM forward launches the exact kernels only (lane F's launcher, numerics=exact): another policy is refused.
 pub const inexact_refusal = "GLM-5.3-Flash on HIP runs numerics=exact only (no inexact path yet): serve it without --policy numerics=inexact";
@@ -114,12 +130,14 @@ pub fn open(
 ) anyerror!Loaded {
     _ = try check(a, gpa, io, dir, problem);
     if (numericsRefused(dev.policy)) |why| return refuse(a, problem, "{s}", .{why});
+    if (mtpRefused(dev.policy)) |why| return refuse(a, problem, "{s}", .{why});
     if (o.world > 1) return refuse(a, problem, "GLM-5.3-Flash on HIP runs on one device: serve it with --tp 1", .{});
     if (o.cache_gib) |g| if (g > 0) return refuse(a, problem, "GLM-5.3-Flash on HIP keeps no prompt cache yet: serve it with --prompt-cache-gib 0", .{});
     const capacity = std.mem.alignForward(usize, o.window + 8, 64); // cuda_state.zig's align64(context + 8)
     const chunk: usize = @min(@max(dev.policy.prefill_step, 64), state.prompt_rows);
     problem.* = "";
-    const e = serve.Engine.create(gpa, a, io, dev.index, dir, capacity, chunk, problem) catch |err| {
+    const drafts: usize = @min(dev.policy.mtp.drafts, serve.max_drafts);
+    const e = serve.Engine.create(gpa, a, io, dev.index, dir, capacity, chunk, drafts, problem) catch |err| {
         if (problem.len == 0) return refuse(a, problem, "the native HIP engine cannot load GLM-5.3-Flash from {s} ({t})", .{ dir, err });
         return error.Refused;
     };
@@ -150,7 +168,8 @@ pub fn open(
     const after = load.memAvailable() orelse 0;
     const startup = try std.fmt.allocPrint(gpa, "HIP {s} device {d}: GLM-5.3-Flash weights {d:.3} GiB (loaded in " ++
         "{d:.1} s), scratch {d:.2} GiB (prompt chunks of {d} rows); {d} stream{s} at a {d}-token window, {d:.3} " ++
-        "GiB each; MemAvailable {d:.2} GiB left (floor {d:.0} GiB); serial decode (no drafts), no prompt cache", .{
+        "GiB each; MemAvailable {d:.2} GiB left (floor {d:.0} GiB); MTP up to {d} drafts a round for a drafting " ++
+        "request (--no-drafts: serial decode), no prompt cache", .{
         hip.kernels.arch,
         dev.index,
         gib(weights),
@@ -163,6 +182,7 @@ pub fn open(
         gib(per),
         gib(after),
         gib(floor),
+        drafts,
     });
     errdefer gpa.free(startup);
     const own = try gpa.create(Owned);
@@ -170,7 +190,7 @@ pub fn open(
     return .{
         .backend = h.backend(),
         .facts = h.facts(),
-        .rows = serve.max_window,
+        .rows = @intCast(1 + drafts),
         .ctx = own,
         .deinit = Owned.release,
         .streams = streams,
@@ -213,4 +233,17 @@ test "GLM on HIP serves numerics=exact only: an inexact policy is refused by nam
     p.numerics = .inexact;
     try std.testing.expectEqualStrings(inexact_refusal, numericsRefused(p).?);
     try std.testing.expect(std.mem.indexOf(u8, numericsRefused(p).?, "numerics=exact only") != null);
+}
+
+test "GLM on HIP drafts a fixed chain: 3 drafts by default, a gated chain refused by name" {
+    var p: hip.Policy = .{};
+    p.mtp = .{ .drafts = policy_mtp.drafts, .confidence = policy_mtp.confidence };
+    try std.testing.expect(mtpRefused(p) == null);
+    p.mtp.confidence = 0.3; // --mtp-drafts alone keeps the HIP default's 0.3: never read, not refused
+    try std.testing.expect(mtpRefused(p) == null);
+    p.mtp_depth = .gated;
+    try std.testing.expect(std.mem.indexOf(u8, mtpRefused(p).?, "mtp_depth=gated") != null);
+    p.mtp.drafts = 0;
+    try std.testing.expect(mtpRefused(p) == null);
+    try std.testing.expectEqual(@as(u32, 3), max_drafts);
 }
