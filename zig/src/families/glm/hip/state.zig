@@ -7,8 +7,9 @@ const std = @import("std");
 const hip = @import("hip");
 const config = @import("../config.zig");
 
-/// A prompt chunk's rows (cuda_state.zig prefill_rows).
-pub const prompt_rows = 2048;
+/// The most rows a prompt chunk takes (G0-2: up to 8,192, the policy's prefill_step picks the chunk; the buffers and
+/// their arena are sized for the chosen chunk, not for this bound).
+pub const prompt_rows = 8192;
 /// A decode window's rows (the verify window of the MTP rounds; the eager forward runs 1).
 pub const window_rows = 8;
 /// Index-key and gate rows a ring holds: pool_keys reads only from the current pool's first row on.
