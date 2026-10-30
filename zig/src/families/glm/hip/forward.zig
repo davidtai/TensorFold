@@ -82,6 +82,15 @@ pub const Forward = struct {
     dsa_last: DsaLast = .{},
 
     pub const DsaLast = struct { dp: u64 = 0, qr: u64 = 0, lat: u64 = 0, qq: u64 = 0, qa: u64 = 0, ol: u64 = 0, vn: u64 = 0 };
+    /// TF_GLM_FORCE_PICKS (a diagnostic, never served): each MoE layer takes these picks and weights for its rows in
+    /// place of its own router's, so a compare measures the numerics with the reference's routing.
+    force: ?*const Force = null,
+    /// The last MoE block's picks and weights in the arena (valid until the next block).
+    moe_last: struct { pick: u64 = 0, wts: u64 = 0 } = .{},
+
+    /// Picks i32-able int16 and weights fp32, [router layers 46][rows][8] as G5's router_picks / router_weights hold
+    /// them (layer 45: the MTP layer; rows: sequence rows from the prompt's first).
+    pub const Force = struct { picks: []const i16, wts: []const f32, rows: usize };
 
     pub fn init(l: *const hip.Launcher, w: *const weights.Model, cfg: config.Config, s: S, b: *Buffers) !Forward {
         return .{ .l = l, .k = try dsa.Kernels.load(l), .w = w, .cfg = cfg, .s = s, .b = b };
@@ -297,6 +306,8 @@ pub const Forward = struct {
         const wts = try ar.of(f32, pairs);
         try f.lin(b.normed, w.router, R, mlog, false);
         try nemo.select(f.l, cf(mlog), cf(w.bias), mi(pick), mf(wts), null, null, 0, int(R), int(E), int(top_k), f.cfg.routed_scale, f.cfg.norm_topk, f.s);
+        if (f.force) |fc| try f.forcePicks(fc, layer, R, pick, wts);
+        f.moe_last = .{ .pick = pick, .wts = wts };
         // the plan over the routed pairs (experts + 1 as G1's tests plan them); 128 pairs an item in a prompt
         const tile: usize = if (b.prompt) 128 else 8;
         const cap: usize = @min(pairs, E + 1) + pairs / tile;
@@ -313,6 +324,23 @@ pub const Forward = struct {
         try f.lin(sact, w.shared_down, R, sy, false);
         try nemo.combine(f.l, cf(ey), cf(wts), cf(sy), m(b.part), 0, int(R), int(top_k), int(D), f.s);
         if (f.seq) |s| try f.dumpRouter(s, layer, pick, wts, R);
+    }
+
+    /// The forced picks and weights of rows row0 .. row0 + R of router layer `layer` over the router's.
+    fn forcePicks(f: *Forward, fc: *const Force, layer: usize, R: usize, pick: u64, wts: u64) !void {
+        if (f.row0 + R > fc.rows or layer >= dump.router_layers) return error.ForceRows;
+        const ids = try f.host.alloc(i32, R * top_k);
+        defer f.host.free(ids);
+        const ws = try f.host.alloc(f32, R * top_k);
+        defer f.host.free(ws);
+        const at = (layer * fc.rows + f.row0) * top_k;
+        for (ids, fc.picks[at..][0 .. R * top_k]) |*o, v| {
+            if (v < 0 or v >= experts) return error.ForcePick;
+            o.* = v;
+        }
+        @memcpy(ws, fc.wts[at..][0 .. R * top_k]);
+        try f.upload(pick, std.mem.sliceAsBytes(ids));
+        try f.upload(wts, std.mem.sliceAsBytes(ws));
     }
 
     // ---- the head and the MTP layer ----

@@ -284,11 +284,24 @@ pub fn command(init: std.process.Init, args: []const [:0]const u8) !void {
     rn.fp = try fwd.Forward.init(&l, opened.model(), cfg, rn.s.handle, &rn.pb);
     rn.fd = try fwd.Forward.init(&l, opened.model(), cfg, rn.s.handle, &rn.db);
     if (dumps) |*d| {
+        // TF_GLM_FORCE_PICKS=<run dir> (a diagnostic): the teacher-forced prompts take <dir>/<name>/router_picks.npy and
+        // router_weights.npy at every MoE layer (G5's or a HIP dump's); greedy prompts run free
+        const force_dir: ?[]const u8 = if (std.c.getenv("TF_GLM_FORCE_PICKS")) |v| std.mem.span(v) else null;
         for (d.prompts) |p| {
             const sq = try d.begin(p);
             var q: Seq = .{ .ids = p.ids, .max_gen = p.gen, .eos = eos, .tf = true, .dump = sq };
-            std.debug.print("== {s}: {d} ids, gen {d}\n", .{ p.name, p.ids.len, p.gen });
+            var fc: glm.forward.Forward.Force = undefined;
+            const forced = force_dir != null and !p.greedy;
+            if (forced) {
+                fc = try forceOf(a, io, force_dir.?, p.name, p.ids.len + p.gen - 1);
+                rn.fp.force = &fc;
+                rn.fd.force = &fc;
+            }
+            std.debug.print("== {s}: {d} ids, gen {d}{s}\n", .{ p.name, p.ids.len, p.gen, if (forced) ", routing FORCED" else "" });
+            if (forced) std.debug.print("FORCED picks and weights from {s}/{s}\n", .{ force_dir.?, p.name });
             try runSeq(a, io, &rn, &q, o.chunk, true);
+            rn.fp.force = null;
+            rn.fd.force = null;
             try sq.close();
         }
         try d.finish("tf-glm-hip-test forward: eager HIP forward, numerics=exact");
@@ -298,6 +311,28 @@ pub fn command(init: std.process.Init, args: []const [:0]const u8) !void {
     var q: Seq = .{ .ids = ids, .max_gen = @max(o.gen, 1), .eos = eos, .tf = o.tf, .dump = null };
     try runSeq(a, io, &rn, &q, o.chunk, o.mtp);
     std.debug.print("FORWARD OK\n", .{});
+}
+
+/// The forced routing of prompt `name` from run dir `dir`: router_picks.npy int16 and router_weights.npy fp32, each
+/// [46][N][8] with N at least `rows`.
+fn forceOf(a: std.mem.Allocator, io: std.Io, dir: []const u8, name: []const u8, rows: usize) !glm.forward.Forward.Force {
+    const npy = @import("core").npy;
+    const read = struct {
+        fn f(al: std.mem.Allocator, i: std.Io, d: []const u8, n: []const u8, file: []const u8) !npy.Array {
+            const bytes = try std.Io.Dir.cwd().readFileAlloc(i, try std.fs.path.join(al, &.{ d, n, file }), al, .limited(1 << 30));
+            return npy.parse(bytes);
+        }
+    }.f;
+    const pk = try read(a, io, dir, name, "router_picks.npy");
+    const wt = try read(a, io, dir, name, "router_weights.npy");
+    if (!std.mem.eql(u8, pk.descr, "<i2") or !std.mem.eql(u8, wt.descr, "<f4") or pk.rank != 3 or wt.rank != 3) return error.BadForce;
+    if (pk.shape[0] != 46 or pk.shape[2] != 8 or wt.shape[0] != 46 or wt.shape[1] != pk.shape[1] or wt.shape[2] != 8) return error.BadForce;
+    if (pk.shape[1] < rows) return error.ForceRows;
+    const picks = try a.alloc(i16, pk.count());
+    @memcpy(std.mem.sliceAsBytes(picks), pk.data);
+    const wts = try a.alloc(f32, wt.count());
+    @memcpy(std.mem.sliceAsBytes(wts), wt.data);
+    return .{ .picks = picks, .wts = wts, .rows = pk.shape[1] };
 }
 
 fn gib(n: usize) f64 {

@@ -812,6 +812,37 @@ test "glm fwd: an MoE layer (router, top-8 of 288, EXL3 experts, shared) against
         }
     }
     try expectSame("glm fwd MoE block: 300 rows = 100 x 3", std.mem.sliceAsBytes(outs[0]), std.mem.sliceAsBytes(outs[1]));
+    // TF_GLM_FORCE_PICKS: forced with the router's own picks and weights, the block gives the free run's bits
+    for ([_]bool{ true, false }) |prompt| {
+        var b = try Buffers.init(&t.r, rows, prompt, 64);
+        defer b.deinit();
+        var f = try t.fwd(&b);
+        try t.put(b.normed, std.mem.sliceAsBytes(x.bits[0 .. rows * D]));
+        try f.moeBlock(mw, 3, rows);
+        const free = try t.get(f32, b.part, rows * D);
+        const pk = try t.get(i32, f.moe_last.pick, rows * 8);
+        const ws = try t.get(f32, f.moe_last.wts, rows * 8);
+        const fp = try a.alloc(i16, 46 * rows * 8);
+        const fw = try a.alloc(f32, 46 * rows * 8);
+        @memset(fp, 0);
+        @memset(fw, 0);
+        for (pk, ws, 0..) |id, wv, i| {
+            fp[3 * rows * 8 + i] = @intCast(id);
+            fw[3 * rows * 8 + i] = wv;
+        }
+        const fc: forward.Forward.Force = .{ .picks = fp, .wts = fw, .rows = rows };
+        f.force = &fc;
+        try t.put(b.normed, std.mem.sliceAsBytes(x.bits[0 .. rows * D]));
+        try f.moeBlock(mw, 3, rows);
+        const forced = try t.get(f32, b.part, rows * D);
+        try expectSame(if (prompt) "glm fwd MoE block forced with its own picks = free (prompt)" else "glm fwd MoE block forced with its own picks = free (decode)", std.mem.sliceAsBytes(free), std.mem.sliceAsBytes(forced));
+        // and forced with other picks it differs (the switch is live)
+        for (fp[3 * rows * 8 ..][0 .. rows * 8]) |*v| v.* = @intCast(@mod(@as(i32, v.*) + 1, 288));
+        try t.put(b.normed, std.mem.sliceAsBytes(x.bits[0 .. rows * D]));
+        try f.moeBlock(mw, 3, rows);
+        const other = try t.get(f32, b.part, rows * D);
+        if (std.mem.eql(u8, std.mem.sliceAsBytes(other), std.mem.sliceAsBytes(free))) return error.ForceNotLive;
+    }
 }
 
 // ---- the DSA block on real weights, op by op (TF_GLM_DIR: the checkpoint; TF_GLM_FWD_DUMP: a TF_GLM_DUMP prompt dir) ----
