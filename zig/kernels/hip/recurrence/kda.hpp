@@ -6,8 +6,8 @@
 // dtypes are the CUDA path's (cuda_state.zig, cuda_kda_block.zig): the stacked bf16 projection rows
 // [q | k | v | f_a | g_a | b] (row stride p_stride, beta's logits at b_off), the bf16 decay and gate rows, the bf16 conv
 // window [3][3 heads 128], the saves k fp32, v bf16, decays fp32 and beta fp32. The conv taps are bf16 as the
-// checkpoint stores them (CUDA widens them at load). One difference, inside the block: q, k and the read-out y stay
-// fp32 (CUDA: q and k fp32, y bf16); out reads y fp32.
+// checkpoint stores them (CUDA widens them at load). The read-out y is stored fp32 and rounded to bf16 where out reads
+// it: CUDA's rounding point (glm_kda.cu: ys = bf(o), or the step kernel's bf16 y_out), the same bits.
 
 #include <hip/hip_runtime.h>
 
@@ -104,7 +104,8 @@ tf_kda_prep(int H, const uint16_t* __restrict__ P, int p_stride, int b_off, cons
     }
 }
 
-// Block (row, head), 128 threads: out = bf16(norm_w rms(y) sigmoid(gate)), out_kernel_body's values with y fp32.
+// Block (row, head), 128 threads: out = bf16(norm_w rms(y) sigmoid(gate)), out_kernel_body's values: y (fp32 as the scan
+// writes it) rounded to bf16 first, as CUDA rounds the read-out before the norm.
 extern "C" __global__ void __launch_bounds__(128)
 tf_kda_out(int H, const float* __restrict__ y, const uint16_t* __restrict__ G, int g_stride,
            const uint16_t* __restrict__ norm_w, float eps, uint16_t* __restrict__ out) {
@@ -118,14 +119,14 @@ tf_kda_out(int H, const float* __restrict__ y, const uint16_t* __restrict__ G, i
         float ss = 0.0f;
 #pragma unroll
         for (int i = 0; i < 4; ++i) {
-            const float v = y[base + lane * 4 + i];
+            const float v = bf(y[base + lane * 4 + i]);
             ss = ss + v * v;
         }
         ss = wave_sum(ss);
         if (lane == 0) rinv = 1.0f / sqrtf(ss / static_cast<float>(DV) + eps);
     }
     __syncthreads();
-    const float yn = y[base + t] * rinv;
+    const float yn = bf(y[base + t]) * rinv;
     const float yw = widen(norm_w[t]) * yn;
     const float gate = widen(G[static_cast<size_t>(r) * g_stride + h * DV + t]);
     out[base + t] = bf16_bits(yw * sigmoid(gate));

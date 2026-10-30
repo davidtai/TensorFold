@@ -187,8 +187,8 @@ pub fn tf_kda_keep(l: *const Launcher, state: F, state_stride: i64, k: CF, v: C,
     try l.go(l.kda.keep, dim(kda_dim / 8, heads, layers), dim(32, 8, 1), 0, s, &a);
 }
 
-/// kda.chain's out (glm_kda.cu tf_glm_kda_out): bf16 out (rows, heads, 128) = norm_w rms(y) sigmoid(g), y fp32, the
-/// gate rows g bf16 (stride g_stride), norm_w bf16 [128].
+/// kda.chain's out (glm_kda.cu tf_glm_kda_out): bf16 out (rows, heads, 128) = norm_w rms(y) sigmoid(g), y fp32 rounded
+/// to bf16 on read (CUDA's rounding point), the gate rows g bf16 (stride g_stride), norm_w bf16 [128].
 pub fn tf_kda_out(l: *const Launcher, y: CF, g: C, g_stride: c_int, norm_w: C, eps: f32, out: P, rows: c_int, heads: c_int, s: S) Error!void {
     if (heads < 1 or rows < 1) return invalid("kda out");
     var a: Args = .{};

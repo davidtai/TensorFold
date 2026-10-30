@@ -823,6 +823,19 @@ test "KDA: the window and prompt chains on the CUDA buffers against the float64 
         const got = try rig.download(u16, out);
         defer gpa.free(got);
         try expectOut(got, want_out, n, what);
+        {
+            // the rounding point: out of the scan's fp32 y equals out of y rounded to bf16 first, bit for bit
+            const gy = try rig.download(f32, y);
+            defer gpa.free(gy);
+            for (gy) |*v| v.* = @floatCast(rb(v.*));
+            const y16 = try h.up(t, gy);
+            const out16 = try h.zeros(t, rows * n * 2);
+            try t.on.tf_kda_out(cf(at(y16)), cv(dev.g), @intCast(n), cv(dev.norm), eps_out, mv(at(out16)), @intCast(rows), heads, s);
+            try t.stream.synchronize();
+            const got16 = try rig.download(u16, out16);
+            defer gpa.free(got16);
+            try rig.expect(std.mem.eql(u16, got, got16), "KDA chain rows={d}: out does not round y to bf16 before the norm", .{rows});
+        }
         const gs = try rig.download(f32, state);
         defer gpa.free(gs);
         const es = relative(gs, want_state);
