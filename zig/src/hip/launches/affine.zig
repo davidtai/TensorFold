@@ -760,7 +760,7 @@ pub const Kernels = struct {
         return .{ .x = x, .words = w, .scale = .{ .p = 0, .kind = 1 }, .bias = .{ .p = 0, .kind = 1 }, .out = out, .m = m, .n = n, .k = k, .bits = 16, .group = 32, .fp16 = 0, .out16 = out16 };
     }
 
-    /// A product of BF16 rows (bf16Arg): with `prompt` on the WMMA tile of its K (one chain over K), else on the stream
+    /// A product of BF16 rows (bf16Arg): with `prompt` on the WMMA tile of its K (32-k groups folded on the VALU), else on the stream
     /// tile (a lane's 32-element chunks, folded by shuffle). x rows k apart, 16-byte aligned; k a multiple of 32 (64 on
     /// the WMMA tile). The two tiles sum in different orders: their bits differ.
     pub fn bf16Go(k: *const Kernels, r: *const runtime.Runtime, a: Arg, prompt: bool, s: abi.Stream) Error!void {
@@ -770,7 +770,7 @@ pub const Kernels = struct {
         if (a.words % 16 != 0) return refuse("bf16 rows unaligned");
         var args: hl.Args = .{};
         try args.add(a);
-        try go(r, f, .{ .x = cdiv(a.n, 128) * cdiv(a.m, 256) }, .{ .x = 256 }, s, &args);
+        try go(r, f, .{ .x = cdiv(a.n, 128) * cdiv(a.m, 128) }, .{ .x = 256 }, s, &args);
     }
 
     /// Decode's (gate | up) product of BF16 rows on the stream tile: `w` is gate (cols, k) then up (cols, k), act (m, cols)

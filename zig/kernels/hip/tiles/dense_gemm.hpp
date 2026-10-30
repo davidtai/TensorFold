@@ -43,7 +43,11 @@ constexpr int kThreads = 256;
 // K: the product's K (a multiple of 64). AHEAD: windows of loads a thread holds (K / 64 a multiple of it). bf16 x and
 // tables, plain products only. Blocks in row-major order of 128 x 128 tiles (Strata's grouped order, 8 row tiles a
 // group, measured slower: dn_qkv 14.3 ms against 13.8).
-template <int K, int AHEAD = 1, bool HC_MIX = false>
+// BF16W: a.words are bf16 weight rows (n, K) row major (GLM's BF16 linears), copied to LDS as stored; a group's sum is
+// its two WMMA from zero, folded acc + d on the VALU (IEEE round to nearest) in K order; no scale, bias or sum of x.
+// gfx1151's WMMA (and dot2) adds with a truncating ~24-bit aligner, so the long sum over K goes through the VALU, not
+// through the instruction's accumulator (lane G4's probe: K 4,096 bf16 flips 0.27 % on one WMMA chain).
+template <int K, int AHEAD = 1, bool HC_MIX = false, bool BF16W = false>
 __device__ __forceinline__ void wmma_dense_tile(const Affine& a, HcMix mix = {}, const uint16_t* gates = nullptr) {
 #if TF_DEVICE_WMMA_GFX11
     using namespace dense_tile;
@@ -52,8 +56,9 @@ __device__ __forceinline__ void wmma_dense_tile(const Affine& a, HcMix mix = {},
     constexpr int kWindows = K / kKW;
     constexpr int kGroups = K / 32;
     constexpr int kLdw = (kKW + 8) / 2;  // a staged row: 72 bf16, so 8 lanes of 16-byte reads hit 32 banks
-    constexpr int kWordsRow = K / 8;
+    constexpr int kWordsRow = BF16W ? K / 2 : K / 8;
     static_assert(K % kKW == 0 && kWindows % AHEAD == 0, "whole windows; a window's register slot is a constant");
+    static_assert(!(BF16W && HC_MIX), "the hc mix epilogue reads affine weights");
     __shared__ __attribute__((aligned(16))) uint32_t xs[kBM * kLdw];
     __shared__ __attribute__((aligned(16))) uint32_t ws[kBN * kLdw];
     __shared__ float sx[2][kBM];
@@ -79,7 +84,7 @@ __device__ __forceinline__ void wmma_dense_tile(const Affine& a, HcMix mix = {},
     auto column = [&](int c) { return HC_MIX ? (c / 32) * dims + bn * 32 + c % 32 : n0 + c; };
     const int col = HC_MIX ? column(r) : (n0 + r < a.n ? n0 + r : a.n - 1);
     const int row = r < rows_left ? m0 + r : a.m - 1;
-    const uint32_t* wsrc = a.words + static_cast<long long>(col) * kWordsRow + q * 4;
+    const uint32_t* wsrc = a.words + static_cast<long long>(col) * kWordsRow + q * (BF16W ? 16 : 4);
     const u32x4* xsrc = reinterpret_cast<const u32x4*>(static_cast<const __bf16*>(a.x) + static_cast<long long>(row) * K) + q * 4;
     const int trow = tid & (kBN - 1);
     const bool thigh = tid >= kBN;
@@ -103,22 +108,36 @@ __device__ __forceinline__ void wmma_dense_tile(const Affine& a, HcMix mix = {},
         for (int nt = 0; nt < kNT; ++nt) acc[mt][nt] = zero;
     }
 
-    uint4 wreg[AHEAD];
+    uint4 wreg[AHEAD][BF16W ? 4 : 1];
     u32x4 xreg[AHEAD][4];
     uint16_t treg[AHEAD][2];
     // Every load is unconditional (a window past the last repeats the last): a load behind a branch leaves the compiler
     // no static count, and it waits for vmcnt(0) at the stash.
     auto load = [&]<int R>(std::integral_constant<int, R>, int w) {
         const int wl = w < kWindows ? w : kWindows - 1;
-        wreg[R] = *reinterpret_cast<const uint4*>(wsrc + wl * 8);
+        if constexpr (BF16W) {
+            // a group's 32 bf16 of the column: 64 bytes at word 32 wl + 16 q
+#pragma unroll
+            for (int v = 0; v < 4; ++v) wreg[R][v] = *reinterpret_cast<const uint4*>(wsrc + wl * 32 + v * 4);
+        } else {
+            wreg[R][0] = *reinterpret_cast<const uint4*>(wsrc + wl * 8);
+            treg[R][0] = tsrc[2 * wl];
+            treg[R][1] = tsrc[2 * wl + 1];
+        }
 #pragma unroll
         for (int v = 0; v < 4; ++v) xreg[R][v] = xsrc[wl * 8 + v];
-        treg[R][0] = tsrc[2 * wl];
-        treg[R][1] = tsrc[2 * wl + 1];
     };
     auto stash = [&]<int R>(std::integral_constant<int, R>) {
-        const uint32_t wv[4] = {wreg[R].x, wreg[R].y, wreg[R].z, wreg[R].w};
         u32x4* wdst = reinterpret_cast<u32x4*>(ws + r * kLdw + q * 16);
+        if constexpr (BF16W) {
+#pragma unroll
+            for (int v = 0; v < 4; ++v) wdst[v] = u32x4{wreg[R][v].x, wreg[R][v].y, wreg[R][v].z, wreg[R][v].w};
+            u32x4* xdst = reinterpret_cast<u32x4*>(xs + r * kLdw + q * 16);
+#pragma unroll
+            for (int v = 0; v < 4; ++v) xdst[v] = xreg[R][v];
+            return;
+        } else {
+        const uint32_t wv[4] = {wreg[R][0].x, wreg[R][0].y, wreg[R][0].z, wreg[R][0].w};
 #pragma unroll
         for (int v = 0; v < 4; ++v) {
             uint32_t p[4];
@@ -143,6 +162,7 @@ __device__ __forceinline__ void wmma_dense_tile(const Affine& a, HcMix mix = {},
         float(*tdst)[kBN] = thigh ? bi : sc;
         tdst[0][trow] = __uint_as_float(static_cast<uint32_t>(treg[R][0]) << 16);
         tdst[1][trow] = __uint_as_float(static_cast<uint32_t>(treg[R][1]) << 16);
+        }
     };
 
     [&]<int... R>(std::integer_sequence<int, R...>) {
@@ -169,6 +189,17 @@ __device__ __forceinline__ void wmma_dense_tile(const Affine& a, HcMix mix = {},
 #pragma unroll
                         for (int nt = 0; nt < kNT; ++nt) d[mt][nt] = T::mma(af, bf[nt], t == 0 ? zero : d[mt][nt]);
                     }
+                }
+                if constexpr (BF16W) {
+#pragma unroll
+                    for (int mt = 0; mt < kMT; ++mt) {
+#pragma unroll
+                        for (int nt = 0; nt < kNT; ++nt) {
+#pragma unroll
+                            for (int i = 0; i < 8; ++i) acc[mt][nt][i] = acc[mt][nt][i] + d[mt][nt][i];
+                        }
+                    }
+                    continue;
                 }
 #pragma unroll
                 for (int mt = 0; mt < kMT; ++mt) {
