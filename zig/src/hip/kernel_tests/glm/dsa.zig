@@ -202,9 +202,10 @@ test "GLM DSA: the latent cache write copies each row into its slot and nothing 
 /// float64 y[r][h][n] = sum_k x[r][h k + k] W_h[k][n] over kv_b as stored (absorb: W_h[k][n] = kv_b[512 h + k][n];
 /// expand, `values`: W_h[k][n] = kv_b[512 h + 256 + n][k]); x rows `xs` values apart. Bound: bf16 out + (K + 8) 2^-24
 /// sum |x w|.
-fn headProducts(t: *Rig, x: []const u16, xs: usize, kvb: []const u16, rows: usize, kd: usize, nd: usize, values: bool) !struct { want: []f64, tol: []f64 } {
+fn headProducts(t: *Rig, x: []const u16, xs: usize, kvb: []const u16, rows: usize, kd: usize, nd: usize, values: bool) !struct { want: []f64, tol: []f64, chain: []f64 } {
     const want = try t.a().alloc(f64, rows * heads * nd);
     const tol = try t.a().alloc(f64, rows * heads * nd);
+    const chain = try t.a().alloc(f64, rows * heads * nd);
     const wd = try t.f64s(kvb);
     const xd = try t.f64s(x);
     const per = dsa.qk + dsa.dv;
@@ -220,10 +221,28 @@ fn headProducts(t: *Rig, x: []const u16, xs: usize, kvb: []const u16, rows: usiz
             }
             const i = (r * heads + h) * nd + n;
             want[i] = sum;
-            tol[i] = @abs(sum) * b8 + abs * @as(f64, @floatFromInt(kd + 8)) * ulp + 1e-30;
+            chain[i] = abs * @as(f64, @floatFromInt(kd + 8)) * ulp;
+            tol[i] = @abs(sum) * b8 + chain[i] + 1e-30;
         }
     };
-    return .{ .want = want, .tol = tol };
+    return .{ .want = want, .tol = tol, .chain = chain };
+}
+
+/// Each bf16 output is the float64 value rounded to nearest, or (only where the value is within `chain`, the fp32
+/// accumulation's bound, of a rounding midpoint) the neighbour on the far side of that midpoint: the output error is
+/// one bf16 rounding of an fp32 sum, nothing more.
+fn roundedOnce(t: *Rig, name: []const u8, p: u64, want: []const f64, chain: []const f64) !void {
+    const got = try t.backAs(u16, p, want.len);
+    var nearest: usize = 0;
+    var near_mid: usize = 0;
+    for (want, chain, 0..) |w, c, i| {
+        const lo = bfBits(@floatCast(w - c));
+        const hi = bfBits(@floatCast(w + c));
+        const g = got[i];
+        try expect(g == lo or g == hi, "{s}: output {d} is 0x{x:0>4}; float64 {e} rounds to 0x{x:0>4} (0x{x:0>4} within the fp32 chain)", .{ name, i, g, w, bfBits(@floatCast(w)), if (lo == bfBits(@floatCast(w))) hi else lo });
+        if (g == bfBits(@floatCast(w))) nearest += 1 else near_mid += 1;
+    }
+    std.debug.print("ROUNDED {s}: {d} of {d} outputs are float64 rounded to nearest bf16, {d} the neighbour within the fp32 chain of a midpoint\n", .{ name, nearest, want.len, near_mid });
 }
 
 test "GLM DSA: absorb and expand by kv_b as stored against float64; rows alone equal their rows in a wide call" {
@@ -242,6 +261,7 @@ test "GLM DSA: absorb and expand by kv_b as stored against float64; rows alone e
         try dsa.absorbQ(t.k, t.s(), dq, qs, dsa.kvKeys(dkv), dsa.kv_head, out, rows, heads);
         const ref = try headProducts(t, q, qs, kvb, rows, dsa.qk, dsa.lw, false);
         try closeCols(t, "absorb_q 40 rows x 64 heads, [256] . Wk_h [256, 512] in kv_b as stored", out, ref.want, ref.tol, dsa.lw);
+        try roundedOnce(t, "absorb_q", out, ref.want, ref.chain);
         const row_bytes = heads * dsa.lw * 2;
         for ([_][2]usize{ .{ 0, 1 }, .{ 5, 3 }, .{ 17, 4 }, .{ 20, 17 } }) |w| {
             const o = try t.zeros(w[1] * row_bytes);
@@ -257,6 +277,7 @@ test "GLM DSA: absorb and expand by kv_b as stored against float64; rows alone e
         try dsa.expandV(t.k, t.s(), dol, dsa.kvValues(dkv), dsa.kv_head, out, rows, heads);
         const ref = try headProducts(t, ol, heads * dsa.lw, kvb, rows, dsa.lw, dsa.dv, true);
         try closeCols(t, "expand_v 40 rows x 64 heads, [512] . Wv_h [256, 512]^T in kv_b as stored", out, ref.want, ref.tol, dsa.dv);
+        try roundedOnce(t, "expand_v", out, ref.want, ref.chain);
         const row_bytes = heads * dsa.dv * 2;
         for ([_][2]usize{ .{ 0, 1 }, .{ 5, 3 }, .{ 17, 4 }, .{ 20, 17 } }) |w| {
             const o = try t.zeros(w[1] * row_bytes);
