@@ -112,7 +112,11 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     glm_module.addImport("glm_config", glmConfig(b, target));
     const glm_test = b.addTest(.{ .name = "glm-hip-test", .root_module = glm_module });
     b.step("glm-hip-test", "Build GLM-5.3-Flash's HIP kernel tests into zig-out/bin/glm-hip-test (-Dhip-arch, no run)").dependOn(&b.addInstallArtifact(glm_test, .{}).step);
-    b.step("hip-glm-kernel-test", "GLM-5.3-Flash's kernels against their host references on the GPU (builds and runs glm-hip-test)").dependOn(&b.addRunArtifact(glm_test).step);
+    // The run reads TF_GLM_CONFIG and TF_GLM_DIR (tests skip when unset): never served from the cache, so a run with them
+    // set cannot reuse a run that skipped.
+    const glm_run = b.addRunArtifact(glm_test);
+    glm_run.has_side_effects = true;
+    b.step("hip-glm-kernel-test", "GLM-5.3-Flash's kernels against their host references on the GPU (builds and runs glm-hip-test)").dependOn(&glm_run.step);
     const stub_kernels = b.createModule(.{ .root_source_file = b.addWriteFiles().add("kernels.zig", stub) });
     const host = engineModules(b, b.graph.host, .Debug, stub_kernels, null);
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = host.hip })).step);
