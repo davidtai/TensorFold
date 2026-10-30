@@ -78,6 +78,10 @@ pub const Forward = struct {
     row0: usize = 0,
     /// Host scratch for the dumps' downloads.
     host: std.mem.Allocator = std.heap.page_allocator,
+    /// The last DSA block's intermediates in the arena (valid until the next block): an op-by-op check reads them.
+    dsa_last: DsaLast = .{},
+
+    pub const DsaLast = struct { dp: u64 = 0, qr: u64 = 0, lat: u64 = 0, qq: u64 = 0, qa: u64 = 0, ol: u64 = 0, vn: u64 = 0 };
 
     pub fn init(l: *const hip.Launcher, w: *const weights.Model, cfg: config.Config, s: S, b: *Buffers) !Forward {
         return .{ .l = l, .k = try dsa.Kernels.load(l), .w = w, .cfg = cfg, .s = s, .b = b };
@@ -264,6 +268,7 @@ pub const Forward = struct {
             try dsa.attention(f.k, f.s, qa + off, cs.lc, pos, r0, keys, pt, ol + off, n, H, parts, att_scale);
         }
         try dsa.expandV(f.k, f.s, ol, dsa.kvValues(w.kv_b.w), dsa.kv_head, vn, R, H);
+        f.dsa_last = .{ .dp = dp, .qr = qr, .lat = lat, .qq = qq, .qa = qa, .ol = ol, .vn = vn };
         try f.lin(vn, w.o, R, b.part, false);
     }
 
