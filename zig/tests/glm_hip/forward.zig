@@ -1,9 +1,15 @@
 //! tf-glm-hip-test forward: GLM-5.3-Flash's eager forward (zig/src/families/glm/hip/forward.zig) on a whole checkpoint.
-//!   forward <checkpoint> <ids.u32> [--gen N] [--chunk R] [--tf] [--mtp]
+//!   forward <checkpoint> <ids.u32> [--gen N] [--chunk R] [--tf] [--mtp] [--decode-from P [--decode-to E [--resume-mark]]]
 //!     ids.u32: uint32 little-endian token ids (G5's <prompt>/ids.u32). The prompt in chunks of R rows (default
 //!     2,048), then N greedy tokens (default 16; the first from the last prompt row), ties to the lower id.
 //!     --tf: lm_head over every prompt row: teacher-forced NLL, perplexity and top-1 (G5's teacher_forced).
 //!     --mtp: the MTP layer teacher-forced over prompt + generated rows (row j: h_j, token j + 1; predicts j + 2).
+//!     The prompt/decode seam (LANES.md code contract 7), a test of the CLI only; unset, nothing changes:
+//!     --decode-from P: the prompt's ids[0 .. P) in prompt chunks, then its rows P .. E - 1 one at a time on the
+//!     decode buffers (the given ids, not greedy picks), each row's head as a prompt row's.
+//!     --decode-to E (default: the prompt's end): rows E .. on the prompt path again, from the decode cut.
+//!     --resume-mark: the state is kept at P (a prompt-path mark); after the decode rows (their heads and dumps
+//!     discarded) it is restored and rows P .. on the prompt path again: a next turn re-prefilling the reply.
 //!     Prints the generated ids and sha256 of every logits row computed (the numerics=exact hash; the same for any R).
 //!   forward <checkpoint> - [--chunk R]   with TF_GLM_DUMP and TF_GLM_DUMP_REF set: every prompt of the reference
 //!     run, as run_ref.py runs it (teacher-forced prompt, greedy gen, the MTP pass), dumped in G5-ref.md section 4's
@@ -21,25 +27,31 @@ const V: usize = dump.V;
 
 const usage =
     \\usage: tf-glm-hip-test forward <checkpoint> <ids.u32 | -> [--gen N] [--chunk R] [--tf] [--mtp]
+    \\       [--decode-from P [--decode-to E [--resume-mark]]]
     \\       (ids "-": the prompts of TF_GLM_DUMP_REF, dumped into TF_GLM_DUMP)
     \\
 ;
 
-const Opts = struct { gen: usize = 16, chunk: usize = glm.state.prompt_rows, tf: bool = false, mtp: bool = false };
+const Opts = struct { gen: usize = 16, chunk: usize = glm.state.prompt_rows, tf: bool = false, mtp: bool = false, seam: Seam = .{} };
+
+/// The prompt/decode seam test's cuts (all null: the plain run).
+const Seam = struct { from: ?usize = null, to: ?usize = null, mark: bool = false };
 
 fn opts(args: []const [:0]const u8) !Opts {
     var o: Opts = .{};
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         const a = args[i];
-        if (std.mem.eql(u8, a, "--tf")) o.tf = true else if (std.mem.eql(u8, a, "--mtp")) o.mtp = true else {
+        if (std.mem.eql(u8, a, "--tf")) o.tf = true else if (std.mem.eql(u8, a, "--mtp")) o.mtp = true else if (std.mem.eql(u8, a, "--resume-mark")) o.seam.mark = true else {
             if (i + 1 >= args.len) return error.MissingArgument;
             const v = try std.fmt.parseInt(usize, args[i + 1], 10);
-            if (std.mem.eql(u8, a, "--gen")) o.gen = v else if (std.mem.eql(u8, a, "--chunk")) o.chunk = v else return error.UnknownOption;
+            if (std.mem.eql(u8, a, "--gen")) o.gen = v else if (std.mem.eql(u8, a, "--chunk")) o.chunk = v else if (std.mem.eql(u8, a, "--decode-from")) o.seam.from = v else if (std.mem.eql(u8, a, "--decode-to")) o.seam.to = v else return error.UnknownOption;
             i += 1;
         }
     }
     if (o.chunk == 0 or o.chunk > glm.state.prompt_rows) return error.BadChunk;
+    if ((o.seam.to != null or o.seam.mark) and o.seam.from == null) return error.DecodeToWithoutDecodeFrom;
+    if (o.seam.mark and o.seam.to == null) return error.ResumeMarkWithoutDecodeTo;
     return o;
 }
 
@@ -56,6 +68,9 @@ const Run = struct {
     hid: hip.DeviceBuffer,
     logits: []f32, // host [head_rows][V]
     hash: std.crypto.hash.sha2.Sha256 = .init(.{}),
+    /// --resume-mark: the state's leading part (positions, KDA conv windows and states, the KDA window buffers) at
+    /// the mark; the DSA caches past the mark are rewritten before they are read.
+    mark: ?hip.DeviceBuffer = null,
 
     fn now(io: std.Io) f64 {
         return @as(f64, @floatFromInt(std.Io.Timestamp.now(io, .awake).nanoseconds)) / 1e9;
@@ -79,6 +94,28 @@ const Run = struct {
     /// Window f's `n` final-normed rows into hid from sequence row `row`.
     fn keep(run: *Run, f: *fwd.Forward, row: usize, n: usize) !void {
         try hip.runtime.check(run.r.api.hipMemcpyDtoDAsync(@ptrFromInt(run.hid.base() + row * D * 2), @ptrFromInt(f.b.fnormed), n * D * 2, run.s.handle));
+    }
+
+    /// The bytes of the state the mark keeps: everything before the first DSA cache set.
+    fn markBytes(st: *const State) usize {
+        return st.caches[0].lc - st.buf.base();
+    }
+
+    /// Keep the state at the current position; the host fields come back as the returned copy.
+    fn saveMark(run: *Run) !State {
+        const m = run.mark orelse return error.NoMarkBuffer;
+        try hip.runtime.check(run.r.api.hipMemcpyDtoDAsync(@ptrFromInt(m.base()), @ptrFromInt(run.st.buf.base()), markBytes(&run.st), run.s.handle));
+        return run.st;
+    }
+
+    /// The state kept by saveMark, if no ring rebase came between (the rings are not kept).
+    fn restoreMark(run: *Run, at: State) !void {
+        const m = run.mark orelse return error.NoMarkBuffer;
+        if (at.base != run.st.base or at.mtp_base != run.st.mtp_base) return error.RebasedSinceMark;
+        try hip.runtime.check(run.r.api.hipMemcpyDtoDAsync(@ptrFromInt(run.st.buf.base()), @ptrFromInt(m.base()), markBytes(&run.st), run.s.handle));
+        run.st = at;
+        try run.st.setPos(run.s.handle, at.pos);
+        try run.st.setMtpLen(run.s.handle, at.mtp_len);
     }
 };
 
@@ -150,15 +187,12 @@ const Greedy = struct {
     }
 };
 
-fn runSeq(a: std.mem.Allocator, io: std.Io, run: *Run, q: *Seq, chunk: usize, mtp: bool) !void {
+/// The prompt's rows [from, to) in chunks of `chunk` on the prompt path (lm_head: every row, or the prompt's last).
+fn promptRows(run: *Run, q: *Seq, from: usize, to: usize, chunk: usize) !void {
     const t = q.ids.len;
-    try run.st.reset(run.s.handle);
-    run.hash = .init(.{});
-    // 1. the prompt in chunks
-    const t0 = Run.now(io);
-    var at: usize = 0;
-    while (at < t) : (at += chunk) {
-        const n = @min(chunk, t - at);
+    var at = from;
+    while (at < to) : (at += chunk) {
+        const n = @min(chunk, to - at);
         run.fp.seq = q.dump;
         run.fp.row0 = at;
         try run.fp.run(&run.st, q.ids[at..][0..n]);
@@ -169,7 +203,39 @@ fn runSeq(a: std.mem.Allocator, io: std.Io, run: *Run, q: *Seq, chunk: usize, mt
             try run.heads(&run.fp, run.fp.b.fnormed + (n - 1) * D * 2, 1, PromptRows{ .q = q, .at = t - 1 }, PromptRows.each);
         }
     }
+}
+
+/// The prompt's rows [from, to) one at a time on the decode path (the given ids); `discard`: no heads, no dumps.
+fn decodeRows(run: *Run, q: *Seq, from: usize, to: usize, discard: bool) !void {
+    const t = q.ids.len;
+    for (from..to) |row| {
+        run.fd.seq = if (discard) null else q.dump;
+        run.fd.row0 = row;
+        try run.fd.run(&run.st, q.ids[row..][0..1]);
+        try run.keep(&run.fd, row, 1);
+        if (!discard and (q.tf or q.dump != null or row + 1 == t))
+            try run.heads(&run.fd, run.fd.b.fnormed, 1, PromptRows{ .q = q, .at = row }, PromptRows.each);
+    }
+}
+
+fn runSeq(a: std.mem.Allocator, io: std.Io, run: *Run, q: *Seq, chunk: usize, mtp: bool, seam: Seam) !void {
+    const t = q.ids.len;
+    try run.st.reset(run.s.handle);
+    run.hash = .init(.{});
+    // 1. the prompt in chunks; with the seam cuts: [0, P) prompt, [P, E) decode, then [E, t) prompt (or [P, t) from
+    //    the mark)
+    const t0 = Run.now(io);
+    const p = if (seam.from) |x| @min(x, t) else t;
+    const e = if (seam.to) |x| @min(@max(x, p), t) else t;
+    const mark = seam.mark and e > p;
+    try promptRows(run, q, 0, p, chunk);
+    const at_mark: ?State = if (mark) try run.saveMark() else null;
+    try decodeRows(run, q, p, e, mark);
+    if (at_mark) |m| try run.restoreMark(m);
+    try promptRows(run, q, if (mark) p else e, t, chunk);
     try run.fp.sync();
+    try run.fd.sync();
+    if (p < t) std.debug.print("SEAM rows {d}-{d} by serial decode{s}; prompt rows {d}-{d} after it{s}\n", .{ p, e -| 1, if (mark) " (discarded)" else "", if (mark) p else e, t -| 1, if (mark) ", from the state kept at the mark" else ", from the decode cut" });
     const t1 = Run.now(io);
     // 2. greedy: the first token from the last prompt row, then one row a step
     try q.gen.append(a, q.last);
@@ -280,6 +346,8 @@ pub fn command(init: std.process.Init, args: []const [:0]const u8) !void {
     defer rn.db.deinit();
     rn.hid = try hip.DeviceBuffer.alloc(&r, longest * D * 2);
     defer rn.hid.free();
+    if (o.seam.mark) rn.mark = try hip.DeviceBuffer.alloc(&r, Run.markBytes(&rn.st));
+    defer if (rn.mark) |*m| m.free();
     std.debug.print("FORWARD context {d}: state {d:.3} GiB, prompt buffers {d:.3} GiB\n", .{ capacity, gib(State.bytes(capacity)), gib(rn.pb.arena.len + rn.pb.buf.len) });
     rn.fp = try fwd.Forward.init(&l, opened.model(), cfg, rn.s.handle, &rn.pb);
     rn.fd = try fwd.Forward.init(&l, opened.model(), cfg, rn.s.handle, &rn.db);
@@ -299,7 +367,7 @@ pub fn command(init: std.process.Init, args: []const [:0]const u8) !void {
             }
             std.debug.print("== {s}: {d} ids, gen {d}{s}\n", .{ p.name, p.ids.len, p.gen, if (forced) ", routing FORCED" else "" });
             if (forced) std.debug.print("FORCED picks and weights from {s}/{s}\n", .{ force_dir.?, p.name });
-            try runSeq(a, io, &rn, &q, o.chunk, true);
+            try runSeq(a, io, &rn, &q, o.chunk, true, o.seam);
             rn.fp.force = null;
             rn.fd.force = null;
             try sq.close();
@@ -309,7 +377,7 @@ pub fn command(init: std.process.Init, args: []const [:0]const u8) !void {
         return;
     }
     var q: Seq = .{ .ids = ids, .max_gen = @max(o.gen, 1), .eos = eos, .tf = o.tf, .dump = null };
-    try runSeq(a, io, &rn, &q, o.chunk, o.mtp);
+    try runSeq(a, io, &rn, &q, o.chunk, o.mtp, o.seam);
     std.debug.print("FORWARD OK\n", .{});
 }
 
