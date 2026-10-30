@@ -14,6 +14,7 @@ pub const Group = enum {
     affine_dot2,
     flashnext,
     mamba,
+    glm,
 };
 pub const group_count = @typeInfo(Group).@"enum".field_names.len;
 

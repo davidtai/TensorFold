@@ -1,9 +1,15 @@
 //! A real checkpoint's config.json against GLM-5.3-Flash's shape: TF_GLM_CONFIG names the file (skipped when unset).
 //! Run on the box: TF_GLM_CONFIG=<checkpoint>/config.json zig test -lc zig/src/families/glm/config_checkpoint_test.zig
+//! HIP's glm-hip-test runs `check` too (zig/tests/hip/glm_config.zig): a test runs only in its binary's root module.
 const std = @import("std");
 const config = @import("config.zig");
 
 test "TF_GLM_CONFIG parses to the whole GLM-5.3-Flash shape: EXL3 experts, 34 KDA and 11 MLA layers, one MTP layer" {
+    try check();
+}
+
+/// The checks on TF_GLM_CONFIG's config.json; error.SkipZigTest when it is unset.
+pub fn check() !void {
     const path = std.c.getenv("TF_GLM_CONFIG") orelse return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();

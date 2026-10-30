@@ -111,6 +111,7 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = host.flashnext })).step);
     b.step("test-flashnext-proposal-hip-host", "Original Flash Next HIP IDs and head-row spans without device runtime").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = host.flashnext, .filters = &.{"Flash Next proposal:"} })).step);
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = host.nemotron })).step);
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = host.glm })).step);
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = host.serve })).step);
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = host.native })).step);
     // the GPU programs compile on any host against stub kernels, so `test` catches what only they reach
@@ -150,6 +151,17 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
         "tf-nemotron-hip-test",
         "Nemotron-H load and skeleton checks on the GPU (-Dhip-arch)",
     ).dependOn(&b.addInstallArtifact(nem_test, .{}).step);
+    const glm_test = b.addTest(.{ .name = "glm-hip-test", .root_module = b.createModule(.{
+        .root_source_file = b.path("zig/tests/hip/glm_tests.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{ .{ .name = "hip", .module = gpu.hip }, .{ .name = "glm", .module = gpu.glm } },
+    }) });
+    b.step(
+        "glm-hip-test",
+        "GLM-5.3-Flash's HIP kernels against their host references: builds zig-out/bin/glm-hip-test (-Dhip-arch, no run)",
+    ).dependOn(&b.addInstallArtifact(glm_test, .{}).step);
     const native = server(b, target, gpu, build_options);
     b.step("native-hip", "tensorfold-native with the HIP engines into zig-out/native-hip/bin (-Dhip-arch)").dependOn(&b.addInstallArtifact(native, .{ .dest_dir = .{ .override = .{ .custom = "native-hip/bin" } } }).step);
     @import("hip_contract.zig").steps(b, .{
@@ -182,6 +194,7 @@ const Engine = struct {
     family: *std.Build.Module,
     flashnext: *std.Build.Module,
     nemotron: *std.Build.Module,
+    glm: *std.Build.Module,
     native: *std.Build.Module,
 };
 
@@ -248,6 +261,17 @@ fn engineModules(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.
             .{ .name = "hip_serve", .module = serve },
         },
     });
+    const glm = b.createModule(.{
+        .root_source_file = b.path("zig/src/families/glm/hip.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "hip", .module = hip },
+            .{ .name = "lanes", .module = lanes },
+            .{ .name = "core", .module = core },
+        },
+    });
     const native = b.createModule(.{
         .root_source_file = b.path("zig/src/native/hip.zig"),
         .target = target,
@@ -260,6 +284,7 @@ fn engineModules(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.
             .{ .name = "qwen3_5", .module = family },
             .{ .name = "flashnext", .module = flashnext },
             .{ .name = "nemotron", .module = nemotron },
+            .{ .name = "glm", .module = glm },
         },
     });
     return .{
@@ -270,6 +295,7 @@ fn engineModules(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.
         .family = family,
         .flashnext = flashnext,
         .nemotron = nemotron,
+        .glm = glm,
         .native = native,
     };
 }
@@ -296,7 +322,7 @@ fn server(b: *std.Build, target: std.Build.ResolvedTarget, e: Engine, build_opti
 const groups = [_][]const u8{
     "ops/ops.hip",           "ops/act.hip",             "attention/attention.hip", "recurrence/gated_delta.hip",
     "attention/prefill.hip", "decode/decode.hip",       "decode/plan.hip",         "tiles/dot2_tiles.hip",
-    "tiles/dot2.hip",        "flashnext/flashnext.hip", "recurrence/mamba.hip",
+    "tiles/dot2.hip",        "flashnext/flashnext.hip", "recurrence/mamba.hip",     "glm/glm.hip",
 };
 
 /// What the group sources include, so an edit to one rebuilds them.
@@ -317,7 +343,25 @@ const headers = [_][]const u8{
 /// The flags of the kernels' first build: no contraction, wave32 on RDNA, C++20.
 const flags = [_][]const u8{ "-D__HIP_PLATFORM_AMD__=1", "-DUSE_ROCM=1", "-DHIPBLAS_V2", "-fPIC", "-DCUDA_HAS_FP16=1", "-DHIP_ENABLE_WARP_SYNC_BUILTINS=1", "-std=c++20", "-fno-gpu-rdc", "-mno-wavefrontsize64", "-ffp-contract=off" };
 
-const stub = "pub const arch = \"\";\npub const images: [11][]align(8) const u8 = @splat(&.{});\n";
+const stub = std.fmt.comptimePrint("pub const arch = \"\";\npub const images: [{d}][]align(8) const u8 = @splat(&.{{}});\n", .{groups.len});
+
+/// Folders whose every file the group sources may include: a lane adds a header there without a line in `headers`.
+const header_dirs = [_][]const u8{"glm"};
+
+/// Every file under zig/kernels/hip/`dir`, as build inputs.
+fn dirFiles(b: *std.Build, dir: []const u8) []const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    const io = b.graph.io;
+    var d = b.root.openDir(io, b.pathJoin(&.{ "zig/kernels/hip", dir }), .{ .iterate = true }) catch return &.{};
+    defer d.close(io);
+    var walk = d.walk(b.allocator) catch @panic("OOM");
+    defer walk.deinit();
+    while (walk.next(io) catch null) |e| {
+        if (e.kind != .file) continue;
+        out.append(b.allocator, b.pathJoin(&.{ dir, e.path })) catch @panic("OOM");
+    }
+    return out.items;
+}
 
 /// One code object a group for `arch`, built with the caps table's instruction switches, as the `hip_kernels` module.
 fn kernelObjects(b: *std.Build, hipcc: []const u8, hipcc_resolved: []const u8, device_lib: ?[]const u8, arch: []const u8) *std.Build.Module {
@@ -362,6 +406,7 @@ pub fn compile(b: *std.Build, cc: Hipcc, arch: []const u8, source: std.Build.Laz
     run.addArg(b.fmt("--offload-arch={s}", .{arch}));
     run.addPrefixedDirectoryArg("-I", b.path("zig/kernels/hip"));
     for (headers) |h| run.addFileInput(b.path(b.fmt("zig/kernels/hip/{s}", .{h})));
+    for (header_dirs) |dir| for (dirFiles(b, dir)) |h| run.addFileInput(b.path(b.fmt("zig/kernels/hip/{s}", .{h})));
     run.addArg("-o");
     const object = run.addOutputFileArg(out);
     run.addFileArg(source);

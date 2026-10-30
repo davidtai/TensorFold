@@ -6,41 +6,14 @@ const Span = @import("cuda_shard.zig").Span;
 const cuda = @import("cuda");
 const experts = @import("cuda_experts.zig");
 
-/// config.json's quantization_config (top level, else text_config's), when it has one.
-fn block(root: std.json.Value) ?std.json.ObjectMap {
-    if (root != .object) return null;
-    if (root.object.get("quantization_config")) |q| if (q == .object) return q.object;
-    if (root.object.get("text_config")) |t| if (t == .object) if (t.object.get("quantization_config")) |q| if (q == .object) return q.object;
-    return null;
-}
+const exl3_admit = @import("exl3_admit.zig");
 
 /// Whether config.json names EXL3 (quant_method "exl3"): `admit` then says whether this family reads it.
-pub fn isExl3(gpa: std.mem.Allocator, config_json: []const u8) bool {
-    const parsed = std.json.parseFromSlice(std.json.Value, gpa, config_json, .{}) catch return false;
-    defer parsed.deinit();
-    const q = block(parsed.value) orelse return false;
-    const m = q.get("quant_method") orelse return false;
-    return m == .string and std.mem.eql(u8, m.string, "exl3");
-}
+pub const isExl3 = exl3_admit.isExl3;
 
 /// The EXL3 checkpoints the kernels read: 4-bit routed experts on the "mcg" codebook (everything else bf16).
 pub fn admit(gpa: std.mem.Allocator, config_json: []const u8, why: *modelopt.Why) !void {
-    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, config_json, .{});
-    defer parsed.deinit();
-    const q = block(parsed.value) orelse {
-        why.set("no quantization_config", .{});
-        return error.UnsupportedQuant;
-    };
-    const bits = q.get("bits") orelse std.json.Value{ .null = {} };
-    if (bits != .integer or bits.integer != 4) {
-        why.set("EXL3 at {f} bits: the CUDA family reads 4-bit EXL3 experts", .{std.json.fmt(bits, .{})});
-        return error.UnsupportedQuant;
-    }
-    const book = q.get("codebook") orelse std.json.Value{ .null = {} };
-    if (book != .string or !std.mem.eql(u8, book.string, "mcg")) {
-        why.set("EXL3 codebook {f}: the CUDA family reads \"mcg\"", .{std.json.fmt(book, .{})});
-        return error.UnsupportedQuant;
-    }
+    return exl3_admit.admit("CUDA", gpa, config_json, why);
 }
 
 /// One layer's EXL3 experts on a rank: trellis words [E][K/16][N/16][32] and fp16 scales (suh [E][K], svh [E][N]).
