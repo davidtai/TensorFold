@@ -144,7 +144,14 @@ fn echo(init: std.process.Init, ref: []const u8, out: []const u8) !void {
         var p = p0;
         const rdir = try std.fs.path.join(a, &.{ ref, p.name });
         // the generated count as the reference ran it (older runs' prompts.json has no gen)
-        const g = try std.Io.Dir.cwd().readFileAlloc(init.io, try std.fs.path.join(a, &.{ rdir, "greedy.json" }), a, .limited(1 << 24));
+        // a prompt the reference has not finished (no greedy.json yet) is left out
+        const g = std.Io.Dir.cwd().readFileAlloc(init.io, try std.fs.path.join(a, &.{ rdir, "greedy.json" }), a, .limited(1 << 24)) catch |err| switch (err) {
+            error.FileNotFound => {
+                std.debug.print("{s}: not finished in the reference, left out\n", .{p.name});
+                continue;
+            },
+            else => return err,
+        };
         const gj = try std.json.parseFromSliceLeaky(std.json.Value, a, g, .{});
         p.gen = @intCast(gj.object.get("ids").?.array.items.len);
         const s = try d.begin(p);
