@@ -661,6 +661,83 @@ test "KDA: a held window and its keep on the CUDA saves give the window's output
     }
 }
 
+test "KDA: windows kept in place, then a prompt chunk, give the bits of one serial scan of the kept rows" {
+    // (a) a window whose drafts are all rejected: held, the state is the start's bits; its keep of the pending row
+    // alone (kept 0 never happens: the pending row is always kept, cuda_forward.zig commit's BadCommit; tf_kda_keep
+    // refuses it);
+    // (b) windows of 4 rows keeping 1, 2 and 3; (c) each window after a partial keep; (d) a 70-row prompt chunk after.
+    const t = try Rig.open(1 << 20);
+    defer t.close();
+    const heads = glm_heads;
+    const n = heads * d;
+    const keeps = [_]usize{ 1, 2, 3 };
+    const prompt = 70;
+    var wins: [keeps.len]ScanIn = undefined;
+    for (&wins, 0..) |*w, i| w.* = try ScanIn.make(heads, 4, 0x5e9 + i);
+    defer for (wins) |w| w.free();
+    const tail = try ScanIn.make(heads, prompt, 0x5e9f);
+    defer tail.free();
+    // the serial rows: each window's kept rows, then the prompt's
+    var total: usize = prompt;
+    for (keeps) |k| total += k;
+    const serial: ScanIn = .{ .heads = heads, .rows = total, .q = try gpa.alloc(f32, total * n), .k = try gpa.alloc(f32, total * n), .v = try gpa.alloc(u16, total * n), .gate = try gpa.alloc(f32, total * n), .beta = try gpa.alloc(f32, total * heads), .state = try gpa.dupe(f32, tail.state) };
+    defer serial.free();
+    {
+        var row: usize = 0;
+        for (wins ++ [_]ScanIn{tail}, keeps ++ [_]usize{prompt}) |src, k| {
+            @memcpy(serial.q[row * n ..][0 .. k * n], src.q[0 .. k * n]);
+            @memcpy(serial.k[row * n ..][0 .. k * n], src.k[0 .. k * n]);
+            @memcpy(serial.v[row * n ..][0 .. k * n], src.v[0 .. k * n]);
+            @memcpy(serial.gate[row * n ..][0 .. k * n], src.gate[0 .. k * n]);
+            @memcpy(serial.beta[row * heads ..][0 .. k * heads], src.beta[0 .. k * heads]);
+            row += k;
+        }
+    }
+    var h: Held = .{};
+    defer h.deinit();
+    // the serial scan: one call over every kept row (the prompt blocks; the cut test shows they are the tile's bits)
+    const sd = try serial.dev(&h, t);
+    const s_state = try h.up(t, serial.state);
+    const s_y = try h.zeros(t, total * n * 4);
+    try scan(t, heads, sd, at(s_state), at(s_y), 0, total, 0);
+    try t.stream.synchronize();
+    const want_y = try rig.download(f32, s_y);
+    defer gpa.free(want_y);
+    const want_s = try rig.download(u8, s_state);
+    defer gpa.free(want_s);
+    // the engine's order: hold, keep in place, a window at a time, then the prompt chunk
+    const state = try h.up(t, serial.state);
+    const y = try h.zeros(t, 4 * n * 4);
+    const s = t.stream.handle;
+    var row: usize = 0;
+    for (wins, keeps, 0..) |w, k, i| {
+        const wd = try w.dev(&h, t);
+        try t.on.tf_kda_hold(cf(wd.q), cf(wd.k), cv(wd.v), cf(wd.g), cf(wd.b), mf(at(state)), mf(at(y)), 4, heads, s);
+        if (i == 0) {
+            try t.stream.synchronize();
+            const held = try rig.download(u32, state);
+            defer gpa.free(held);
+            try std.testing.expectEqualSlices(u32, @ptrCast(serial.state), held);
+        }
+        try t.on.tf_kda_keep(mf(at(state)), 0, cf(wd.k), cv(wd.v), cf(wd.g), cf(wd.b), 0, 0, @intCast(k), 1, heads, s);
+        try t.stream.synchronize();
+        const gy = try rig.download(f32, y);
+        defer gpa.free(gy);
+        try rig.expect(std.mem.eql(u32, @ptrCast(gy[0 .. k * n]), @ptrCast(want_y[row * n ..][0 .. k * n])), "KDA sequence: window {d} (kept {d}): the kept rows' outputs differ from the serial scan's", .{ i, k });
+        row += k;
+    }
+    const td = try tail.dev(&h, t);
+    const py = try h.zeros(t, prompt * n * 4);
+    try t.on.tf_kda(cf(td.q), cf(td.k), cv(td.v), cf(td.g), cf(td.b), mf(at(state)), mf(at(py)), prompt, heads, s, null, 0);
+    try t.stream.synchronize();
+    const gy = try rig.download(f32, py);
+    defer gpa.free(gy);
+    try rig.expect(std.mem.eql(u32, @ptrCast(gy), @ptrCast(want_y[row * n ..][0 .. prompt * n])), "KDA sequence: the prompt chunk's outputs differ from the serial scan's", .{});
+    const gs = try rig.download(u8, state);
+    defer gpa.free(gs);
+    try rig.expect(std.mem.eql(u8, gs, want_s), "KDA sequence: the state after the prompt chunk differs from the serial scan's", .{});
+}
+
 /// glm_ref_kda.zig's float64 chain on a Block: conv + SiLU, L2 q / k, decays, bf16 beta, delta rule, y = bf16(S q),
 /// RMS norm, gate. Out [rows][n]; the state after the rows into `state`.
 fn chainRef(b: Block, state: []f64, out: []f64) !void {
