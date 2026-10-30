@@ -323,6 +323,7 @@ const groups = [_][]const u8{
     "ops/ops.hip",           "ops/act.hip",             "attention/attention.hip", "recurrence/gated_delta.hip",
     "attention/prefill.hip", "decode/decode.hip",       "decode/plan.hip",         "tiles/dot2_tiles.hip",
     "tiles/dot2.hip",        "flashnext/flashnext.hip", "recurrence/mamba.hip",     "glm/glm.hip",
+    "quant/exl3.hip",
 };
 
 /// What the group sources include, so an edit to one rebuilds them.
@@ -337,7 +338,7 @@ const headers = [_][]const u8{
     "tiles/moe_gemm.hpp",         "tiles/dense_gemm.hpp",  "tiles/dense_inexact.hpp", "common/tsum.hpp",
     "flashnext/hc_up.hpp",        "ops/qk_rope_wave.hpp",
     "flashnext/streams.hpp",      "flashnext/ngram.hpp",   "flashnext/indexer.hpp", "flashnext/sparse.hpp",
-    "ops/nemotron_moe.hpp",       "recurrence/gated_delta_wy.hpp",
+    "ops/nemotron_moe.hpp",       "recurrence/gated_delta_wy.hpp", "quant/exl3.hpp",
 };
 
 /// The flags of the kernels' first build: no contraction, wave32 on RDNA, C++20.
