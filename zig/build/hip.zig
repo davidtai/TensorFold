@@ -183,6 +183,13 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
         "tf-glm-hip-test",
         "GLM-5.3-Flash on HIP: the placement, the streaming load and its sha256 sample, the dump format (-Dhip-arch)",
     ).dependOn(&b.addInstallArtifact(glm_exe, .{}).step);
+    // The GLM forward's integration tests (families/glm/hip/fwd_test.zig, "glm fwd") on the real kernels, ReleaseSafe for
+    // the float64 references' host loops; never served from the cache (a GPU run)
+    const fwd_gpu = engineModules(b, target, .ReleaseSafe, objects, hip_include);
+    const fwd_test = b.addTest(.{ .name = "glm-fwd-test", .root_module = fwd_gpu.glm, .filters = &.{"glm fwd"} });
+    const fwd_run = b.addRunArtifact(fwd_test);
+    fwd_run.has_side_effects = true;
+    b.step("glm-fwd-test", "GLM-5.3-Flash's forward blocks on the GPU against float64, and their rows' bits across cuts (-Dhip-arch)").dependOn(&fwd_run.step);
     const native = server(b, target, gpu, build_options);
     b.step("native-hip", "tensorfold-native with the HIP engines into zig-out/native-hip/bin (-Dhip-arch)").dependOn(&b.addInstallArtifact(native, .{ .dest_dir = .{ .override = .{ .custom = "native-hip/bin" } } }).step);
     @import("hip_contract.zig").steps(b, .{
