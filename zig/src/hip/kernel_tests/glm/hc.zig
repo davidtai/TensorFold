@@ -106,8 +106,9 @@ const Pre = struct {
             r.out[d] = w * c[d] * rinv2;
             var dp: f64 = 0;
             for (0..S) |k| dp += r.pre_tol[k] * @abs(check.val(x[k * D + d]));
-            // three bf16 roundings (c, c / rms, the output) and the pre weights' error, twice for the rms it moves
-            r.out_tol[d] = @abs(r.out[d]) * std.math.pow(f64, 2, -7) + 2 * @abs(w) * rinv2 * dp + 1e-30;
+            // three bf16 roundings (c, c / rms, the output), each up to u = 2^-8 relative, and the pre weights' error,
+            // twice for the rms it moves
+            r.out_tol[d] = @abs(r.out[d]) * 3 * std.math.pow(f64, 2, -8) + 2 * @abs(w) * rinv2 * dp + 1e-30;
         }
         return r;
     }
@@ -276,7 +277,8 @@ test "glm hc post: branch (2 partials) into 4 streams through post and comb with
             mag += @abs(term);
         }
         const want = pb + mixed;
-        const tol = (@abs(pb) + @abs(want)) * std.math.pow(f64, 2, -9) + mag * std.math.pow(f64, 2, -21);
+        // two bf16 roundings (the branch, the output) of u = 2^-8 each, and fp32
+        const tol = (@abs(pb) + @abs(want)) * std.math.pow(f64, 2, -8) + mag * std.math.pow(f64, 2, -21);
         const i = r * W + s * D + d;
         w.add(i, check.val(got[i]), want, tol);
     };
@@ -307,7 +309,7 @@ test "glm stream mean, residual (1 and 2 partials), embedding into streams: with
                 sum += check.val(hx[r * W + s * D + d]);
                 mag += @abs(check.val(hx[r * W + s * D + d]));
             }
-            w.add(r * D + d, check.val(got[r * D + d]), sum / S, @abs(sum / S) * std.math.pow(f64, 2, -9) + mag * std.math.pow(f64, 2, -22));
+            w.add(r * D + d, check.val(got[r * D + d]), sum / S, @abs(sum / S) * std.math.pow(f64, 2, -8) + mag * std.math.pow(f64, 2, -22));
         };
         try w.done();
     }
@@ -331,7 +333,7 @@ test "glm stream mean, residual (1 and 2 partials), embedding into streams: with
             var gs: f64 = hg[i];
             if (parts == 2) gs += hg[rows * d + i];
             const want = check.val(hx[i]) + gs;
-            w.add(i, check.val(got[i]), want, (@abs(gs) + @abs(want)) * std.math.pow(f64, 2, -9) + @abs(gs) * std.math.pow(f64, 2, -22));
+            w.add(i, check.val(got[i]), want, (@abs(gs) + @abs(want)) * std.math.pow(f64, 2, -8) + @abs(gs) * std.math.pow(f64, 2, -22));
         }
         try w.done();
     };
@@ -396,7 +398,8 @@ test "glm rms: widths 4096, 1536 and 512, bf16 weights, strided rows (the MTP la
             const rinv = 1 / @sqrt(eps + ss / @as(f64, @floatFromInt(width)));
             for (0..width) |i| {
                 const want = check.val(hw[i]) * check.val(row[i]) * rinv;
-                wst.add(r * width + i, check.val(got[r * os + width + i]), want, @abs(want) * std.math.pow(f64, 2, -8) + 1e-30);
+                // two bf16 roundings (x / rms, the output) of u = 2^-8 each
+                wst.add(r * width + i, check.val(got[r * os + width + i]), want, @abs(want) * std.math.pow(f64, 2, -7) + 1e-30);
                 try rig.expect(got[r * os + i] == 0x7f7f, "rms {d}: row {d} column {d} outside the output was written", .{ width, r, i });
             }
         }

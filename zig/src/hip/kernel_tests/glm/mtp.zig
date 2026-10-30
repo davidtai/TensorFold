@@ -25,7 +25,8 @@ fn normRows(w: *check.Worst, x: []const u16, xs: usize, nw: []const u16, got: []
         const rinv = 1 / @sqrt(eps + ss / D);
         for (0..D) |i| {
             const want = check.val(nw[i]) * check.val(x[r * xs + i]) * rinv;
-            w.add(r * D + i, check.val(got[r * gs + off + i]), want, @abs(want) * std.math.pow(f64, 2, -8) + 1e-30);
+            // two bf16 roundings (x / rms, the output) of u = 2^-8 each
+            w.add(r * D + i, check.val(got[r * gs + off + i]), want, @abs(want) * std.math.pow(f64, 2, -7) + 1e-30);
         }
     }
 }
@@ -117,7 +118,7 @@ test "glm mtp: enorm and hnorm into [e | h], eh_proj on both tiles, residual and
         var wr: check.Worst = .{ .name = try std.fmt.bufPrint(&name[3], "mtp residual and shared_head.norm {d} rows", .{c.n}) };
         for (0..c.n * D) |i| {
             const want = check.val(gx[i]) + hg[i];
-            wr.add(i, check.val(gr[i]), want, (@abs(hg[i]) + @abs(want)) * std.math.pow(f64, 2, -9) + @abs(hg[i]) * std.math.pow(f64, 2, -22));
+            wr.add(i, check.val(gr[i]), want, (@abs(hg[i]) + @abs(want)) * std.math.pow(f64, 2, -8) + @abs(hg[i]) * std.math.pow(f64, 2, -22));
         }
         normRows(&wr, gr, D, hpn, gn, D, 0, c.n);
         try wr.done();
