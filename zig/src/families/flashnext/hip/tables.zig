@@ -16,6 +16,11 @@ pub const Tables = struct {
     bits: u8,
     group: usize,
     hasher: ngram.Hasher,
+    /// The rows are read through the checkpoint's mapping (rows=mapped, or a rank of a group), not an anonymous copy:
+    /// a gather then asks the kernel for each row's pages before it copies them.
+    mapped: bool = true,
+    /// Mapped rows: one bit a page of each shard's words, scales and biases, set once a gather asked for the page.
+    asked: [][3][]u64 = &.{},
 
     /// Bytes of a row's packed words, and of its scales (as of its biases).
     pub fn wordBytes(t: Tables) usize {
@@ -85,6 +90,65 @@ pub const Tables = struct {
                 @field(s, f) = copy;
             }
         }
+        t.mapped = false;
+    }
+
+    /// Mapped rows: no readahead on a fault (a row is 100 bytes in three tensors; a fault would read its neighbours'
+    /// pages too), and a page map for `prefetch`.
+    pub fn randomAccess(t: *Tables, a: std.mem.Allocator) !void {
+        const page = std.heap.pageSize();
+        t.asked = try a.alloc([3][]u64, t.shards.len);
+        for (t.shards, t.asked) |s, *bits| {
+            inline for (.{ "words", "scales", "biases" }, 0..) |f, k| {
+                const b = @field(s, f);
+                advise(b, std.os.linux.MADV.RANDOM);
+                const from = std.mem.alignBackward(usize, @intFromPtr(b.ptr), page);
+                const pages = (std.mem.alignForward(usize, @intFromPtr(b.ptr) + b.len, page) - from) / page;
+                bits[k] = try a.alloc(u64, std.math.divCeil(usize, pages, 64) catch unreachable);
+                @memset(bits[k], 0);
+            }
+        }
+    }
+
+    /// Mapped rows: the pages of each id not asked for before, asked for at once (MADV_WILLNEED starts their reads and
+    /// does not wait), so the cold pages of a window load in parallel and the copy waits only for the slowest. A page
+    /// is asked for once: a warm gather makes no call, and a page the kernel drops later costs one fault of its own.
+    fn prefetch(t: *const Tables, ids: []const u32) void {
+        if (@import("builtin").os.tag != .linux or t.asked.len == 0) return;
+        const page = std.heap.pageSize();
+        const wb = t.wordBytes();
+        const tb = t.tableBytes();
+        for (ids) |id| {
+            const s = t.shardOf(id) orelse continue;
+            const row = id - t.starts[s];
+            const sh = t.shards[s];
+            inline for (.{ sh.words, sh.scales, sh.biases }, .{ wb, tb, tb }, 0..) |part, n, k| {
+                const base = std.mem.alignBackward(usize, @intFromPtr(part.ptr), page);
+                const from = std.mem.alignBackward(usize, @intFromPtr(part.ptr) + row * n, page);
+                const to = std.mem.alignForward(usize, @intFromPtr(part.ptr) + row * n + n, page);
+                const bits = t.asked[s][k];
+                var new = false;
+                var p = (from - base) / page;
+                while (p < (to - base) / page) : (p += 1) {
+                    const bit = @as(u64, 1) << @intCast(p % 64);
+                    if (bits[p / 64] & bit == 0) {
+                        bits[p / 64] |= bit;
+                        new = true;
+                    }
+                }
+                if (new) _ = std.os.linux.madvise(@ptrFromInt(from), to - from, std.os.linux.MADV.WILLNEED);
+            }
+        }
+    }
+
+    /// The shard holding row `id`, or null past the last.
+    fn shardOf(t: *const Tables, id: u32) ?usize {
+        const s = std.sort.upperBound(usize, t.starts, @as(usize, id), struct {
+            fn order(x: usize, y: usize) std.math.Order {
+                return std.math.order(x, y);
+            }
+        }.order) - 1;
+        return if (s < t.shards.len) s else null;
     }
 
     fn advise(b: []const u8, advice: u32) void {
@@ -113,13 +177,9 @@ pub const Tables = struct {
         const tb = t.tableBytes();
         if (words.len < ids.len * wb or scales.len < ids.len * tb or biases.len < ids.len * tb)
             return error.StagingTooSmall;
+        if (t.mapped) t.prefetch(ids);
         for (ids, 0..) |id, i| {
-            const s = std.sort.upperBound(usize, t.starts, @as(usize, id), struct {
-                fn order(x: usize, y: usize) std.math.Order {
-                    return std.math.order(x, y);
-                }
-            }.order) - 1;
-            if (s >= t.shards.len) return error.NgramRowOutOfRange;
+            const s = t.shardOf(id) orelse return error.NgramRowOutOfRange;
             const row = id - t.starts[s];
             const sh = t.shards[s];
             @memcpy(words[i * wb ..][0..wb], sh.words[row * wb ..][0..wb]);
