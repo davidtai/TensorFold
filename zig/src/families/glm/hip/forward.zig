@@ -2,7 +2,7 @@
 //! 45 layers, the final norm, lm_head, and the MTP layer. One stream, no graphs, no TP. The op order and the buffer
 //! dtypes between blocks are the CUDA path's (cuda_forward.zig whole/finish/mtp, cuda_kda_block.zig,
 //! cuda_dsa_block.zig, cuda_moe.zig, cuda_mlp.zig); each op is a lane's launcher:
-//!   G4 hip.launches.glm (mHC, norms, residual, stream mean, embed) and the BF16 tiles (affine bf16Go, bf16PairGo);
+//!   G4 hip.launches.glm (mHC, norms, residual, stream mean, embed, GLM SwiGLU) and the BF16 tiles (bf16Go, bf16GluGo);
 //!   G2 the KDA launchers on the Launcher (tf_kda_prep, tf_kda, tf_kda_out, tf_kda_conv_shift);
 //!   G3 hip.launches.glm_dsa (latent cache, absorb/expand, indexer, select, latent attention);
 //!   G1 hip.exl3.run (the routed EXL3 experts over tf_moe_route's plan);
@@ -97,16 +97,17 @@ pub const Forward = struct {
         try f.l.affine.bf16Go(f.l.r, a, f.b.prompt, f.s);
     }
 
-    /// The shared expert's and the dense MLP's [gate | up] with SwiGLU (limit 10) into act bf16 (rows, cols), as G4's
-    /// tests compose it: prompt rows on the WMMA tile (fp32 pair) and tf_moe_act, decode rows on the stream pair tile.
+    /// The shared expert's and the dense MLP's [gate | up] with GLM's SwiGLU at CUDA's rounding points (limit 10;
+    /// glm_glue_moe.cuh swiglu1: g and u bf16, bf16(silu(min(g, 10))), bf16 of the product) into act bf16 (rows, cols),
+    /// as G4's tests compose it: prompt rows bf16 [gate | up] on the WMMA tile, then glm.swiglu; decode rows bf16GluGo.
     fn swiglu(f: *Forward, x: u64, gu: weights.Bf16, cols: usize, rows: usize, act: u64) !void {
         const limit = f.cfg.swiglu_limit;
         if (f.b.prompt) {
-            const both = try f.b.arena.of(f32, rows * 2 * cols);
-            try f.lin(x, gu, rows, both, false);
-            return f.l.tf_moe_act(cf(both), m(act), 2, int(rows), int(cols), limit, f.s);
+            const both = try f.b.arena.of(u16, rows * 2 * cols);
+            try f.lin(x, gu, rows, both, true);
+            return glue.swiglu(f.l, c(both), m(act), int(rows), int(cols), limit, f.s);
         }
-        try f.l.affine.bf16PairGo(f.l.r, x, gu.w, act, int(rows), int(cols), @intCast(gu.k), limit, f.s);
+        try f.l.affine.bf16GluGo(f.l.r, x, gu.w, act, f.l.glm.silu, int(rows), int(cols), @intCast(gu.k), limit, f.s);
     }
 
     pub fn sync(f: *const Forward) !void {

@@ -602,17 +602,20 @@ fn swigluRef(g: f64, u: f64) f64 {
     return gg / (1 + @exp(-gg)) * uu;
 }
 
-/// [gate | up] (w rows 0..cols gate, cols..2 cols up), SwiGLU, down: fp32-free float64 (G4's tiles round once).
+/// [gate | up] (w rows 0..cols gate, cols..2 cols up), SwiGLU at CUDA's rounding points (glm_glue_moe.cuh swiglu1: g and
+/// u bf16, bf16(silu(min(g, 10))), bf16 of the product), down, in float64.
 fn mlpRef(a: std.mem.Allocator, x: []const f64, rows: usize, gu: []const f64, down: []const f64, cols: usize) ![]f64 {
     const h = try mm(a, x, D, 0, rows, gu, 0, 2 * cols, D);
     const act = try a.alloc(f64, rows * cols);
     for (0..rows) |r| for (0..cols) |j| {
-        act[r * cols + j] = rb(swigluRef(h[r * 2 * cols + j], h[r * 2 * cols + cols + j]));
+        const g = @min(rb(h[r * 2 * cols + j]), 10.0);
+        const u = @max(@min(rb(h[r * 2 * cols + cols + j]), 10.0), -10.0);
+        act[r * cols + j] = rb(rb(g / (1 + @exp(-g))) * u);
     };
     return mm(a, act, cols, 0, rows, down, 0, D, cols);
 }
 
-test "glm fwd: the dense MLP (12,288) against float64 on both tiles; 300 rows = 200 + 100, bit for bit" {
+test "glm fwd: the dense MLP (12,288, CUDA's SwiGLU rounding) against float64 on both tiles; 300 rows = 200 + 100, bit for bit" {
     const t = try Rig.open();
     defer t.close();
     const a = t.a();
@@ -629,7 +632,7 @@ test "glm fwd: the dense MLP (12,288) against float64 on both tiles; 300 rows = 
         var f = try t.fwd(&b);
         try t.put(b.normed, std.mem.sliceAsBytes(x.bits[0 .. 8 * D]));
         try f.denseBlock(dw, 8);
-        try expectRows(if (prompt) "glm fwd dense MLP, 8 rows (WMMA tile, tf_moe_act)" else "glm fwd dense MLP, 8 rows (stream pair tile)", try t.get(f32, b.part, 8 * D), want, 8, D);
+        try expectRows(if (prompt) "glm fwd dense MLP, 8 rows (WMMA tile, glm.swiglu)" else "glm fwd dense MLP, 8 rows (stream tile, bf16GluGo)", try t.get(f32, b.part, 8 * D), want, 8, D);
     }
     var outs: [2][]f32 = undefined;
     for (0..2) |cut| {
