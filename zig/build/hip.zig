@@ -126,7 +126,9 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = host.flashnext })).step);
     b.step("test-flashnext-proposal-hip-host", "Original Flash Next HIP IDs and head-row spans without device runtime").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = host.flashnext, .filters = &.{"Flash Next proposal:"} })).step);
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = host.nemotron })).step);
-    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = host.glm })).step);
+    const glm_host = b.addRunArtifact(b.addTest(.{ .root_module = host.glm }));
+    test_step.dependOn(&glm_host.step);
+    b.step("test-glm-hip-host", "GLM-5.3-Flash HIP family CPU tests: admission, placement, the dump format").dependOn(&glm_host.step);
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = host.serve })).step);
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = host.native })).step);
     // the GPU programs compile on any host against stub kernels, so `test` catches what only they reach
@@ -166,6 +168,21 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
         "tf-nemotron-hip-test",
         "Nemotron-H load and skeleton checks on the GPU (-Dhip-arch)",
     ).dependOn(&b.addInstallArtifact(nem_test, .{}).step);
+    const glm_exe = b.addExecutable(.{ .name = "tf-glm-hip-test", .root_module = b.createModule(.{
+        .root_source_file = b.path("zig/tests/glm_hip/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "hip", .module = gpu.hip },
+            .{ .name = "glm", .module = gpu.glm },
+            .{ .name = "core", .module = gpu.hip.import_table.get("core").? },
+        },
+    }) });
+    b.step(
+        "tf-glm-hip-test",
+        "GLM-5.3-Flash on HIP: the placement, the streaming load and its sha256 sample, the dump format (-Dhip-arch)",
+    ).dependOn(&b.addInstallArtifact(glm_exe, .{}).step);
     const native = server(b, target, gpu, build_options);
     b.step("native-hip", "tensorfold-native with the HIP engines into zig-out/native-hip/bin (-Dhip-arch)").dependOn(&b.addInstallArtifact(native, .{ .dest_dir = .{ .override = .{ .custom = "native-hip/bin" } } }).step);
     @import("hip_contract.zig").steps(b, .{
