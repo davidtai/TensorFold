@@ -8,25 +8,25 @@ const hruntime = @import("../../runtime.zig");
 const dsa = @import("../../launches/glm_dsa.zig");
 
 const gpa = std.testing.allocator;
-const heads = 64;
+pub const heads = 64;
 
 test {
     _ = dsa;
 }
 
-const Rng = struct {
+pub const Rng = struct {
     state: u64,
-    fn next(r: *Rng) u64 {
+    pub fn next(r: *Rng) u64 {
         r.state ^= r.state >> 12;
         r.state ^= r.state << 25;
         r.state ^= r.state >> 27;
         return r.state *% 0x2545F4914F6CDD1D;
     }
     /// Uniform on [-1, 1).
-    fn unit(r: *Rng) f64 {
+    pub fn unit(r: *Rng) f64 {
         return @as(f64, @floatFromInt(r.next() >> 11)) / 4503599627370496.0 - 1.0;
     }
-    fn below(r: *Rng, n: usize) usize {
+    pub fn below(r: *Rng, n: usize) usize {
         return @intCast(r.next() % n);
     }
 };
@@ -36,14 +36,14 @@ fn bfValue(b: u16) f64 {
 }
 
 /// Round to nearest even, as float_to_bf16.
-fn bfBits(v: f32) u16 {
+pub fn bfBits(v: f32) u16 {
     const w: u32 = @bitCast(v);
     const bias: u32 = ((w >> 16) & 1) + 0x7fff;
     return @intCast((w +% bias) >> 16);
 }
 
-/// The shared kernel-test rig (device, stream, launchers) with the DSA kernels, an arena and owned device buffers.
-const Rig = struct {
+/// The shared kernel-test rig (also kernel_tests/glm/dsa_rows.zig's) (device, stream, launchers) with the DSA kernels, an arena and owned device buffers.
+pub const Rig = struct {
     base: *rig.Rig,
     k: dsa.Kernels,
     arena: std.heap.ArenaAllocator,
@@ -51,7 +51,7 @@ const Rig = struct {
     rng: Rng,
     worst: f64 = 0,
 
-    fn open(seed: u64) !*Rig {
+    pub fn open(seed: u64) !*Rig {
         const t = try gpa.create(Rig);
         errdefer gpa.destroy(t);
         t.base = try rig.Rig.open(1 << 20);
@@ -64,7 +64,7 @@ const Rig = struct {
         return t;
     }
 
-    fn close(t: *Rig) void {
+    pub fn close(t: *Rig) void {
         for (t.bufs.items) |*b| b.free();
         t.bufs.deinit(gpa);
         t.arena.deinit();
@@ -72,35 +72,35 @@ const Rig = struct {
         gpa.destroy(t);
     }
 
-    fn a(t: *Rig) std.mem.Allocator {
+    pub fn a(t: *Rig) std.mem.Allocator {
         return t.arena.allocator();
     }
 
-    fn s(t: *Rig) dsa.S {
+    pub fn s(t: *Rig) dsa.S {
         return t.base.stream.handle;
     }
 
     /// Device bytes holding `host`; its address.
-    fn dev(t: *Rig, host: anytype) !u64 {
+    pub fn dev(t: *Rig, host: anytype) !u64 {
         const b = try DeviceBuffer.fromHost(&t.base.r, std.mem.sliceAsBytes(host));
         try t.bufs.append(gpa, b);
         return b.base();
     }
 
     /// `n` device bytes, each `fill`.
-    fn filled(t: *Rig, n: usize, fill: u8) !u64 {
+    pub fn filled(t: *Rig, n: usize, fill: u8) !u64 {
         const b = try DeviceBuffer.alloc(&t.base.r, n);
         try t.bufs.append(gpa, b);
         try b.fill8(fill);
         return b.base();
     }
 
-    fn zeros(t: *Rig, n: usize) !u64 {
+    pub fn zeros(t: *Rig, n: usize) !u64 {
         return t.filled(n, 0);
     }
 
     /// `n` bytes back from address `p` (inside a buffer of this rig), after the stream's work.
-    fn back(t: *Rig, p: u64, n: usize) ![]u8 {
+    pub fn back(t: *Rig, p: u64, n: usize) ![]u8 {
         try t.base.stream.synchronize();
         for (t.bufs.items) |b| {
             const lo = b.base();
@@ -113,12 +113,12 @@ const Rig = struct {
         return error.NotABuffer;
     }
 
-    fn backAs(t: *Rig, comptime T: type, p: u64, n: usize) ![]align(1) const T {
+    pub fn backAs(t: *Rig, comptime T: type, p: u64, n: usize) ![]align(1) const T {
         return std.mem.bytesAsSlice(T, try t.back(p, n * @sizeOf(T)));
     }
 
     /// `n` bf16 values uniform on [-scale, scale), rounded.
-    fn bfs(t: *Rig, n: usize, scale: f64) ![]u16 {
+    pub fn bfs(t: *Rig, n: usize, scale: f64) ![]u16 {
         const out = try t.a().alloc(u16, n);
         for (out) |*v| v.* = bfBits(@floatCast(t.rng.unit() * scale));
         return out;
@@ -131,7 +131,7 @@ const Rig = struct {
     }
 };
 
-fn expect(ok: bool, comptime fmt: []const u8, args: anytype) !void {
+pub fn expect(ok: bool, comptime fmt: []const u8, args: anytype) !void {
     if (ok) return;
     std.debug.print("FAIL " ++ fmt ++ "\n", args);
     return error.TestUnexpectedResult;
@@ -162,14 +162,14 @@ fn closeCols(t: *Rig, name: []const u8, p: u64, want: []const f64, tol: []const 
     try worstCol(t, name, col);
 }
 
-fn sameBytes(t: *Rig, name: []const u8, a_: u64, b_: u64, n: usize) !void {
+pub fn sameBytes(t: *Rig, name: []const u8, a_: u64, b_: u64, n: usize) !void {
     const x = try t.back(a_, n);
     const y = try t.back(b_, n);
     for (x, y, 0..) |u, v, i| try expect(u == v, "{s}: byte {d} differs ({d} vs {d})", .{ name, i, u, v });
     std.debug.print("SAME {s}: {d} bytes\n", .{ name, n });
 }
 
-fn posDev(t: *Rig, p: usize) !u64 {
+pub fn posDev(t: *Rig, p: usize) !u64 {
     const v: [1]i32 = .{@intCast(p)};
     return t.dev(&v);
 }
@@ -667,11 +667,11 @@ fn attnRef(t: *Rig, q: []const u16, cd: []const f64, keys: []const []const u32, 
     return .{ .want = want, .tol = tol };
 }
 
-fn parts(t: *Rig, rows: usize, n: usize) !dsa.Partials {
+pub fn parts(t: *Rig, rows: usize, n: usize) !dsa.Partials {
     return .{ .po = try t.zeros(rows * heads * n * dsa.lw * 4), .pms = try t.zeros(rows * heads * n * 2 * 4) };
 }
 
-const scale_qk: f32 = 0.0625; // qk_head_dim 256: 256^-0.5
+pub const scale_qk: f32 = 0.0625; // qk_head_dim 256: 256^-0.5
 
 test "GLM DSA: dense latent attention against float64; head blocks, single rows and split calls give the same bits" {
     const t = try Rig.open(0x6305);
