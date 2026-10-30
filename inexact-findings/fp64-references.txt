@@ -1,0 +1,166 @@
+FP64 sparse_attn h24kv2d256 prompt exact rms_rel=6.116e-8 max_abs=1.974e-7 worst_col=2407 worst_col_err=6.992e-8 ref_rms=2.483e-1 nonfinite=0
+FP64 sparse_attn h24kv2d256 prompt inexact rms_rel=1.290e-6 max_abs=1.966e-6 worst_col=633 worst_col_err=7.431e-7 ref_rms=2.483e-1 nonfinite=0
+FP64 sparse_attn h24kv2d256 prompt verdict=WORSE rms_rel=1.290e-6/6.116e-8 max_abs=1.966e-6/1.974e-7 worst_col_err=7.431e-7/6.992e-8
+FP64 sparse_attn h24kv2d256 decode exact rms_rel=6.116e-8 max_abs=1.974e-7 worst_col=2407 worst_col_err=6.992e-8 ref_rms=2.483e-1 nonfinite=0
+FP64 sparse_attn h24kv2d256 decode inexact rms_rel=1.627e-7 max_abs=2.961e-7 worst_col=6105 worst_col_err=1.143e-7 ref_rms=2.483e-1 nonfinite=0
+FP64 sparse_attn h24kv2d256 decode verdict=WORSE rms_rel=1.627e-7/6.116e-8 max_abs=2.961e-7/1.974e-7 worst_col_err=1.143e-7/6.992e-8
+FP64 attn_p_bf16 h24kv2d256 prompt inexact_p_hilo rms_rel=1.143e-6 max_abs=2.090e-6 worst_col=686 worst_col_err=8.533e-7 ref_rms=2.578e-1 nonfinite=0
+FP64 attn_p_bf16 h24kv2d256 prompt exact rms_rel=5.987e-8 max_abs=2.093e-7 worst_col=802 worst_col_err=7.422e-8 ref_rms=2.578e-1 nonfinite=0
+FP64 attn_p_bf16 h24kv2d256 prompt inexact rms_rel=5.505e-4 max_abs=1.011e-3 worst_col=5383 worst_col_err=3.839e-4 ref_rms=2.578e-1 nonfinite=0
+FP64 attn_p_bf16 h24kv2d256 prompt verdict=WORSE rms_rel=5.505e-4/5.987e-8 max_abs=1.011e-3/2.093e-7 worst_col_err=3.839e-4/7.422e-8
+FP64 gdn_wy h1x3.L1.y prompt exact rms_rel=9.354e-8 max_abs=2.836e-8 worst_col=208 worst_col_err=2.836e-8 ref_rms=8.576e-2 nonfinite=0
+FP64 gdn_wy h1x3.L1.y prompt inexact rms_rel=3.234e-4 max_abs=1.777e-4 worst_col=8 worst_col_err=1.777e-4 ref_rms=8.576e-2 nonfinite=0
+FP64 gdn_wy h1x3.L1.y prompt verdict=WORSE rms_rel=3.234e-4/9.354e-8 max_abs=1.777e-4/2.836e-8 worst_col_err=1.777e-4/2.836e-8
+FP64 gdn_wy h1x3.L1.state prompt exact rms_rel=4.113e-8 max_abs=4.374e-8 worst_col=59 worst_col_err=7.678e-9 ref_rms=8.828e-2 nonfinite=0
+FP64 gdn_wy h1x3.L1.state prompt inexact rms_rel=2.306e-4 max_abs=6.440e-4 worst_col=59 worst_col_err=6.404e-5 ref_rms=8.828e-2 nonfinite=0
+FP64 gdn_wy h1x3.L1.state prompt verdict=WORSE rms_rel=2.306e-4/4.113e-8 max_abs=6.440e-4/4.374e-8 worst_col_err=6.404e-5/7.678e-9
+FP64 gdn_wy h1x3.L1.y decode exact rms_rel=9.354e-8 max_abs=2.836e-8 worst_col=208 worst_col_err=2.836e-8 ref_rms=8.576e-2 nonfinite=0
+FP64 gdn_wy h1x3.L1.y decode inexact rms_rel=9.354e-8 max_abs=2.836e-8 worst_col=208 worst_col_err=2.836e-8 ref_rms=8.576e-2 nonfinite=0
+FP64 gdn_wy h1x3.L1.y decode verdict=SAME_KERNEL rms_rel=9.354e-8/9.354e-8 max_abs=2.836e-8/2.836e-8 worst_col_err=2.836e-8/2.836e-8
+FP64 gdn_wy h1x3.L1.state decode exact rms_rel=4.113e-8 max_abs=4.374e-8 worst_col=59 worst_col_err=7.678e-9 ref_rms=8.828e-2 nonfinite=0
+FP64 gdn_wy h1x3.L1.state decode inexact rms_rel=4.113e-8 max_abs=4.374e-8 worst_col=59 worst_col_err=7.678e-9 ref_rms=8.828e-2 nonfinite=0
+FP64 gdn_wy h1x3.L1.state decode verdict=SAME_KERNEL rms_rel=4.113e-8/4.113e-8 max_abs=4.374e-8/4.374e-8 worst_col_err=7.678e-9/7.678e-9
+FP64 gdn_wy h1x3.L33.y prompt exact rms_rel=1.123e-7 max_abs=6.084e-8 worst_col=102 worst_col_err=2.252e-8 ref_rms=8.073e-2 nonfinite=0
+FP64 gdn_wy h1x3.L33.y prompt inexact rms_rel=5.008e-4 max_abs=2.752e-4 worst_col=19 worst_col_err=8.839e-5 ref_rms=8.073e-2 nonfinite=0
+FP64 gdn_wy h1x3.L33.y prompt verdict=WORSE rms_rel=5.008e-4/1.123e-7 max_abs=2.752e-4/6.084e-8 worst_col_err=8.839e-5/2.252e-8
+FP64 gdn_wy h1x3.L33.state prompt exact rms_rel=7.773e-8 max_abs=4.353e-8 worst_col=42 worst_col_err=7.613e-9 ref_rms=6.240e-2 nonfinite=0
+FP64 gdn_wy h1x3.L33.state prompt inexact rms_rel=4.235e-4 max_abs=2.647e-4 worst_col=42 worst_col_err=5.281e-5 ref_rms=6.240e-2 nonfinite=0
+FP64 gdn_wy h1x3.L33.state prompt verdict=WORSE rms_rel=4.235e-4/7.773e-8 max_abs=2.647e-4/4.353e-8 worst_col_err=5.281e-5/7.613e-9
+FP64 gdn_wy h1x3.L33.y decode exact rms_rel=1.123e-7 max_abs=6.084e-8 worst_col=102 worst_col_err=2.252e-8 ref_rms=8.073e-2 nonfinite=0
+FP64 gdn_wy h1x3.L33.y decode inexact rms_rel=1.123e-7 max_abs=6.084e-8 worst_col=102 worst_col_err=2.252e-8 ref_rms=8.073e-2 nonfinite=0
+FP64 gdn_wy h1x3.L33.y decode verdict=SAME_KERNEL rms_rel=1.123e-7/1.123e-7 max_abs=6.084e-8/6.084e-8 worst_col_err=2.252e-8/2.252e-8
+FP64 gdn_wy h1x3.L33.state decode exact rms_rel=7.773e-8 max_abs=4.353e-8 worst_col=42 worst_col_err=7.613e-9 ref_rms=6.240e-2 nonfinite=0
+FP64 gdn_wy h1x3.L33.state decode inexact rms_rel=7.773e-8 max_abs=4.353e-8 worst_col=42 worst_col_err=7.613e-9 ref_rms=6.240e-2 nonfinite=0
+FP64 gdn_wy h1x3.L33.state decode verdict=SAME_KERNEL rms_rel=7.773e-8/7.773e-8 max_abs=4.353e-8/4.353e-8 worst_col_err=7.613e-9/7.613e-9
+FP64 gdn_wy h2x4.L64.y prompt exact rms_rel=1.123e-7 max_abs=9.264e-8 worst_col=65 worst_col_err=2.100e-8 ref_rms=8.332e-2 nonfinite=0
+FP64 gdn_wy h2x4.L64.y prompt inexact rms_rel=4.962e-4 max_abs=5.521e-4 worst_col=87 worst_col_err=1.148e-4 ref_rms=8.332e-2 nonfinite=0
+FP64 gdn_wy h2x4.L64.y prompt verdict=WORSE rms_rel=4.962e-4/1.123e-7 max_abs=5.521e-4/9.264e-8 worst_col_err=1.148e-4/2.100e-8
+FP64 gdn_wy h2x4.L64.state prompt exact rms_rel=9.462e-8 max_abs=1.317e-7 worst_col=16 worst_col_err=1.266e-8 ref_rms=8.786e-2 nonfinite=0
+FP64 gdn_wy h2x4.L64.state prompt inexact rms_rel=3.966e-4 max_abs=3.493e-4 worst_col=16 worst_col_err=6.476e-5 ref_rms=8.786e-2 nonfinite=0
+FP64 gdn_wy h2x4.L64.state prompt verdict=WORSE rms_rel=3.966e-4/9.462e-8 max_abs=3.493e-4/1.317e-7 worst_col_err=6.476e-5/1.266e-8
+FP64 gdn_wy h2x4.L64.y decode exact rms_rel=1.123e-7 max_abs=9.264e-8 worst_col=65 worst_col_err=2.100e-8 ref_rms=8.332e-2 nonfinite=0
+FP64 gdn_wy h2x4.L64.y decode inexact rms_rel=1.123e-7 max_abs=9.264e-8 worst_col=65 worst_col_err=2.100e-8 ref_rms=8.332e-2 nonfinite=0
+FP64 gdn_wy h2x4.L64.y decode verdict=SAME_KERNEL rms_rel=1.123e-7/1.123e-7 max_abs=9.264e-8/9.264e-8 worst_col_err=2.100e-8/2.100e-8
+FP64 gdn_wy h2x4.L64.state decode exact rms_rel=9.462e-8 max_abs=1.317e-7 worst_col=16 worst_col_err=1.266e-8 ref_rms=8.786e-2 nonfinite=0
+FP64 gdn_wy h2x4.L64.state decode inexact rms_rel=9.462e-8 max_abs=1.317e-7 worst_col=16 worst_col_err=1.266e-8 ref_rms=8.786e-2 nonfinite=0
+FP64 gdn_wy h2x4.L64.state decode verdict=SAME_KERNEL rms_rel=9.462e-8/9.462e-8 max_abs=1.317e-7/1.317e-7 worst_col_err=1.266e-8/1.266e-8
+FP64 gdn_wy h1x3.L200.y prompt exact rms_rel=1.144e-7 max_abs=8.448e-8 worst_col=62 worst_col_err=1.771e-8 ref_rms=8.493e-2 nonfinite=0
+FP64 gdn_wy h1x3.L200.y prompt inexact rms_rel=5.071e-4 max_abs=4.667e-4 worst_col=62 worst_col_err=7.791e-5 ref_rms=8.493e-2 nonfinite=0
+FP64 gdn_wy h1x3.L200.y prompt verdict=WORSE rms_rel=5.071e-4/1.144e-7 max_abs=4.667e-4/8.448e-8 worst_col_err=7.791e-5/1.771e-8
+FP64 gdn_wy h1x3.L200.state prompt exact rms_rel=9.301e-8 max_abs=1.144e-7 worst_col=14 worst_col_err=1.310e-8 ref_rms=9.008e-2 nonfinite=0
+FP64 gdn_wy h1x3.L200.state prompt inexact rms_rel=4.153e-4 max_abs=4.234e-4 worst_col=1 worst_col_err=6.718e-5 ref_rms=9.008e-2 nonfinite=0
+FP64 gdn_wy h1x3.L200.state prompt verdict=WORSE rms_rel=4.153e-4/9.301e-8 max_abs=4.234e-4/1.144e-7 worst_col_err=6.718e-5/1.310e-8
+FP64 gdn_wy h1x3.L200.y decode exact rms_rel=1.144e-7 max_abs=8.448e-8 worst_col=62 worst_col_err=1.771e-8 ref_rms=8.493e-2 nonfinite=0
+FP64 gdn_wy h1x3.L200.y decode inexact rms_rel=1.144e-7 max_abs=8.448e-8 worst_col=62 worst_col_err=1.771e-8 ref_rms=8.493e-2 nonfinite=0
+FP64 gdn_wy h1x3.L200.y decode verdict=SAME_KERNEL rms_rel=1.144e-7/1.144e-7 max_abs=8.448e-8/8.448e-8 worst_col_err=1.771e-8/1.771e-8
+FP64 gdn_wy h1x3.L200.state decode exact rms_rel=9.301e-8 max_abs=1.144e-7 worst_col=14 worst_col_err=1.310e-8 ref_rms=9.008e-2 nonfinite=0
+FP64 gdn_wy h1x3.L200.state decode inexact rms_rel=9.301e-8 max_abs=1.144e-7 worst_col=14 worst_col_err=1.310e-8 ref_rms=9.008e-2 nonfinite=0
+FP64 gdn_wy h1x3.L200.state decode verdict=SAME_KERNEL rms_rel=9.301e-8/9.301e-8 max_abs=1.144e-7/1.144e-7 worst_col_err=1.310e-8/1.310e-8
+FP64 gdn_wy h2x4.L1000.y prompt exact rms_rel=1.138e-7 max_abs=9.294e-8 worst_col=111 worst_col_err=1.647e-8 ref_rms=8.005e-2 nonfinite=0
+FP64 gdn_wy h2x4.L1000.y prompt inexact rms_rel=5.024e-4 max_abs=5.250e-4 worst_col=37 worst_col_err=6.602e-5 ref_rms=8.005e-2 nonfinite=0
+FP64 gdn_wy h2x4.L1000.y prompt verdict=WORSE rms_rel=5.024e-4/1.138e-7 max_abs=5.250e-4/9.294e-8 worst_col_err=6.602e-5/1.647e-8
+FP64 gdn_wy h2x4.L1000.state prompt exact rms_rel=8.762e-8 max_abs=9.588e-8 worst_col=26 worst_col_err=1.190e-8 ref_rms=9.322e-2 nonfinite=0
+FP64 gdn_wy h2x4.L1000.state prompt inexact rms_rel=4.112e-4 max_abs=4.648e-4 worst_col=94 worst_col_err=6.934e-5 ref_rms=9.322e-2 nonfinite=0
+FP64 gdn_wy h2x4.L1000.state prompt verdict=WORSE rms_rel=4.112e-4/8.762e-8 max_abs=4.648e-4/9.588e-8 worst_col_err=6.934e-5/1.190e-8
+FP64 gdn_wy h2x4.L1000.y decode exact rms_rel=1.138e-7 max_abs=9.294e-8 worst_col=111 worst_col_err=1.647e-8 ref_rms=8.005e-2 nonfinite=0
+FP64 gdn_wy h2x4.L1000.y decode inexact rms_rel=1.138e-7 max_abs=9.294e-8 worst_col=111 worst_col_err=1.647e-8 ref_rms=8.005e-2 nonfinite=0
+FP64 gdn_wy h2x4.L1000.y decode verdict=SAME_KERNEL rms_rel=1.138e-7/1.138e-7 max_abs=9.294e-8/9.294e-8 worst_col_err=1.647e-8/1.647e-8
+FP64 gdn_wy h2x4.L1000.state decode exact rms_rel=8.762e-8 max_abs=9.588e-8 worst_col=26 worst_col_err=1.190e-8 ref_rms=9.322e-2 nonfinite=0
+FP64 gdn_wy h2x4.L1000.state decode inexact rms_rel=8.762e-8 max_abs=9.588e-8 worst_col=26 worst_col_err=1.190e-8 ref_rms=9.322e-2 nonfinite=0
+FP64 gdn_wy h2x4.L1000.state decode verdict=SAME_KERNEL rms_rel=8.762e-8/8.762e-8 max_abs=9.588e-8/9.588e-8 worst_col_err=1.190e-8/1.190e-8
+FP64 gdn_wy h2x6.L4170.y prompt exact rms_rel=1.106e-7 max_abs=1.224e-7 worst_col=79 worst_col_err=1.580e-8 ref_rms=7.524e-2 nonfinite=0
+FP64 gdn_wy h2x6.L4170.y prompt inexact rms_rel=5.091e-4 max_abs=7.543e-4 worst_col=79 worst_col_err=6.497e-5 ref_rms=7.524e-2 nonfinite=0
+FP64 gdn_wy h2x6.L4170.y prompt verdict=WORSE rms_rel=5.091e-4/1.106e-7 max_abs=7.543e-4/1.224e-7 worst_col_err=6.497e-5/1.580e-8
+FP64 gdn_wy h2x6.L4170.state prompt exact rms_rel=7.462e-8 max_abs=8.330e-8 worst_col=79 worst_col_err=8.115e-9 ref_rms=7.911e-2 nonfinite=0
+FP64 gdn_wy h2x6.L4170.state prompt inexact rms_rel=4.159e-4 max_abs=5.580e-4 worst_col=12 worst_col_err=6.924e-5 ref_rms=7.911e-2 nonfinite=0
+FP64 gdn_wy h2x6.L4170.state prompt verdict=WORSE rms_rel=4.159e-4/7.462e-8 max_abs=5.580e-4/8.330e-8 worst_col_err=6.924e-5/8.115e-9
+FP64 gdn_wy h2x6.L4170.y decode exact rms_rel=1.106e-7 max_abs=1.224e-7 worst_col=79 worst_col_err=1.580e-8 ref_rms=7.524e-2 nonfinite=0
+FP64 gdn_wy h2x6.L4170.y decode inexact rms_rel=1.106e-7 max_abs=1.224e-7 worst_col=79 worst_col_err=1.580e-8 ref_rms=7.524e-2 nonfinite=0
+FP64 gdn_wy h2x6.L4170.y decode verdict=SAME_KERNEL rms_rel=1.106e-7/1.106e-7 max_abs=1.224e-7/1.224e-7 worst_col_err=1.580e-8/1.580e-8
+FP64 gdn_wy h2x6.L4170.state decode exact rms_rel=7.462e-8 max_abs=8.330e-8 worst_col=79 worst_col_err=8.115e-9 ref_rms=7.911e-2 nonfinite=0
+FP64 gdn_wy h2x6.L4170.state decode inexact rms_rel=7.462e-8 max_abs=8.330e-8 worst_col=79 worst_col_err=8.115e-9 ref_rms=7.911e-2 nonfinite=0
+FP64 gdn_wy h2x6.L4170.state decode verdict=SAME_KERNEL rms_rel=7.462e-8/7.462e-8 max_abs=8.330e-8/8.330e-8 worst_col_err=8.115e-9/8.115e-9
+FP64 gdn_wy h16x48.L200.y prompt exact rms_rel=1.032e-7 max_abs=1.259e-7 worst_col=28 worst_col_err=1.757e-8 ref_rms=6.585e-2 nonfinite=0
+FP64 gdn_wy h16x48.L200.y prompt inexact rms_rel=5.117e-4 max_abs=7.125e-4 worst_col=56 worst_col_err=8.071e-5 ref_rms=6.585e-2 nonfinite=0
+FP64 gdn_wy h16x48.L200.y prompt verdict=WORSE rms_rel=5.117e-4/1.032e-7 max_abs=7.125e-4/1.259e-7 worst_col_err=8.071e-5/1.757e-8
+FP64 gdn_wy h16x48.L200.state prompt exact rms_rel=6.544e-8 max_abs=1.032e-7 worst_col=56 worst_col_err=5.492e-9 ref_rms=6.738e-2 nonfinite=0
+FP64 gdn_wy h16x48.L200.state prompt inexact rms_rel=4.071e-4 max_abs=7.455e-4 worst_col=56 worst_col_err=3.994e-5 ref_rms=6.738e-2 nonfinite=0
+FP64 gdn_wy h16x48.L200.state prompt verdict=WORSE rms_rel=4.071e-4/6.544e-8 max_abs=7.455e-4/1.032e-7 worst_col_err=3.994e-5/5.492e-9
+FP64 gdn_wy h16x48.L200.y decode exact rms_rel=1.032e-7 max_abs=1.259e-7 worst_col=28 worst_col_err=1.757e-8 ref_rms=6.585e-2 nonfinite=0
+FP64 gdn_wy h16x48.L200.y decode inexact rms_rel=1.032e-7 max_abs=1.259e-7 worst_col=28 worst_col_err=1.757e-8 ref_rms=6.585e-2 nonfinite=0
+FP64 gdn_wy h16x48.L200.y decode verdict=SAME_KERNEL rms_rel=1.032e-7/1.032e-7 max_abs=1.259e-7/1.259e-7 worst_col_err=1.757e-8/1.757e-8
+FP64 gdn_wy h16x48.L200.state decode exact rms_rel=6.544e-8 max_abs=1.032e-7 worst_col=56 worst_col_err=5.492e-9 ref_rms=6.738e-2 nonfinite=0
+FP64 gdn_wy h16x48.L200.state decode inexact rms_rel=6.544e-8 max_abs=1.032e-7 worst_col=56 worst_col_err=5.492e-9 ref_rms=6.738e-2 nonfinite=0
+FP64 gdn_wy h16x48.L200.state decode verdict=SAME_KERNEL rms_rel=6.544e-8/6.544e-8 max_abs=1.032e-7/1.032e-7 worst_col_err=5.492e-9/5.492e-9
+FP64 dense_bf16w k2560n640.m300 prompt exact rms_rel=1.939e-7 max_abs=3.362e-5 worst_col=567 worst_col_err=8.955e-6 ref_rms=1.982e1 nonfinite=0
+FP64 dense_bf16w k2560n640.m300 prompt inexact rms_rel=1.697e-3 max_abs=1.513e-1 worst_col=560 worst_col_err=5.257e-2 ref_rms=1.982e1 nonfinite=0
+FP64 dense_bf16w k2560n640.m300 prompt verdict=WORSE rms_rel=1.697e-3/1.939e-7 max_abs=1.513e-1/3.362e-5 worst_col_err=5.257e-2/8.955e-6
+FP64 dense_bf16w k2560n640.m300 decode exact rms_rel=7.084e-8 max_abs=7.272e-6 worst_col=554 worst_col_err=2.305e-6 ref_rms=1.982e1 nonfinite=0
+FP64 dense_bf16w k2560n640.m300 decode inexact rms_rel=7.084e-8 max_abs=7.272e-6 worst_col=554 worst_col_err=2.305e-6 ref_rms=1.982e1 nonfinite=0
+FP64 dense_bf16w k2560n640.m300 decode verdict=SAME_KERNEL rms_rel=7.084e-8/7.084e-8 max_abs=7.272e-6/7.272e-6 worst_col_err=2.305e-6/2.305e-6
+FP64 dense_bf16w k6144n2560.m257 prompt exact rms_rel=3.247e-7 max_abs=9.096e-5 worst_col=2226 worst_col_err=2.609e-5 ref_rms=3.110e1 nonfinite=0
+FP64 dense_bf16w k6144n2560.m257 prompt inexact rms_rel=1.685e-3 max_abs=2.534e-1 worst_col=1493 worst_col_err=9.081e-2 ref_rms=3.110e1 nonfinite=0
+FP64 dense_bf16w k6144n2560.m257 prompt verdict=WORSE rms_rel=1.685e-3/3.247e-7 max_abs=2.534e-1/9.096e-5 worst_col_err=9.081e-2/2.609e-5
+FP64 dense_bf16w k6144n2560.m257 decode exact rms_rel=7.909e-8 max_abs=1.425e-5 worst_col=1119 worst_col_err=4.414e-6 ref_rms=3.110e1 nonfinite=0
+FP64 dense_bf16w k6144n2560.m257 decode inexact rms_rel=7.909e-8 max_abs=1.425e-5 worst_col=1119 worst_col_err=4.414e-6 ref_rms=3.110e1 nonfinite=0
+FP64 dense_bf16w k6144n2560.m257 decode verdict=SAME_KERNEL rms_rel=7.909e-8/7.909e-8 max_abs=1.425e-5/1.425e-5 worst_col_err=4.414e-6/4.414e-6
+FP64 dense_bf16w k2560n200.m130 prompt exact rms_rel=2.143e-7 max_abs=2.909e-5 worst_col=32 worst_col_err=1.035e-5 ref_rms=1.962e1 nonfinite=0
+FP64 dense_bf16w k2560n200.m130 prompt inexact rms_rel=1.756e-3 max_abs=1.258e-1 worst_col=123 worst_col_err=5.199e-2 ref_rms=1.962e1 nonfinite=0
+FP64 dense_bf16w k2560n200.m130 prompt verdict=WORSE rms_rel=1.756e-3/2.143e-7 max_abs=1.258e-1/2.909e-5 worst_col_err=5.199e-2/1.035e-5
+FP64 dense_bf16w k2560n200.m130 decode exact rms_rel=7.296e-8 max_abs=5.901e-6 worst_col=38 worst_col_err=2.561e-6 ref_rms=1.962e1 nonfinite=0
+FP64 dense_bf16w k2560n200.m130 decode inexact rms_rel=7.296e-8 max_abs=5.901e-6 worst_col=38 worst_col_err=2.561e-6 ref_rms=1.962e1 nonfinite=0
+FP64 dense_bf16w k2560n200.m130 decode verdict=SAME_KERNEL rms_rel=7.296e-8/7.296e-8 max_abs=5.901e-6/5.901e-6 worst_col_err=2.561e-6/2.561e-6
+FP64 dense_bf16w k2560n1024.m1024 prompt exact rms_rel=2.065e-7 max_abs=3.952e-5 worst_col=121 worst_col_err=6.335e-6 ref_rms=1.945e1 nonfinite=0
+FP64 dense_bf16w k2560n1024.m1024 prompt inexact rms_rel=1.753e-3 max_abs=1.404e-1 worst_col=158 worst_col_err=4.543e-2 ref_rms=1.945e1 nonfinite=0
+FP64 dense_bf16w k2560n1024.m1024 prompt verdict=WORSE rms_rel=1.753e-3/2.065e-7 max_abs=1.404e-1/3.952e-5 worst_col_err=4.543e-2/6.335e-6
+FP64 dense_bf16w k2560n1024.m1024 decode exact rms_rel=7.091e-8 max_abs=8.941e-6 worst_col=991 worst_col_err=1.884e-6 ref_rms=1.945e1 nonfinite=0
+FP64 dense_bf16w k2560n1024.m1024 decode inexact rms_rel=7.091e-8 max_abs=8.941e-6 worst_col=991 worst_col_err=1.884e-6 ref_rms=1.945e1 nonfinite=0
+FP64 dense_bf16w k2560n1024.m1024 decode verdict=SAME_KERNEL rms_rel=7.091e-8/7.091e-8 max_abs=8.941e-6/8.941e-6 worst_col_err=1.884e-6/1.884e-6
+FP64 moe_bf16w gu.k2560n1280.limit0 prompt exact rms_rel=1.649e-3 max_abs=1.471e1 worst_col=54 worst_col_err=1.633e0 ref_rms=3.531e2 nonfinite=0
+FP64 moe_bf16w gu.k2560n1280.limit0 prompt inexact rms_rel=2.544e-3 max_abs=1.763e1 worst_col=87 worst_col_err=1.956e0 ref_rms=3.531e2 nonfinite=0
+FP64 moe_bf16w gu.k2560n1280.limit0 prompt verdict=WORSE rms_rel=2.544e-3/1.649e-3 max_abs=1.763e1/1.471e1 worst_col_err=1.956e0/1.633e0
+FP64 moe_bf16w gu.k2560n1280.limit0 decode exact rms_rel=1.649e-3 max_abs=1.471e1 worst_col=54 worst_col_err=1.633e0 ref_rms=3.531e2 nonfinite=0
+FP64 moe_bf16w gu.k2560n1280.limit0 decode inexact rms_rel=1.649e-3 max_abs=1.471e1 worst_col=54 worst_col_err=1.633e0 ref_rms=3.531e2 nonfinite=0
+FP64 moe_bf16w gu.k2560n1280.limit0 decode verdict=SAME_KERNEL rms_rel=1.649e-3/1.649e-3 max_abs=1.471e1/1.471e1 worst_col_err=1.633e0/1.633e0
+FP64 moe_bf16w gu.k2560n1280.limit7 prompt exact rms_rel=1.112e-3 max_abs=1.250e-1 worst_col=16 worst_col_err=4.045e-2 ref_rms=2.872e1 nonfinite=0
+FP64 moe_bf16w gu.k2560n1280.limit7 prompt inexact rms_rel=4.079e-3 max_abs=1.057e0 worst_col=106 worst_col_err=1.706e-1 ref_rms=2.872e1 nonfinite=0
+FP64 moe_bf16w gu.k2560n1280.limit7 prompt verdict=WORSE rms_rel=4.079e-3/1.112e-3 max_abs=1.057e0/1.250e-1 worst_col_err=1.706e-1/4.045e-2
+FP64 moe_bf16w gu.k2560n1280.limit7 decode exact rms_rel=1.112e-3 max_abs=1.250e-1 worst_col=16 worst_col_err=4.045e-2 ref_rms=2.872e1 nonfinite=0
+FP64 moe_bf16w gu.k2560n1280.limit7 decode inexact rms_rel=1.112e-3 max_abs=1.250e-1 worst_col=16 worst_col_err=4.045e-2 ref_rms=2.872e1 nonfinite=0
+FP64 moe_bf16w gu.k2560n1280.limit7 decode verdict=SAME_KERNEL rms_rel=1.112e-3/1.112e-3 max_abs=1.250e-1/1.250e-1 worst_col_err=4.045e-2/4.045e-2
+FP64 moe_bf16w down.k640n2560 prompt exact rms_rel=9.154e-8 max_abs=1.019e-5 worst_col=2472 worst_col_err=1.409e-6 ref_rms=9.934e0 nonfinite=0
+FP64 moe_bf16w down.k640n2560 prompt inexact rms_rel=1.701e-3 max_abs=8.582e-2 worst_col=2397 worst_col_err=2.163e-2 ref_rms=9.934e0 nonfinite=0
+FP64 moe_bf16w down.k640n2560 prompt verdict=WORSE rms_rel=1.701e-3/9.154e-8 max_abs=8.582e-2/1.019e-5 worst_col_err=2.163e-2/1.409e-6
+FP64 moe_bf16w down.k640n2560 decode exact rms_rel=5.818e-8 max_abs=4.828e-6 worst_col=2452 worst_col_err=7.892e-7 ref_rms=9.934e0 nonfinite=0
+FP64 moe_bf16w down.k640n2560 decode inexact rms_rel=5.818e-8 max_abs=4.828e-6 worst_col=2452 worst_col_err=7.892e-7 ref_rms=9.934e0 nonfinite=0
+FP64 moe_bf16w down.k640n2560 decode verdict=SAME_KERNEL rms_rel=5.818e-8/5.818e-8 max_abs=4.828e-6/4.828e-6 worst_col_err=7.892e-7/7.892e-7
+FP64 router_bf16 e513k2560.m300 prompt exact rms_rel=2.330e-7 max_abs=1.550e-5 worst_col=445 worst_col_err=2.450e-6 ref_rms=4.222e0 nonfinite=0
+FP64 router_bf16 e513k2560.m300 prompt inexact rms_rel=9.704e-7 max_abs=6.127e-5 worst_col=129 worst_col_err=1.066e-5 ref_rms=4.222e0 nonfinite=0
+FP64 router_bf16 e513k2560.m300 prompt verdict=WORSE rms_rel=9.704e-7/2.330e-7 max_abs=6.127e-5/1.550e-5 worst_col_err=1.066e-5/2.450e-6
+FP64 router_bf16 e513k2560.m300 decode exact rms_rel=2.330e-7 max_abs=1.550e-5 worst_col=445 worst_col_err=2.450e-6 ref_rms=4.222e0 nonfinite=0
+FP64 router_bf16 e513k2560.m300 decode inexact rms_rel=2.330e-7 max_abs=1.550e-5 worst_col=445 worst_col_err=2.450e-6 ref_rms=4.222e0 nonfinite=0
+FP64 router_bf16 e513k2560.m300 decode verdict=SAME_KERNEL rms_rel=2.330e-7/2.330e-7 max_abs=1.550e-5/1.550e-5 worst_col_err=2.450e-6/2.450e-6
+FP64 router_bf16 e513k2560.m64 prompt exact rms_rel=2.268e-7 max_abs=1.168e-5 worst_col=105 worst_col_err=3.749e-6 ref_rms=4.169e0 nonfinite=0
+FP64 router_bf16 e513k2560.m64 prompt inexact rms_rel=9.884e-7 max_abs=3.600e-5 worst_col=226 worst_col_err=1.180e-5 ref_rms=4.169e0 nonfinite=0
+FP64 router_bf16 e513k2560.m64 prompt verdict=WORSE rms_rel=9.884e-7/2.268e-7 max_abs=3.600e-5/1.168e-5 worst_col_err=1.180e-5/3.749e-6
+FP64 router_bf16 e513k2560.m64 decode exact rms_rel=2.268e-7 max_abs=1.168e-5 worst_col=105 worst_col_err=3.749e-6 ref_rms=4.169e0 nonfinite=0
+FP64 router_bf16 e513k2560.m64 decode inexact rms_rel=2.268e-7 max_abs=1.168e-5 worst_col=105 worst_col_err=3.749e-6 ref_rms=4.169e0 nonfinite=0
+FP64 router_bf16 e513k2560.m64 decode verdict=SAME_KERNEL rms_rel=2.268e-7/2.268e-7 max_abs=1.168e-5/1.168e-5 worst_col_err=3.749e-6/3.749e-6
+FP64 router_bf16 e513k2560.m257 prompt exact rms_rel=2.293e-7 max_abs=1.001e-5 worst_col=85 worst_col_err=2.062e-6 ref_rms=4.241e0 nonfinite=0
+FP64 router_bf16 e513k2560.m257 prompt inexact rms_rel=9.640e-7 max_abs=6.366e-5 worst_col=435 worst_col_err=1.142e-5 ref_rms=4.241e0 nonfinite=0
+FP64 router_bf16 e513k2560.m257 prompt verdict=WORSE rms_rel=9.640e-7/2.293e-7 max_abs=6.366e-5/1.001e-5 worst_col_err=1.142e-5/2.062e-6
+FP64 router_bf16 e513k2560.m257 decode exact rms_rel=2.293e-7 max_abs=1.001e-5 worst_col=85 worst_col_err=2.062e-6 ref_rms=4.241e0 nonfinite=0
+FP64 router_bf16 e513k2560.m257 decode inexact rms_rel=2.293e-7 max_abs=1.001e-5 worst_col=85 worst_col_err=2.062e-6 ref_rms=4.241e0 nonfinite=0
+FP64 router_bf16 e513k2560.m257 decode verdict=SAME_KERNEL rms_rel=2.293e-7/2.293e-7 max_abs=1.001e-5/1.001e-5 worst_col_err=2.062e-6/2.062e-6
+FP64 index_mma h4d128.q_f32 prompt exact rms_rel=3.492e-8 max_abs=3.301e-7 worst_col=744 worst_col_err=6.805e-8 ref_rms=6.653e-1 nonfinite=0
+FP64 index_mma h4d128.q_f32 prompt inexact rms_rel=1.127e-3 max_abs=4.288e-3 worst_col=846 worst_col_err=1.237e-3 ref_rms=6.653e-1 nonfinite=0
+FP64 index_mma h4d128.q_f32 prompt verdict=WORSE rms_rel=1.127e-3/3.492e-8 max_abs=4.288e-3/3.301e-7 worst_col_err=1.237e-3/6.805e-8
+FP64 index_mma h4d128.q_f32 decode exact rms_rel=3.492e-8 max_abs=3.301e-7 worst_col=744 worst_col_err=6.805e-8 ref_rms=6.653e-1 nonfinite=0
+FP64 index_mma h4d128.q_f32 decode inexact rms_rel=3.492e-8 max_abs=3.301e-7 worst_col=744 worst_col_err=6.805e-8 ref_rms=6.653e-1 nonfinite=0
+FP64 index_mma h4d128.q_f32 decode verdict=SAME_KERNEL rms_rel=3.492e-8/3.492e-8 max_abs=3.301e-7/3.301e-7 worst_col_err=6.805e-8/6.805e-8
+FP64 index_mma h4d128.q_bf16 prompt exact rms_rel=3.447e-8 max_abs=2.486e-7 worst_col=1066 worst_col_err=6.865e-8 ref_rms=6.509e-1 nonfinite=0
+FP64 index_mma h4d128.q_bf16 prompt inexact rms_rel=3.553e-8 max_abs=2.486e-7 worst_col=1066 worst_col_err=6.865e-8 ref_rms=6.509e-1 nonfinite=0
+FP64 index_mma h4d128.q_bf16 prompt verdict=WORSE rms_rel=3.553e-8/3.447e-8 max_abs=2.486e-7/2.486e-7 worst_col_err=6.865e-8/6.865e-8
+FP64 index_mma h4d128.q_bf16 decode exact rms_rel=3.447e-8 max_abs=2.486e-7 worst_col=1066 worst_col_err=6.865e-8 ref_rms=6.509e-1 nonfinite=0
+FP64 index_mma h4d128.q_bf16 decode inexact rms_rel=3.447e-8 max_abs=2.486e-7 worst_col=1066 worst_col_err=6.865e-8 ref_rms=6.509e-1 nonfinite=0
+FP64 index_mma h4d128.q_bf16 decode verdict=SAME_KERNEL rms_rel=3.447e-8/3.447e-8 max_abs=2.486e-7/2.486e-7 worst_col_err=6.865e-8/6.865e-8
