@@ -216,7 +216,7 @@ fn runSeq(a: std.mem.Allocator, io: std.Io, run: *Run, q: *Seq, chunk: usize, mt
 }
 
 /// `args`: what follows "forward" (checkpoint, ids file or "-", options).
-pub fn run(init: std.process.Init, args: []const [:0]const u8) !void {
+pub fn command(init: std.process.Init, args: []const [:0]const u8) !void {
     if (args.len < 2) {
         std.debug.print(usage, .{});
         return error.Usage;
