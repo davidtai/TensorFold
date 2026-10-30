@@ -38,6 +38,8 @@ pub const registry = @import("core").registry;
 pub const collective = @import("collective.zig");
 pub const moe = @import("moe.zig");
 pub const moe_nemotron = @import("moe_nemotron.zig");
+/// The EXL3 routed experts over the MoE plan (GLM-5.3-Flash).
+pub const exl3 = @import("exl3.zig");
 pub const reduce = @import("reduce.zig");
 /// Joins this rank's tensor-parallel group: RCCL's (comm/), behind collective.zig.
 pub const joinGroup = @import("comm/group.zig").join;
@@ -59,6 +61,7 @@ test {
     _ = graph_cache;
     _ = moe;
     _ = moe_nemotron;
+    _ = exl3;
     _ = reduce;
     _ = @import("comm/rccl.zig");
     _ = @import("comm/link.zig");

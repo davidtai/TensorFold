@@ -41,6 +41,7 @@ const tp = @import("launches/tp.zig");
 pub const flashnext = @import("launches/flashnext.zig");
 const mamba = @import("launches/mamba.zig");
 const nemotron_moe = @import("launches/nemotron_moe.zig");
+pub const exl3 = @import("launches/exl3.zig");
 
 pub const ConvArgs = conv.ConvArgs;
 pub const PlanArgs = plan.PlanArgs;
@@ -96,6 +97,8 @@ pub const Launcher = struct {
     mamba: mamba.Fns,
     /// Nemotron-H's MoE pick and relu^2 (nemotron_moe.hpp).
     nemo: nemotron_moe.Fns,
+    /// The EXL3 routed experts' kernels (quant/exl3.hip).
+    exl3: exl3.Fns,
 
     const PlanFns = struct {
         kv_write: Function,
@@ -307,6 +310,7 @@ pub const Launcher = struct {
         l.softmax_stats = try att.function("tf_softmax_stats");
         l.sum_partials = try att.function("tf_sum_partials");
         l.mamba = try mamba.Fns.load(l.mods[@backingInt(kernels.Group.mamba)]);
+        l.exl3 = try exl3.Fns.load(l.mods[@backingInt(kernels.Group.exl3)]);
         const tiles = l.mods[@backingInt(kernels.Group.affine_tiles)];
         const dot2 = l.mods[@backingInt(kernels.Group.affine_dot2)];
         l.affine = try affine.Kernels.load(tiles, dot2, caps.Caps.of(kernels.arch) orelse return error.Invalid, choices.products);

@@ -6,4 +6,5 @@ test {
     _ = @import("kernel_tests/glm/config.zig");
     _ = @import("kernel_tests/glm/copy.zig");
     _ = @import("kernel_tests/kda.zig");
+    _ = @import("kernel_tests/exl3.zig");
 }
