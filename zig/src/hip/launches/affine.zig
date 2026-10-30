@@ -788,7 +788,7 @@ pub const Kernels = struct {
         if (t == .dense) return k.bf16Go(r, a, true, s);
         if (a.bits != 16 or a.m < 1 or a.n < 1 or @rem(a.k, 64) != 0 or a.x % 16 != 0 or a.words % 16 != 0) return refuse("bf16 shape");
         const i = bf16Index(a.k) orelse return refuse("bf16 K");
-        const f = k.bf16_wmma_alt[@intFromEnum(t) - 1][i] orelse return refuse("bf16 wmma tile");
+        const f = k.bf16_wmma_alt[@backingInt(t) - 1][i] orelse return refuse("bf16 wmma tile");
         const rows: c_int = if (t == .ahead2) 128 else 256;
         var args: hl.Args = .{};
         try args.add(a);
