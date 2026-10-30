@@ -225,8 +225,11 @@ TF_EXL3_GEMV(8)
 // Grid (N / 128, items, mats), 256 threads (8 waves: 2 along m x 4 along n). A block owns one item and one 128-column
 // block; passes of 64 member rows. A k step of 32: the step's 2 x 8 trellis tiles decoded into LDS as fp16 [n][k] (the
 // B layout: a lane a column, 16 k), the rows' x into LDS [m][k], two v_wmma_f32_16x16x16_f16 a 16 x 16 accumulator;
-// the next step's loads go to registers while this step computes. A sum is the WMMA's over k in order: one order for
-// each pair. z[(mat P + p) N + col], fp32 before the output rotation.
+// the next step's loads go to registers while this step computes. FOLD > 0: each group of FOLD k steps (FOLD x 32 k)
+// runs its WMMA chain from zero and is added to the fp32 sum on the VALU, groups in k order (gfx1151's f16 WMMA adds
+// with a truncating aligner, so a chain over all of K drifts: lane G4's probe, K 4,096: 0.66 % bf16 flips on one chain,
+// 0.017 % with 64-k groups). FOLD 0: one WMMA chain over K (the numerics reference). Either way one order for each
+// pair. z[(mat P + p) N + col], fp32 before the output rotation.
 
 namespace {
 
@@ -235,7 +238,7 @@ constexpr int kBM = 64, kBK = 32, kLK = kBK + 8;  // rows a pass, k a step, halv
 typedef _Float16 h16 __attribute__((ext_vector_type(16)));
 typedef float f8 __attribute__((ext_vector_type(8)));
 
-template <int K2, int CB>
+template <int K2, int CB, int FOLD>
 __device__ void gemm(const uint16_t* X0, const uint16_t* X1, int x_div, const uint64_t* tp0, const uint64_t* tp1,
                      const int* items, const int* members, float* z, int k, int n, int pairs, int experts) {
 #if TF_DEVICE_WMMA_GFX11
@@ -283,11 +286,13 @@ __device__ void gemm(const uint16_t* X0, const uint16_t* X1, int x_div, const ui
                 *reinterpret_cast<uint32_t*>(c1 + 8) = p[3];
             }
         };
+        const f8 zero = f8{0, 0, 0, 0, 0, 0, 0, 0};
         f8 acc[2][2];
+        f8 d[2][2];  // FOLD: the group's WMMA chain
 #pragma unroll
         for (int i = 0; i < 2; ++i)
 #pragma unroll
-            for (int j = 0; j < 2; ++j) acc[i][j] = f8{0, 0, 0, 0, 0, 0, 0, 0};
+            for (int j = 0; j < 2; ++j) acc[i][j] = d[i][j] = zero;
         gload(0);
         sstore(0);
         __syncthreads();
@@ -304,7 +309,24 @@ __device__ void gemm(const uint16_t* X0, const uint16_t* X1, int x_div, const ui
 #pragma unroll
                 for (int i = 0; i < 2; ++i)
 #pragma unroll
-                    for (int j = 0; j < 2; ++j) acc[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(af[i], bf[j], acc[i][j]);
+                    for (int j = 0; j < 2; ++j) {
+                        if constexpr (FOLD > 0) {
+                            const bool first = kk == 0 && s % FOLD == 0;
+                            d[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(af[i], bf[j], first ? zero : d[i][j]);
+                        } else {
+                            acc[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(af[i], bf[j], acc[i][j]);
+                        }
+                    }
+            }
+            if constexpr (FOLD > 0) {
+                if ((s + 1) % FOLD == 0 || s + 1 == iters) {
+#pragma unroll
+                    for (int i = 0; i < 2; ++i)
+#pragma unroll
+                        for (int j = 0; j < 2; ++j)
+#pragma unroll
+                            for (int r = 0; r < 8; ++r) acc[i][j][r] = acc[i][j][r] + d[i][j][r];
+                }
             }
             if (s + 1 < iters) sstore(buf ^ 1);
             __syncthreads();
@@ -330,11 +352,22 @@ __device__ void gemm(const uint16_t* X0, const uint16_t* X1, int x_div, const ui
 
 }  // namespace
 
+// GLM's prompt GEMM: 64-k groups (2 steps) folded on the VALU.
+constexpr int kGemmFold = 2;
+
 extern "C" __global__ void __launch_bounds__(256) tf_exl3_gemm(const uint16_t* X0, const uint16_t* X1, int x_div,
                                                                const uint64_t* tp0, const uint64_t* tp1, const int* items,
                                                                const int* members, float* z, int k, int n, int pairs,
                                                                int experts) {
-    gemm<8, kMcg>(X0, X1, x_div, tp0, tp1, items, members, z, k, n, pairs, experts);
+    gemm<8, kMcg, kGemmFold>(X0, X1, x_div, tp0, tp1, items, members, z, k, n, pairs, experts);
+}
+
+// The same GEMM on one WMMA chain over K (the pre-fold arithmetic): the numerics tests' reference, not served.
+extern "C" __global__ void __launch_bounds__(256) tf_exl3_gemm_chain(const uint16_t* X0, const uint16_t* X1, int x_div,
+                                                                     const uint64_t* tp0, const uint64_t* tp1,
+                                                                     const int* items, const int* members, float* z,
+                                                                     int k, int n, int pairs, int experts) {
+    gemm<8, kMcg, 0>(X0, X1, x_div, tp0, tp1, items, members, z, k, n, pairs, experts);
 }
 
 // ---- 5. the epilogues -----------------------------------------------------------------------------------------------

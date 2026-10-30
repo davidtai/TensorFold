@@ -14,4 +14,5 @@ test {
     _ = @import("kernel_tests/glm/swiglu.zig");
     _ = @import("kernel_tests/glm/dsa.zig");
     _ = @import("kernel_tests/glm/flips.zig");
+    _ = @import("kernel_tests/glm/exl3_fold.zig");
 }

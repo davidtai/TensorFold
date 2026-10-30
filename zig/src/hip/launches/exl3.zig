@@ -24,6 +24,8 @@ pub const Fns = struct {
     rotate: Function,
     gemv: [gemv_rows.len]Function,
     gemm: Function,
+    /// The GEMM on one WMMA chain over K (tf_exl3_gemm_chain): the numerics reference of the tests, not served.
+    gemm_chain: Function,
     gateup: Function,
     down: Function,
 
@@ -33,6 +35,7 @@ pub const Fns = struct {
             .rotate = try m.function("tf_exl3_rotate"),
             .gemv = .{ try m.function("tf_exl3_gemv_1"), try m.function("tf_exl3_gemv_2"), try m.function("tf_exl3_gemv_4"), try m.function("tf_exl3_gemv_8") },
             .gemm = try m.function("tf_exl3_gemm"),
+            .gemm_chain = try m.function("tf_exl3_gemm_chain"),
             .gateup = try m.function("tf_exl3_gateup_epilogue"),
             .down = try m.function("tf_exl3_down_epilogue"),
         };
@@ -119,14 +122,24 @@ pub fn gemv(l: *const Launcher, p: Product, sk: usize, rows: usize, s: S) Error!
     try l.go(l.exl3.gemv[which], dim(p.n / 128 * sk, p.count, p.mats), dim(256, 1, 1), @intCast(shared), s, &a);
 }
 
-/// The WMMA GEMM (gfx11): passes of 64 member rows an item, the whole of K a block (no split).
+/// The WMMA GEMM (gfx11): passes of 64 member rows an item, the whole of K a block (no split), 64-k groups folded on
+/// the VALU in k order.
 pub fn gemm(l: *const Launcher, p: Product, s: S) Error!void {
+    return gemmOn(l, l.exl3.gemm, p, s);
+}
+
+/// The same product on one WMMA chain over K (the tests' numerics reference).
+pub fn gemmChain(l: *const Launcher, p: Product, s: S) Error!void {
+    return gemmOn(l, l.exl3.gemm_chain, p, s);
+}
+
+fn gemmOn(l: *const Launcher, f: Function, p: Product, s: S) Error!void {
     if (p.k % 32 != 0 or p.n % 128 != 0) return invalid("exl3 gemm");
     if (p.count == 0) return;
     var a: Args = .{};
     try addProduct(&a, p);
     try a.add(int(p.experts));
-    try l.go(l.exl3.gemm, dim(p.n / 128, p.count, p.mats), dim(256, 1, 1), 0, s, &a);
+    try l.go(f, dim(p.n / 128, p.count, p.mats), dim(256, 1, 1), 0, s, &a);
 }
 
 fn addProduct(a: *Args, p: Product) Error!void {
