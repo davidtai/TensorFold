@@ -164,3 +164,18 @@ FP64 index_mma h4d128.q_bf16 prompt verdict=WORSE rms_rel=3.553e-8/3.447e-8 max_
 FP64 index_mma h4d128.q_bf16 decode exact rms_rel=3.447e-8 max_abs=2.486e-7 worst_col=1066 worst_col_err=6.865e-8 ref_rms=6.509e-1 nonfinite=0
 FP64 index_mma h4d128.q_bf16 decode inexact rms_rel=3.447e-8 max_abs=2.486e-7 worst_col=1066 worst_col_err=6.865e-8 ref_rms=6.509e-1 nonfinite=0
 FP64 index_mma h4d128.q_bf16 decode verdict=SAME_KERNEL rms_rel=3.447e-8/3.447e-8 max_abs=2.486e-7/2.486e-7 worst_col_err=6.865e-8/6.865e-8
+FP64 hc_up_mix k320n10240.g decode exact rms_rel=4.238e-8 max_abs=2.159e-6 worst_col=9040 worst_col_err=7.981e-7 ref_rms=6.726e0 nonfinite=0
+FP64 hc_up_mix k320n10240.g decode inexact not_observable (tf_fn_hc_up_mix keeps g in registers)
+FP64 hc_up_mix k320n10240 decode differ=0/28160 (one launch's mixed bytes unlike the chain's)
+FP64 hc_up_mix k320n10240.points decode exact rms_rel=0.000e0 max_abs=0.000e0 worst_col=0 worst_col_err=0.000e0 ref_rms=4.255e-1 nonfinite=0
+FP64 hc_up_mix k320n10240.points decode inexact rms_rel=0.000e0 max_abs=0.000e0 worst_col=0 worst_col_err=0.000e0 ref_rms=4.255e-1 nonfinite=0
+FP64 hc_up_mix k320n10240.points decode verdict=NO_WORSE rms_rel=0.000e0/0.000e0 max_abs=0.000e0/0.000e0 worst_col_err=0.000e0/0.000e0
+FP64 hc_up_mix k320n10240.mixed decode exact rms_rel=2.431e-3 max_abs=5.895e-3 worst_col=918 worst_col_err=2.180e-3 ref_rms=4.256e-1 nonfinite=0
+FP64 hc_up_mix k320n10240.mixed decode inexact rms_rel=2.431e-3 max_abs=5.895e-3 worst_col=918 worst_col_err=2.180e-3 ref_rms=4.256e-1 nonfinite=0
+FP64 hc_up_mix k320n10240.mixed decode verdict=NO_WORSE rms_rel=2.431e-3/2.431e-3 max_abs=5.895e-3/5.895e-3 worst_col_err=2.180e-3/2.180e-3
+FP64 hc_up_mix k320n10240.points prompt exact rms_rel=0.000e0 max_abs=0.000e0 worst_col=0 worst_col_err=0.000e0 ref_rms=4.255e-1 nonfinite=0
+FP64 hc_up_mix k320n10240.points prompt inexact rms_rel=0.000e0 max_abs=0.000e0 worst_col=0 worst_col_err=0.000e0 ref_rms=4.255e-1 nonfinite=0
+FP64 hc_up_mix k320n10240.points prompt verdict=SAME_KERNEL rms_rel=0.000e0/0.000e0 max_abs=0.000e0/0.000e0 worst_col_err=0.000e0/0.000e0
+FP64 hc_up_mix k320n10240.mixed prompt exact rms_rel=2.431e-3 max_abs=5.895e-3 worst_col=918 worst_col_err=2.180e-3 ref_rms=4.256e-1 nonfinite=0
+FP64 hc_up_mix k320n10240.mixed prompt inexact rms_rel=2.431e-3 max_abs=5.895e-3 worst_col=918 worst_col_err=2.180e-3 ref_rms=4.256e-1 nonfinite=0
+FP64 hc_up_mix k320n10240.mixed prompt verdict=SAME_KERNEL rms_rel=2.431e-3/2.431e-3 max_abs=5.895e-3/5.895e-3 worst_col_err=2.180e-3/2.180e-3
