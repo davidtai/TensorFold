@@ -399,7 +399,8 @@ TF_HELD(8, 2) TF_HELD(8, 4)
 #define TF_BF16_STREAM(R)                                                              \
     template __global__ void bf16_stream<R, 1, false>(Affine, StreamSides, int, int); \
     template __global__ void bf16_stream<R, 2, false>(Affine, StreamSides, int, int); \
-    template __global__ void bf16_stream<R, 2, true>(Affine, StreamSides, int, int);
+    template __global__ void bf16_stream<R, 2, true>(Affine, StreamSides, int, int); \
+    template __global__ void bf16_stream_glu<R>(Affine, StreamSides, int, int);
 TF_BF16_STREAM(1) TF_BF16_STREAM(2) TF_BF16_STREAM(4)
 #endif
 #if TF_MATRIX

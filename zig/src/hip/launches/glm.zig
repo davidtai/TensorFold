@@ -5,6 +5,8 @@ const Launcher = @import("../launches.zig").Launcher;
 const Module = @import("../module.zig").Module;
 const Function = @import("../module.zig").Function;
 const util = @import("util.zig");
+const runtime = @import("../runtime.zig");
+const launch = @import("../launch.zig");
 const S = util.S;
 const P = util.P;
 const C = util.C;
@@ -27,7 +29,14 @@ pub fn hcPartBytes(rows: usize) usize {
     return rows * hc_blocks * hc_part * 4;
 }
 
+/// GLM-5.3-Flash's swiglu_limit: the silu table holds bf16(silu(min(g, 10))).
+pub const swiglu_limit: f32 = 10;
+
 pub const Fns = struct {
+    /// tf_glm_silu's device address (filled by `fill`): the decode pair's table (affine bf16GluGo).
+    silu: u64,
+    silu_fill: Function,
+    swiglu: Function,
     hc_mix: Function,
     hc_finish: Function,
     hc_post: Function,
@@ -38,8 +47,20 @@ pub const Fns = struct {
 
     pub fn load(m: Module) Error!Fns {
         var f: Fns = undefined;
-        inline for (@typeInfo(Fns).@"struct".field_names) |name| @field(f, name) = try m.function("tf_glm_" ++ name);
+        inline for (@typeInfo(Fns).@"struct".field_names) |name| {
+            if (comptime std.mem.eql(u8, name, "silu")) continue;
+            @field(f, name) = try m.function("tf_glm_" ++ name);
+        }
+        f.silu = (try m.global("tf_glm_silu")).address;
         return f;
+    }
+
+    /// tf_glm_silu at swiglu_limit, once a device (Launcher.load).
+    pub fn fill(f: *const Fns, r: *const runtime.Runtime) Error!void {
+        var a: Args = .{};
+        try a.add(swiglu_limit);
+        try launch.launch(f.silu_fill, .{ .grid = .{ .x = (1 << 16) / threads }, .block = .{ .x = threads } }, .{ .r = r, .handle = null }, &a);
+        try runtime.check(r.api.hipStreamSynchronize(null));
     }
 };
 
@@ -94,6 +115,17 @@ pub fn embed(l: *const Launcher, ids: C, table: C, out: P, rows: c_int, d: c_int
     var a: Args = .{};
     inline for (.{ ad(ids), ad(table), ad(out), d, copies }) |v| try a.add(v);
     try l.go(l.glm.embed, dim(rows, cdiv(d, threads), 1), dim(threads, 1, 1), 0, s, &a);
+}
+
+/// GLM's SwiGLU of a prompt with CUDA's rounding points: gu [rows][gate w | up w] bf16 -> act [rows][w] bf16 (s from the
+/// silu table, so the limit on g is swiglu_limit; `limit` clamps u and must equal it).
+pub fn swiglu(l: *const Launcher, gu: C, act: P, rows: c_int, w: c_int, limit: f32, s: S) Error!void {
+    if (limit != swiglu_limit) return util.invalid("glm swiglu limit");
+    const total = @as(i64, rows) * w;
+    if (total == 0) return;
+    var a: Args = .{};
+    inline for (.{ ad(gu), ad(act), w, limit, total }) |v| try a.add(v);
+    try l.go(l.glm.swiglu, dim(cdiv(total, threads), 1, 1), dim(threads, 1, 1), 0, s, &a);
 }
 
 test "the mixing scratch: 16 blocks of 32 fp32 a row" {

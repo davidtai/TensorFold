@@ -212,6 +212,8 @@ pub const Kernels = struct {
     /// its SwiGLU pair at 2 columns; the WMMA tile at each of bf16_ks. Null where the GPU has no BF16 dot2 or matrix.
     bf16_stream: [stream_rows.len][2]?Function,
     bf16_pair: [stream_rows.len]?Function,
+    /// The same pair with GLM's SwiGLU rounding points (bf16_tiles.hpp StreamGlmSwiglu); its silu table in scale.p.
+    bf16_glu: [stream_rows.len]?Function,
     bf16_wmma: [bf16_ks.len]?Function,
     kp: [bit_widths.len][kp_tiles.len]Function,
     span: [2]Function,
@@ -263,6 +265,7 @@ pub const Kernels = struct {
                 k.bf16_stream[i][c] = if (wmma) try tiles_obj.function(std.fmt.comptimePrint(r ++ "11bf16_streamILi{d}ELi{d}ELb0EEEvNS0_6AffineENS0_11StreamSidesEii", .{ rows, cb })) else null;
             }
             k.bf16_pair[i] = if (wmma) try tiles_obj.function(std.fmt.comptimePrint(r ++ "11bf16_streamILi{d}ELi2ELb1EEEvNS0_6AffineENS0_11StreamSidesEii", .{rows})) else null;
+            k.bf16_glu[i] = if (wmma) try tiles_obj.function(std.fmt.comptimePrint(r ++ "15bf16_stream_gluILi{d}EEEvNS0_6AffineENS0_11StreamSidesEii", .{rows})) else null;
         }
         inline for (bf16_ks, 0..) |bk, i| {
             k.bf16_wmma[i] = if (k.matrix) try tiles_obj.function(std.fmt.comptimePrint(r ++ "9bf16_wmmaILi{d}EEEvNS0_6AffineE", .{bk})) else null;
@@ -537,7 +540,9 @@ pub const Kernels = struct {
             else => 2,
         }));
         const table = if (sides.pair_cols > 0) &k.pairs else if (relu2) &k.relu2 else &k.stream;
-        const f = if (b16) (if (sides.pair_cols > 0) k.bf16_pair[ri] else k.bf16_stream[ri][pick]).? else table[b][ri][pick].?;
+        // a BF16 pair with a table in scale.p (BF16 rows carry no scale) takes GLM's SwiGLU rounding points
+        const glu = b16 and sides.pair_cols > 0 and a.scale.p != 0;
+        const f = if (b16) (if (glu) k.bf16_glu[ri] else if (sides.pair_cols > 0) k.bf16_pair[ri] else k.bf16_stream[ri][pick]).? else table[b][ri][pick].?;
         const grid: hl.Dim3 = if (sides.row_blocks > 1)
             .{ .x = row_blocks, .y = blocks, .z = @intCast(items) }
         else
@@ -773,6 +778,15 @@ pub const Kernels = struct {
     pub fn bf16PairGo(k: *const Kernels, r: *const runtime.Runtime, x: u64, w: u64, act: u64, m: c_int, cols: c_int, kk: c_int, limit: f32, s: abi.Stream) Error!void {
         const a = bf16Arg(x, w, 0, act, m, 2 * cols, kk);
         if (m < 1 or cols < 1 or @rem(kk, 32) != 0 or x % 16 != 0) return refuse("bf16 pair shape");
+        return k.streamGo(r, a, .{ .pair_cols = cols, .limit = limit }, cols, 1, s);
+    }
+
+    /// bf16PairGo with GLM's SwiGLU rounding points (CUDA glm_glue_moe.cuh swiglu1): g and u rounded to bf16, s =
+    /// bf16(silu(min(g, limit))) from `silu` (launches/glm.zig Fns.silu, the table of every bf16 g), out = bf16(u s).
+    pub fn bf16GluGo(k: *const Kernels, r: *const runtime.Runtime, x: u64, w: u64, act: u64, silu: u64, m: c_int, cols: c_int, kk: c_int, limit: f32, s: abi.Stream) Error!void {
+        var a = bf16Arg(x, w, 0, act, m, 2 * cols, kk);
+        a.scale.p = silu;
+        if (silu == 0 or m < 1 or cols < 1 or @rem(kk, 32) != 0 or x % 16 != 0) return refuse("bf16 glu shape");
         return k.streamGo(r, a, .{ .pair_cols = cols, .limit = limit }, cols, 1, s);
     }
 

@@ -45,6 +45,19 @@ __device__ __forceinline__ float block_sum(float v, float* scratch) {
 
 __device__ __forceinline__ float sigmoid1(float v) { return 1.f / (1.f + expf(-v)); }
 
+// bf16 of a double in one rounding: round to odd onto fp32 (the inexact bit kept as the last bit), then to nearest
+// even onto bf16. 24 bits hold the 8 of bf16 plus 2 more, so the result is the double's own nearest bf16.
+__device__ __forceinline__ uint16_t bf16_of(double v) {
+    if (v != v) return 0x7fc0;
+    float f = static_cast<float>(v);
+    if (static_cast<double>(f) != v) {
+        uint32_t u = __float_as_uint(f);
+        if (fabs(static_cast<double>(f)) > fabs(v)) u -= 1;  // toward zero
+        f = __uint_as_float(u | 1u);
+    }
+    return float_to_bf16(f);
+}
+
 // The kernels below stay in this namespace (extern "C" keeps their names): other lanes' headers share the group.
 
 // hc pre, part 1: block (row group, K block b) of 256 threads, 4 rows. part[(row * 16 + b) * 32 + m] = x[row] . fn[m]
@@ -262,6 +275,31 @@ extern "C" __global__ void __launch_bounds__(kThreads)
     if (c >= d) return;
     const uint16_t v = table[static_cast<long long>(ids[r]) * d + c];
     for (int k = 0; k < copies; ++k) out[(r * copies + k) * d + c] = v;
+}
+
+// GLM's SwiGLU with CUDA's rounding points (glm_glue_moe.cuh swiglu1): g and u as bf16, g = min(g, limit), u clamped to
+// +-limit, s = bf16(silu(g)), out = bf16(u s). silu is read from tf_glm_silu, the bf16 nearest to silu(min(g, limit))
+// for each of the 65,536 bf16 g (filled once a device in double): CUDA's points with a correctly rounded s, the value
+// G5's float64 reference rounds. u s of two bf16 is exact in fp32, so the output is one rounding.
+extern "C" __device__ uint16_t tf_glm_silu[1 << 16];
+
+extern "C" __global__ void __launch_bounds__(kThreads) tf_glm_silu_fill(float limit) {
+    const int h = blockIdx.x * kThreads + threadIdx.x;
+    const float g = fminf(bf(static_cast<uint16_t>(h)), limit);  // a NaN g is the limit, as fminf takes it
+    const double gd = g;
+    tf_glm_silu[h] = bf16_of(gd / (1.0 + exp(-gd)));
+}
+
+// The prompt's activation: gu [rows][gate w | up w] bf16 (the WMMA tile's bf16 out), act [rows][w] bf16.
+extern "C" __global__ void __launch_bounds__(kThreads)
+    tf_glm_swiglu(const uint16_t* __restrict__ gu, uint16_t* __restrict__ act, int w, float limit, long long total) {
+    const long long i = static_cast<long long>(blockIdx.x) * kThreads + threadIdx.x;
+    if (i >= total) return;
+    const long long r = i / w;
+    const int c = static_cast<int>(i - r * w);
+    const float s = bf(tf_glm_silu[gu[r * 2 * w + c]]);
+    const float u = fminf(fmaxf(bf(gu[r * 2 * w + w + c]), -limit), limit);
+    act[i] = float_to_bf16(u * s);
 }
 
 }  // namespace glm

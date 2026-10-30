@@ -322,6 +322,7 @@ pub const Launcher = struct {
         try l.affine.fillHcGate(r);
         l.fnx = try flashnext.Fns.load(l.mods[@backingInt(kernels.Group.flashnext)]);
         l.glm = try glm.Fns.load(l.mods[@backingInt(kernels.Group.glm)]);
+        try l.glm.fill(r);
         return l;
     }
 
