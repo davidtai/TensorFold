@@ -40,7 +40,7 @@ const draw = @import("launches/draw.zig");
 const tp = @import("launches/tp.zig");
 pub const flashnext = @import("launches/flashnext.zig");
 const mamba = @import("launches/mamba.zig");
-const nemotron_moe = @import("launches/nemotron_moe.zig");
+pub const nemotron_moe = @import("launches/nemotron_moe.zig");
 pub const exl3 = @import("launches/exl3.zig");
 /// GLM-5.3-Flash's glue: mHC pre and post, the residual, norms, stream mean, embedding (glm/glue.hpp).
 pub const glm = @import("launches/glm.zig");
