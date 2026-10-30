@@ -45,11 +45,19 @@ __global__ void __launch_bounds__(dense_tile::kThreads) bf16_wmma(Affine a) {
     wmma_dense_tile<K, DenseTune<K>::kAhead, false, true>(a);
 }
 
-// The same sums on other block shapes (G4-4; the bits are bf16_wmma's): GROUPED, the 256 x 128 tile of 64 x 64 waves
-// (tiles/dense_inexact.hpp GROUP32); A2, the dense tile with two windows of loads ahead.
+// The same sums in another block order (G4-4; the bits are bf16_wmma's): row tiles grouped so a group's x rows (at most
+// 16 MiB of bf16) stay in cache while its column tiles' weights stream once. ORD2: with two windows of loads ahead.
+constexpr int bf16_group_rows(int k) {
+    const int g = (16 << 20) / (dense_tile::kBM * k * 2);
+    return g < 1 ? 1 : g > 64 ? 64 : g;
+}
 template <int K>
-__global__ void __launch_bounds__(dense_inexact::kThreads) bf16_wmma_grouped(Affine a) {
-    wmma_dense_inexact_tile<K, true, true>(a);
+__global__ void __launch_bounds__(dense_tile::kThreads) bf16_wmma_ord(Affine a) {
+    wmma_dense_tile<K, DenseTune<K>::kAhead, false, true, bf16_group_rows(K)>(a);
+}
+template <int K>
+__global__ void __launch_bounds__(dense_tile::kThreads) bf16_wmma_ord2(Affine a) {
+    wmma_dense_tile<K, 2, false, true, bf16_group_rows(K)>(a);
 }
 template <int K>
 __global__ void __launch_bounds__(dense_tile::kThreads) bf16_wmma_a2(Affine a) {

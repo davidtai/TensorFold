@@ -47,7 +47,10 @@ constexpr int kThreads = 256;
 // its two WMMA from zero, folded acc + d on the VALU (IEEE round to nearest) in K order; no scale, bias or sum of x.
 // gfx1151's WMMA (and dot2) adds with a truncating ~24-bit aligner, so the long sum over K goes through the VALU, not
 // through the instruction's accumulator (lane G4's probe: K 4,096 bf16 flips 0.27 % on one WMMA chain).
-template <int K, int AHEAD = 1, bool HC_MIX = false, bool BF16W = false>
+// GROUP_ROWS > 0: blocks in groups of GROUP_ROWS row tiles, each group walking every column tile with its row tiles
+// next to each other, so a column tile's weights are read from DRAM about once a group and the group's x rows stay in
+// cache (0: row-major order). The order changes no output's arithmetic.
+template <int K, int AHEAD = 1, bool HC_MIX = false, bool BF16W = false, int GROUP_ROWS = 0>
 __device__ __forceinline__ void wmma_dense_tile(const Affine& a, HcMix mix = {}, const uint16_t* gates = nullptr) {
 #if TF_DEVICE_WMMA_GFX11
     using namespace dense_tile;
@@ -66,8 +69,17 @@ __device__ __forceinline__ void wmma_dense_tile(const Affine& a, HcMix mix = {},
     __shared__ float bi[2][kBN];
 
     const int num_n = (a.n + kBN - 1) / kBN;
-    const int bm = blockIdx.x / num_n;
-    const int bn = blockIdx.x % num_n;
+    int bm = blockIdx.x / num_n;
+    int bn = blockIdx.x % num_n;
+    if constexpr (GROUP_ROWS > 0) {
+        const int num_m = (a.m + kBM - 1) / kBM;
+        const int id = blockIdx.x;
+        const int g = id / (GROUP_ROWS * num_n);
+        const int rows_g = num_m - g * GROUP_ROWS < GROUP_ROWS ? num_m - g * GROUP_ROWS : GROUP_ROWS;
+        const int within = id - g * GROUP_ROWS * num_n;
+        bn = within / rows_g;
+        bm = g * GROUP_ROWS + within % rows_g;
+    }
     const int m0 = bm * kBM;
     const int n0 = bn * kBN;
     const int rows_left = a.m - m0;

@@ -1,6 +1,6 @@
-//! G4-4: the BF16 prompt tile on other block shapes. Each shape's bits equal bf16Go's tile (F-K5's 32-k groups, the
-//! K-order fold) at every K of the model; the grouped tile keeps a row's bits under row cuts (contract 7); and speed
-//! facts (no gate) of every tile at GLM's prompt products, 2,048 rows, with the pre-F-K5 one-chain tile as reference.
+//! G4-4: the BF16 prompt tile in other block orders and load depths. Each variant's bits equal bf16Go's tile (F-K5's
+//! 32-k groups, the K-order fold) at every K of the model; the ordered tile keeps a row's bits under row cuts (contract
+//! 7); and speed facts (no gate) of every tile at GLM's prompt products, 2,048 rows, with the pre-F-K5 one-chain tile.
 const std = @import("std");
 const rig = @import("../rig.zig");
 const check = @import("check.zig");
@@ -35,7 +35,7 @@ fn product(t: *Rig, x: DeviceBuffer, w: DeviceBuffer, out: DeviceBuffer, lo: usi
     return got;
 }
 
-test "glm bf16 tile (G4-4): the grouped and two-ahead tiles give bf16Go's bits at every K of the model, fp32 and bf16 out" {
+test "glm bf16 tile (G4-4): the ordered and two-ahead tiles give bf16Go's bits at every K of the model, fp32 and bf16 out" {
     const t = try Rig.open(1 << 20);
     defer t.close();
     if (skip(t)) return error.SkipZigTest;
@@ -59,7 +59,7 @@ test "glm bf16 tile (G4-4): the grouped and two-ahead tiles give bf16Go's bits a
         for ([_]bool{ false, true }) |half| {
             const want = try product(t, x, w, out, 0, sh.m, sh.n, sh.k, half, .dense);
             defer gpa.free(want);
-            for ([_]Tile{ .grouped, .ahead2 }) |tile| {
+            for ([_]Tile{ .ordered, .ordered2, .ahead2 }) |tile| {
                 const got = try product(t, x, w, out, 0, sh.m, sh.n, sh.k, half, tile);
                 defer gpa.free(got);
                 const diff = std.mem.findDiff(u32, want, got);
@@ -69,10 +69,10 @@ test "glm bf16 tile (G4-4): the grouped and two-ahead tiles give bf16Go's bits a
             }
         }
     }
-    std.debug.print("RESULT glm bf16 tile: {d} cases (every K, a 2,048 x [24896, 4096] chunk), grouped and two-ahead bits equal bf16Go's\n", .{cases});
+    std.debug.print("RESULT glm bf16 tile: {d} cases (every K, a 2,048 x [24896, 4096] chunk), ordered, ordered two-ahead and two-ahead bits equal bf16Go's\n", .{cases});
 }
 
-test "glm bf16 tile (G4-4, contract 7): the grouped tile gives a row the same bits at any m and any place in the chunk" {
+test "glm bf16 tile (G4-4, contract 7): the ordered tile gives a row the same bits at any m and any place in the chunk" {
     const t = try Rig.open(1 << 20);
     defer t.close();
     if (skip(t)) return error.SkipZigTest;
@@ -90,16 +90,16 @@ test "glm bf16 tile (G4-4, contract 7): the grouped tile gives a row the same bi
         defer w.free();
         var out = try t.alloc(rows * n * 4);
         defer out.free();
-        const full = try product(t, x, w, out, 0, rows, n, k, false, .grouped);
+        const full = try product(t, x, w, out, 0, rows, n, k, false, .ordered);
         defer gpa.free(full);
         const cuts = [_][2]usize{ .{ 0, 512 }, .{ 512, 512 }, .{ 1536, 512 }, .{ 37, 300 }, .{ 1, 255 }, .{ 255, 2 }, .{ 2000, 48 }, .{ 7, 1 }, .{ 2047, 1 }, .{ 129, 17 } };
         for (cuts) |c| {
-            const g = try product(t, x, w, out, c[0], c[1], n, k, false, .grouped);
+            const g = try product(t, x, w, out, c[0], c[1], n, k, false, .ordered);
             defer gpa.free(g);
-            try rig.expect(std.mem.eql(u32, g, full[c[0] * n ..][0 .. c[1] * n]), "glm bf16 grouped K {d}: rows {d}..{d} differ from the 2,048-row call", .{ k, c[0], c[0] + c[1] });
+            try rig.expect(std.mem.eql(u32, g, full[c[0] * n ..][0 .. c[1] * n]), "glm bf16 ordered K {d}: rows {d}..{d} differ from the 2,048-row call", .{ k, c[0], c[0] + c[1] });
         }
     }
-    std.debug.print("RESULT glm bf16 grouped tile rows: K 1,536 and 4,096, 10 cuts of a 2,048-row chunk equal its rows\n", .{});
+    std.debug.print("RESULT glm bf16 ordered tile rows: K 1,536 and 4,096, 10 cuts of a 2,048-row chunk equal its rows\n", .{});
 }
 
 const Timed = struct {
@@ -143,8 +143,8 @@ test "glm bf16 tile (G4-4, G4-T1): speed facts (no gate) of every prompt tile at
     for (shapes) |s| {
         const flops: f64 = 2.0 * m * @as(f64, @floatFromInt(s.n * s.k));
         const a = K.bf16Arg(at(x), at(w), 0, at(out), m, @intCast(s.n), @intCast(s.k));
-        var us: [4]f64 = undefined;
-        for ([_]Tile{ .dense, .grouped, .ahead2, .chain }, 0..) |tile, i| us[i] = try check.timeUs(t, Timed{ .t = t, .a = a, .tile = tile }, Timed.call, 10);
-        std.debug.print("SPEED glm bf16 prompt {s} [{d}, {d}] 2048 rows: dense {d:.0} us ({d:.1} TFLOPS), grouped {d:.0} ({d:.1}), ahead2 {d:.0} ({d:.1}), one-chain ref {d:.0} ({d:.1})\n", .{ s.name, s.n, s.k, us[0], flops / us[0] / 1e6, us[1], flops / us[1] / 1e6, us[2], flops / us[2] / 1e6, us[3], flops / us[3] / 1e6 });
+        var us: [5]f64 = undefined;
+        for ([_]Tile{ .dense, .ordered, .ordered2, .ahead2, .chain }, 0..) |tile, i| us[i] = try check.timeUs(t, Timed{ .t = t, .a = a, .tile = tile }, Timed.call, 10);
+        std.debug.print("SPEED glm bf16 prompt {s} [{d}, {d}] 2048 rows: dense {d:.0} us ({d:.1} TFLOPS), ordered {d:.0} ({d:.1}), ordered2 {d:.0} ({d:.1}), ahead2 {d:.0} ({d:.1}), one-chain ref {d:.0} ({d:.1})\n", .{ s.name, s.n, s.k, us[0], flops / us[0] / 1e6, us[1], flops / us[1] / 1e6, us[2], flops / us[2] / 1e6, us[3], flops / us[3] / 1e6, us[4], flops / us[4] / 1e6 });
     }
 }
