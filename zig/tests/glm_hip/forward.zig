@@ -65,7 +65,7 @@ const Run = struct {
     fn heads(run: *Run, f: *fwd.Forward, x: u64, n: usize, ctx: anytype, comptime each: fn (@TypeOf(ctx), usize, []const f32) anyerror!void) !void {
         var r0: usize = 0;
         while (r0 < n) : (r0 += glm.state.head_rows) {
-            const k = @min(glm.state.head_rows, n - r0);
+            const k: usize = @min(glm.state.head_rows, n - r0);
             const lg = try f.head(x + r0 * D * 2, k);
             try f.download(f32, lg, run.logits[0 .. k * V]);
             for (0..k) |j| {
