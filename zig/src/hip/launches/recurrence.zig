@@ -145,9 +145,9 @@ pub const kda_dim = 128;
 
 /// kda.chain's prep (glm_kda.cu tf_glm_kda_prep): `rows` rows of the stacked bf16 projection p (row stride p_stride,
 /// q | k | v from column 0, beta's logits at b_off), the bf16 decay rows a (stride a_stride) and the bf16 conv window cs
-/// [3][3 heads 128] (read, not written); taps cw fp32 [3 heads 128][4]. Out: q fp32, k fp32, v bf16, decays fp32 and
-/// beta fp32, row-major (rows, heads, 128) and (rows, heads).
-pub fn tf_kda_prep(l: *const Launcher, p: C, p_stride: c_int, b_off: c_int, a: C, a_stride: c_int, cs: C, cw: CF, a_log: CF, dt_bias: CF, lower: f32, q: F, k: F, v: P, g: F, b: F, rows: c_int, heads: c_int, s: S) Error!void {
+/// [3][3 heads 128] (read, not written); taps cw bf16 [3 heads 128][4] as stored. Out: q fp32, k fp32, v bf16, decays
+/// fp32 and beta fp32, row-major (rows, heads, 128) and (rows, heads).
+pub fn tf_kda_prep(l: *const Launcher, p: C, p_stride: c_int, b_off: c_int, a: C, a_stride: c_int, cs: C, cw: C, a_log: CF, dt_bias: CF, lower: f32, q: F, k: F, v: P, g: F, b: F, rows: c_int, heads: c_int, s: S) Error!void {
     if (heads < 1 or rows < 1 or p_stride < 3 * heads * kda_dim or b_off + heads > p_stride) return invalid("kda prep");
     var x: Args = .{};
     inline for (.{ heads, ad(p), p_stride, b_off, ad(a), a_stride, ad(cs), ad(cw), ad(a_log), ad(dt_bias), lower, ad(q), ad(k), ad(v), ad(g), ad(b) }) |e| try x.add(e);

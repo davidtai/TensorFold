@@ -5,8 +5,9 @@
 // order (cuda/glm_kda.cu prep_kernel_body and out_kernel_body, cuda/glm_glue_rows.cuh tf_glm_conv_shift). Buffers and
 // dtypes are the CUDA path's (cuda_state.zig, cuda_kda_block.zig): the stacked bf16 projection rows
 // [q | k | v | f_a | g_a | b] (row stride p_stride, beta's logits at b_off), the bf16 decay and gate rows, the bf16 conv
-// window [3][3 heads 128], the saves k fp32, v bf16, decays fp32 and beta fp32. One difference, inside the block: q, k
-// and the read-out y stay fp32 (CUDA: q and k fp32, y bf16); out reads y fp32.
+// window [3][3 heads 128], the saves k fp32, v bf16, decays fp32 and beta fp32. The conv taps are bf16 as the
+// checkpoint stores them (CUDA widens them at load). One difference, inside the block: q, k and the read-out y stay
+// fp32 (CUDA: q and k fp32, y bf16); out reads y fp32.
 
 #include <hip/hip_runtime.h>
 
@@ -48,11 +49,12 @@ __device__ __forceinline__ float wave_sum(float x) {
 
 // Block (row, head), 512 threads: conv + SiLU of the head's 3 x 128 q | k | v channels over [window; P rows], rounded to
 // bf16; the decays of its 128 key channels and beta = bf16(sigmoid(b)); then q and k L2-normed (q by 128^-0.5 too).
+// Taps cw bf16 [3 heads 128][4] as the checkpoint stores q|k|v_conv1d (widened here, exactly; CUDA widens at load).
 // Out: q fp32, k fp32, v bf16, decays fp32 (rows, heads, 128) and beta fp32 (rows, heads). prep_kernel_body's values.
 extern "C" __global__ void __launch_bounds__(512)
 tf_kda_prep(int H, const uint16_t* __restrict__ P, int p_stride, int b_off, const uint16_t* __restrict__ A,
-            int a_stride, const uint16_t* __restrict__ cs, const float* __restrict__ cw, const float* __restrict__ a_log,
-            const float* __restrict__ dt_bias, float lower, float* __restrict__ q_out, float* __restrict__ k_save,
+            int a_stride, const uint16_t* __restrict__ cs, const uint16_t* __restrict__ cw,
+            const float* __restrict__ a_log, const float* __restrict__ dt_bias, float lower, float* __restrict__ q_out, float* __restrict__ k_save,
             uint16_t* __restrict__ v_save, float* __restrict__ g_save, float* __restrict__ b_save) {
     using namespace tf_kda;
     constexpr int DK = kDim;
@@ -69,7 +71,7 @@ tf_kda_prep(int H, const uint16_t* __restrict__ P, int p_stride, int b_off, cons
             const int at = r + tap;
             const float x = at < kTaps - 1 ? widen(cs[static_cast<size_t>(at) * C + c])
                                            : widen(P[static_cast<size_t>(at - (kTaps - 1)) * p_stride + c]);
-            acc = acc + cw[static_cast<size_t>(c) * kTaps + tap] * x;
+            acc = acc + widen(cw[static_cast<size_t>(c) * kTaps + tap]) * x;
         }
         const float act = bf(acc / (1.0f + expf(-acc)));
         if (t < DK) qs[t] = act;

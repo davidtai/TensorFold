@@ -107,7 +107,7 @@ fn download(comptime T: type, t: *Rig, addr: u64, count: usize) ![]T {
 
 /// One KDA layer's block inputs as the CUDA path holds them: the stacked projection p bf16 (rows, kw) = [q | k | v |
 /// f_a | g_a | b], the decay rows a and gate rows g bf16 (rows, heads x 128), the conv window cs bf16 [3][3 heads 128],
-/// taps fp32 (widened bf16, as the CUDA loader), A_log a head, dt_bias a channel, o_norm bf16 [128].
+/// taps bf16 [3 heads 128][4] as the checkpoint stores them, A_log a head, dt_bias a channel, o_norm bf16 [128].
 const Block = struct {
     heads: usize,
     rows: usize,
@@ -115,7 +115,7 @@ const Block = struct {
     a: []u16,
     g: []u16,
     cs: []u16,
-    cw: []f32,
+    cw: []u16,
     a_log: []f32,
     dt_bias: []f32,
     norm: []u16,
@@ -144,7 +144,7 @@ const Block = struct {
             .a = try gpa.alloc(u16, rows * n_),
             .g = try gpa.alloc(u16, rows * n_),
             .cs = try gpa.alloc(u16, 3 * 3 * n_),
-            .cw = try gpa.alloc(f32, 3 * n_ * taps),
+            .cw = try gpa.alloc(u16, 3 * n_ * taps),
             .a_log = try gpa.alloc(f32, heads),
             .dt_bias = try gpa.alloc(f32, n_),
             .norm = try gpa.alloc(u16, d),
@@ -153,7 +153,7 @@ const Block = struct {
         for (b.a) |*v| v.* = bfBits(rng.unit() * 2.0);
         for (b.g) |*v| v.* = bfBits(rng.unit() * 2.0);
         for (b.cs) |*v| v.* = if (zero_window) 0 else bfBits(rng.unit() * 1.0);
-        for (b.cw) |*v| v.* = @floatCast(rb(rng.unit() * 0.5));
+        for (b.cw) |*v| v.* = bfBits(rng.unit() * 0.5);
         for (b.a_log) |*v| v.* = rng.unit();
         for (b.dt_bias) |*v| v.* = rng.unit() * 0.5;
         for (b.norm) |*v| v.* = bfBits(1.0 + rng.unit() / 4.0);
@@ -212,7 +212,7 @@ fn prepRef(b: Block) !Prep {
         for (0..3) |part| for (0..d) |i| {
             const c = part * n + h * d + i;
             var acc: f64 = 0;
-            for (0..taps) |tap| acc += @as(f64, b.cw[c * taps + tap]) * b.input(r + tap, c);
+            for (0..taps) |tap| acc += bfOf(b.cw[c * taps + tap]) * b.input(r + tap, c);
             const silu = acc * sigmoid(acc);
             act[part][i] = rb(silu);
             if (part == 2) p.pre_v[r * n + h * d + i] = silu;
@@ -297,7 +297,7 @@ fn saves(h: *Held, t: *Rig, rows: usize, heads: usize) !Saves {
 }
 
 fn prep(t: *Rig, b: Block, dev: BlockDev, out: Saves) !void {
-    try t.on.tf_kda_prep(cv(dev.p), @intCast(b.width()), @intCast(b.bOff()), cv(dev.a), @intCast(b.n()), cv(dev.cs), cf(dev.cw), cf(dev.a_log), cf(dev.dt_bias), lower, mf(out.q), mf(out.k), mv(out.v), mf(out.g), mf(out.b), @intCast(b.rows), @intCast(b.heads), t.stream.handle);
+    try t.on.tf_kda_prep(cv(dev.p), @intCast(b.width()), @intCast(b.bOff()), cv(dev.a), @intCast(b.n()), cv(dev.cs), cv(dev.cw), cf(dev.a_log), cf(dev.dt_bias), lower, mf(out.q), mf(out.k), mv(out.v), mf(out.g), mf(out.b), @intCast(b.rows), @intCast(b.heads), t.stream.handle);
 }
 
 /// Bf16 `got` against float64 `pre` rounded: within a bf16 ulp (2^-7 of the value: a rounding boundary that fp32 and
@@ -907,7 +907,7 @@ test "KDA: speed facts (no gate): prep, scans, out and keep at GLM's 64 heads, o
     const po = struct {
         fn f(c: PO) anyerror!void {
             const s = c.t.stream.handle;
-            if (c.which == 0) return c.t.on.tf_kda_prep(cv(c.bd.p), @intCast(c.b.width()), @intCast(c.b.bOff()), cv(c.bd.a), @intCast(c.b.n()), cv(c.bd.cs), cf(c.bd.cw), cf(c.bd.a_log), cf(c.bd.dt_bias), lower, mf(c.sv.q), mf(c.sv.k), mv(c.sv.v), mf(c.sv.g), mf(c.sv.b), @intCast(c.rows), glm_heads, s);
+            if (c.which == 0) return c.t.on.tf_kda_prep(cv(c.bd.p), @intCast(c.b.width()), @intCast(c.b.bOff()), cv(c.bd.a), @intCast(c.b.n()), cv(c.bd.cs), cv(c.bd.cw), cf(c.bd.a_log), cf(c.bd.dt_bias), lower, mf(c.sv.q), mf(c.sv.k), mv(c.sv.v), mf(c.sv.g), mf(c.sv.b), @intCast(c.rows), glm_heads, s);
             return c.t.on.tf_kda_out(cf(c.y), cv(c.bd.g), @intCast(c.b.n()), cv(c.bd.norm), eps_out, mv(c.out), @intCast(c.rows), glm_heads, s);
         }
     };
