@@ -19,6 +19,7 @@ const state = @import("state.zig");
 
 const glue = hip.launches.glm;
 const dsa = hip.launches.glm_dsa;
+const nemo = hip.launches.nemotron_moe;
 const K = hip.launches.affine.Kernels;
 const S = hip.abi.Stream;
 
@@ -289,7 +290,7 @@ pub const Forward = struct {
         const pick = try ar.of(i32, pairs);
         const wts = try ar.of(f32, pairs);
         try f.lin(b.normed, w.router, R, mlog, false);
-        try f.select(mlog, w.bias, pick, wts, R);
+        try nemo.select(f.l, cf(mlog), cf(w.bias), mi(pick), mf(wts), null, null, 0, int(R), int(E), int(top_k), f.cfg.routed_scale, f.cfg.norm_topk, f.s);
         // the plan over the routed pairs (experts + 1 as G1's tests plan them); 128 pairs an item in a prompt
         const tile: usize = if (b.prompt) 128 else 8;
         const cap = @min(pairs, E + 1) + pairs / tile;
@@ -304,27 +305,8 @@ pub const Forward = struct {
         try f.swiglu(b.normed, w.shared_gu, sw, R, sact);
         const sy = try ar.of(f32, R * D);
         try f.lin(sact, w.shared_down, R, sy, false);
-        try f.combine(ey, wts, sy, b.part, R);
+        try nemo.combine(f.l, cf(ey), cf(wts), cf(sy), m(b.part), 0, int(R), int(top_k), int(D), f.s);
         if (f.seq) |s| try f.dumpRouter(s, layer, pick, wts, R);
-    }
-
-    /// tf_nemo_select_rank (nemotron_moe.zig select's launch): each row's top 8 of 288 by sigmoid + bias, ties to the
-    /// lower id, weights over their sum x routed_scaling_factor.
-    fn select(f: *const Forward, logits: u64, bias: u64, pick: u64, wts: u64, rows: usize) !void {
-        var a: hip.launch.Args = .{};
-        for ([_]u64{ logits, bias, pick, wts, 0, 0 }) |v| try a.add(v);
-        for ([_]c_int{ 0, int(experts), int(top_k) }) |v| try a.add(v);
-        try a.add(f.cfg.routed_scale);
-        try a.add(@as(c_int, @intFromBool(f.cfg.norm_topk)));
-        try f.l.go(f.l.nemo.select, .{ .x = @intCast(rows) }, .{ .x = 512 }, 0, f.s, &a);
-    }
-
-    /// tf_nemo_combine (nemotron_moe.zig combine's launch): out fp32 = the 8 slots' weighted sum in order + shared.
-    fn combine(f: *const Forward, y: u64, wts: u64, shared: u64, out: u64, rows: usize) !void {
-        var a: hip.launch.Args = .{};
-        for ([_]u64{ y, wts, shared, out }) |v| try a.add(v);
-        for ([_]c_int{ 0, int(top_k), int(D) }) |v| try a.add(v);
-        try f.l.go(f.l.nemo.combine, .{ .x = @intCast((D + 255) / 256), .y = @intCast(rows) }, .{ .x = 256 }, 0, f.s, &a);
     }
 
     // ---- the head and the MTP layer ----
