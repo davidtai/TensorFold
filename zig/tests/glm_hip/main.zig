@@ -26,7 +26,7 @@ const gib = load.gib;
 fn printPlan(l: *const layout.Layout) void {
     std.debug.print("{s:<26} {s:>12} {s:>12} {s:>8}\n", .{ "class", "stored GiB", "on GPU GiB", "tensors" });
     for (0..layout.class_count) |i| {
-        const c: layout.Class = @enumFromInt(i);
+        const c: layout.Class = @fromBackingInt(@intCast(i));
         std.debug.print("{s:<26} {d:>12.3} {d:>12.3} {d:>8}\n", .{ c.label(), gib(l.stored[i]), gib(l.on_gpu[i]), l.stored_count[i] });
     }
     var on: u64 = 0;
