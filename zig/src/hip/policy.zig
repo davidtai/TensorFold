@@ -11,8 +11,9 @@ pub const Attention = enum { auto, f32 };
 pub const Pick = enum { auto, reference };
 
 /// Where a single rank reads host-held row tables (Flash Next's n-gram rows) from: a copy in anonymous memory made at
-/// load (a round never faults, and reclaim cannot take it without swap), or the checkpoint's mapping as it is.
-pub const Rows = enum { resident, mapped };
+/// load (a round never faults, and reclaim cannot take it without swap), the checkpoint's mapping as it is, or the SSD
+/// through a fixed row cache of `ngram_mib` MiB (LRU, O_DIRECT reads, read ahead; the page cache holds no copy).
+pub const Rows = enum { resident, mapped, cached };
 
 /// Which kernels may change a result's bits: `exact` runs only the kernels whose output bytes equal the reference path's
 /// (3d219d21's logits); `inexact` also runs the faster ones that round or sum in another order (prompt and decode sparse
@@ -53,6 +54,9 @@ pub const Policy = struct {
     gemm: Pick = .auto,
     fuse: Pick = .auto,
     rows: Rows = .resident,
+    /// The row cache's bound under rows=cached, MiB: 256 holds a 256K-token prompt's rows and its warm-up's. Local to
+    /// a rank (rows=cached is one rank's).
+    ngram_mib: u32 = 256,
     numerics: Numerics = .exact,
     mtp_depth: MtpDepth = .rule,
     prefill_step: u32 = 1024,
@@ -131,6 +135,8 @@ pub const Policy = struct {
         const eql = std.mem.eql;
         if (eql(u8, key, "matrix")) p.matrix = try parseEnum(Choice, value) else if (eql(u8, key, "attention")) p.attention = try parseEnum(Attention, value) else if (eql(u8, key, "kernels")) p.kernels = try parseEnum(Pick, value) else if (eql(u8, key, "graphs")) p.graphs = try parseEnum(Choice, value) else if (eql(u8, key, "stream")) p.stream = try parseEnum(Pick, value) else if (eql(u8, key, "gemm")) p.gemm = try parseEnum(Pick, value) else if (eql(u8, key, "fuse")) p.fuse = try parseEnum(Pick, value) else if (eql(u8, key, "rows")) p.rows = try parseEnum(Rows, value) else if (eql(u8, key, "numerics")) p.numerics = try parseEnum(Numerics, value) else if (eql(u8, key, "mtp_depth")) p.mtp_depth = try parseEnum(MtpDepth, value) else if (eql(u8, key, "prefill_step")) {
             p.prefill_step = std.fmt.parseInt(u32, value, 10) catch return error.BadValue;
+        } else if (eql(u8, key, "ngram_mib")) {
+            p.ngram_mib = std.fmt.parseInt(u32, value, 10) catch return error.BadValue;
         } else if (eql(u8, key, "fill_rows")) {
             p.fill_rows = std.fmt.parseInt(u32, value, 10) catch return error.BadValue;
         } else if (eql(u8, key, "graph_fail")) {
@@ -150,6 +156,7 @@ pub const Policy = struct {
         if (p.gemm != .auto) try w.print(",gemm={t}", .{p.gemm});
         if (p.fuse != .auto) try w.print(",fuse={t}", .{p.fuse});
         if (p.rows != .resident) try w.print(",rows={t}", .{p.rows});
+        if (p.rows == .cached) try w.print(",ngram_mib={d}", .{p.ngram_mib});
         if (p.mtp_depth != .rule) try w.print(",mtp_depth={t}", .{p.mtp_depth});
         if (p.graph_fail >= 0) try w.print(",graph_fail={d}", .{p.graph_fail});
         if (p.rccl_lib.slice()) |path| try w.print(",rccl_lib={s}", .{path});
@@ -322,4 +329,19 @@ test "numerics: exact by default, inexact on the key, refused otherwise; the lau
     const env: Policy.Env = .{ .vars = &.{.{ "TF_POLICY", "numerics=exact" }} };
     try std.testing.expect(!(try Policy.resolve("numerics=inexact", env, &notes)).inexact());
     try std.testing.expect((try Policy.resolve("matrix=auto,numerics=inexact", .none, &notes)).inexact());
+}
+
+test "rows: resident and mapped keep their nibbles; cached is the third, with its cache bound on the line" {
+    try std.testing.expectEqual(@as(u32, 0), @backingInt(Rows.resident));
+    try std.testing.expectEqual(@as(u32, 1), @backingInt(Rows.mapped));
+    var p: Policy = .{};
+    try std.testing.expectEqual(@as(u32, 256), p.ngram_mib);
+    try p.apply("rows=cached,ngram_mib=96");
+    try std.testing.expectEqual(Rows.cached, p.rows);
+    try std.testing.expectEqual(@as(u32, 96), p.ngram_mib);
+    try std.testing.expectEqual(Rows.cached, Policy.fromWords(p.words(), .{}).rows);
+    var buf: [256]u8 = undefined;
+    try std.testing.expect(std.mem.indexOf(u8, try std.fmt.bufPrint(&buf, "{f}", .{p}), ",rows=cached,ngram_mib=96") != null);
+    try std.testing.expect(std.mem.indexOf(u8, try std.fmt.bufPrint(&buf, "{f}", .{Policy{}}), "ngram_mib") == null);
+    try std.testing.expectError(error.BadValue, p.apply("ngram_mib=lots"));
 }

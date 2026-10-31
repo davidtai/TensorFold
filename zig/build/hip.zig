@@ -109,6 +109,9 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     test_step.dependOn(&family_host.step);
     b.step("test-qwen35-hip-host", "Qwen HIP family CPU tests with inert kernels").dependOn(&family_host.step);
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = host.flashnext })).step);
+    const fx_host = b.step("test-flashnext-hip-host", "Flash Next HIP family and HIP policy CPU tests with inert kernels (n-gram hashes, row cache)");
+    fx_host.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = host.flashnext })).step);
+    fx_host.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = host.hip })).step);
     b.step("test-flashnext-proposal-hip-host", "Original Flash Next HIP IDs and head-row spans without device runtime").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = host.flashnext, .filters = &.{"Flash Next proposal:"} })).step);
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = host.nemotron })).step);
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = host.serve })).step);

@@ -126,8 +126,12 @@ pub const Engine = struct {
         e.weights.model.tp = e.comm;
         const spelling = try spellingOf(e.keep.allocator(), io, dir);
         e.tables = try tables.Tables.init(e.keep.allocator(), &e.ck, &e.cfg, e.weights.model.ple.layer, spelling);
-        // one rank: the n-gram rows in anonymous memory (ranks of a group share the mapping's page cache instead)
+        // one rank: the n-gram rows in anonymous memory, or on the SSD through the row cache (ranks of a group share the
+        // mapping's page cache instead)
+        if (o.policy.rows == .cached and o.world > 1) return error.CachedRowsOneRank;
         if (o.world == 1 and o.policy.rows == .resident) try e.tables.keepResident(e.keep.allocator(), &e.ck);
+        if (o.policy.rows == .cached) try e.tables.useCache(gpa, io, &e.ck, o.policy.ngram_mib, o.chunk);
+        errdefer e.tables.deinit();
         const c = mixers.qkConstants(e.cfg.key_dim);
         var w: [2]hip.DeviceBuffer = undefined;
         for (&w, [_]f32{ c.q, c.k }) |*b, v| {
@@ -186,6 +190,7 @@ pub const Engine = struct {
         e.host.staging.free();
         for (&e.qk) |*b| b.free();
         e.weights.deinit();
+        e.tables.deinit();
         e.keep.deinit();
         e.ck.close();
         e.cfg.deinit();

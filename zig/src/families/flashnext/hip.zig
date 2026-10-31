@@ -9,6 +9,7 @@ pub const model = @import("hip/model.zig");
 pub const load = @import("hip/load.zig");
 pub const cache = @import("hip/cache.zig");
 pub const tables = @import("hip/tables.zig");
+pub const row_cache = @import("hip/row_cache.zig");
 pub const forward = @import("hip/forward.zig");
 pub const mixers = @import("hip/mixers.zig");
 pub const engine = @import("hip/engine.zig");
@@ -26,6 +27,7 @@ test {
     _ = ngram;
     _ = model;
     _ = cache;
+    _ = row_cache;
     @import("std").testing.refAllDecls(engine.Engine);
     @import("std").testing.refAllDecls(load);
     @import("std").testing.refAllDecls(forward);

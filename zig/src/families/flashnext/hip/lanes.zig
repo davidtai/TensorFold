@@ -6,6 +6,7 @@ const serve = @import("hip_serve");
 const Engine = @import("engine.zig").Engine;
 const cache = @import("cache.zig");
 const forward = @import("forward.zig");
+const ngram = @import("ngram.zig");
 const head_mod = @import("head.zig");
 const load = @import("load.zig");
 const worker = @import("worker.zig");
@@ -452,6 +453,9 @@ pub const Fx = struct {
                 f.ones,
             );
         }
+        e.tables.report("prompt chunk at {d} of {d} rows", .{ at, rows });
+        // the next chunk's rows read while this one runs (rows=cached; its history is this chunk's end)
+        if (!last) e.tables.ahead(f.gpa, lane.caches.history, prompt[to..@min(prompt.len, to + chunk)]);
         fill.at = to;
         if (fill.next < fill.count and to == fill.stops[fill.next]) {
             if (f.store) |*st| _ = st.keep(prompt, @intCast(to), lane, &.{}, &.{});
@@ -620,6 +624,11 @@ pub const Fx = struct {
                 break :blk follow_buf[0..1];
             };
             const start = lane.caches.len - follow.len;
+            // rows=cached: the next verify window's rows read while the head drafts (`token` sits at caches.len, after
+            // the stream's history; each draft after it, read as it is drawn)
+            var hist = lane.caches.history;
+            e.tables.ahead(f.gpa, hist, &.{token});
+            hist = ngram.after(hist, &.{token});
             try e.stream.synchronize();
             e.host.used = 0;
             e.arena.reset();
@@ -656,6 +665,8 @@ pub const Fx = struct {
                 if (keyed) |t| tok[0] = t else try head_mod.draws(o, m, &e.host, e.stream, mixed, 1, f.draft_ids, &tok, &prob);
                 lane.held[d] = tok[0];
                 chained = d + 1;
+                e.tables.ahead(f.gpa, hist, &tok);
+                hist = ngram.after(hist, &tok);
                 if (d + 1 == depth or prob[0] < stop_under) break;
                 out = try head_mod.run(
                     o,
@@ -682,6 +693,7 @@ pub const Fx = struct {
     fn releaseFn(ptr: *anyopaque, s: *lanes.Stream) void {
         const f = of(ptr);
         const kv = f.lanes.fetchRemove(s) orelse return;
+        f.e.tables.report("decode", .{});
         if (f.link != null) f.send(&.{ @backingInt(worker.Op.release), kv.value.id }) catch {};
         f.free(kv.value);
     }
