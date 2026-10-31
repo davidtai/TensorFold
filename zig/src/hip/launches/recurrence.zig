@@ -128,6 +128,11 @@ pub const KdaFns = struct {
     conv_shift: Function,
     prep_wave: Function,
     out_wave: Function,
+    /// The prompt scan staging 8 steps (K-5's other width), and the scans as before K-5 (16 steps): the tests' oracles.
+    prompt_t8: Function,
+    prompt_t16: Function,
+    tile_t16: Function,
+    hold_t16: Function,
 
     pub fn load(m: Module) Error!KdaFns {
         return .{
@@ -140,6 +145,10 @@ pub const KdaFns = struct {
             .conv_shift = try m.function("tf_kda_conv_shift"),
             .prep_wave = try m.function("tf_kda_prep_wave"),
             .out_wave = try m.function("tf_kda_out_wave"),
+            .prompt_t8 = try m.function("tf_kda_prompt_128_t8"),
+            .prompt_t16 = try m.function("tf_kda_prompt_128_t16"),
+            .tile_t16 = try m.function("tf_kda_tile_128_t16"),
+            .hold_t16 = try m.function("tf_kda_hold_128_t16"),
         };
     }
 };
@@ -186,23 +195,46 @@ pub fn tf_kda_prep_as(l: *const Launcher, form: KdaForm, p: C, p_stride: c_int, 
 /// and beta as tf_kda_prep writes them; y fp32 (rows, heads, 128). A prompt's rows (no snapshots, at least prompt_rows)
 /// take the half-head blocks, others the 8-row tile: the same sums. `states`: each row's state; `from`: tf_gated_delta's.
 pub fn tf_kda(l: *const Launcher, q: CF, k: CF, v: C, gate: CF, beta: CF, state: F, y: F, length: c_int, heads: c_int, s: S, states: F, from: u64) Error!void {
+    return tf_kda_as(l, .t12, q, k, v, gate, beta, state, y, length, heads, s, states, from);
+}
+
+/// The scans' LDS staging widths (gated_delta.hip): t12 the engine's prompt scan (tiles of 8 steps), t8 the prompt
+/// scan staging 8, t16 the scans as before K-5 (16). A step's arithmetic does not depend on the width: the same bytes.
+pub const KdaSteps = enum { t12, t8, t16 };
+
+/// tf_kda at a named staging width (the tests' and the timings').
+pub fn tf_kda_as(l: *const Launcher, steps: KdaSteps, q: CF, k: CF, v: C, gate: CF, beta: CF, state: F, y: F, length: c_int, heads: c_int, s: S, states: F, from: u64) Error!void {
     if (heads < 1 or length < 1) return invalid("kda");
     if (states == null and length >= prompt_rows) {
         var b: Args = .{};
         inline for (.{ ad(q), ad(k), ad(v), ad(gate), ad(beta), ad(state), ad(y), length, heads }) |x| try b.add(x);
-        return l.go(l.kda.prompt, dim(2, heads, 1), dim(32, 4, 1), 0, s, &b);
+        const f = switch (steps) {
+            .t12 => l.kda.prompt,
+            .t8 => l.kda.prompt_t8,
+            .t16 => l.kda.prompt_t16,
+        };
+        return l.go(f, dim(2, heads, 1), dim(32, 4, 1), 0, s, &b);
     }
     var a: Args = .{};
     inline for (.{ ad(q), ad(k), ad(v), ad(gate), ad(beta), ad(state), ad(y), length, heads, ad(states), from }) |x| try a.add(x);
-    try l.go(l.kda.tile, dim(kda_dim / 8, heads, 1), dim(32, 8, 1), 0, s, &a);
+    try l.go(if (steps == .t16) l.kda.tile_t16 else l.kda.tile, dim(kda_dim / 8, heads, 1), dim(32, 8, 1), 0, s, &a);
 }
 
 /// A KDA verify window that holds its state: the rows' outputs only (tf_gdn_hold's). At most 16 rows.
 pub fn tf_kda_hold(l: *const Launcher, q: CF, k: CF, v: C, gate: CF, beta: CF, state: F, y: F, length: c_int, heads: c_int, s: S) Error!void {
+    return holdWith(l, l.kda.hold, q, k, v, gate, beta, state, y, length, heads, s);
+}
+
+/// tf_kda_hold as before K-5 (16 steps staged): the tests' oracle.
+pub fn tf_kda_hold_t16(l: *const Launcher, q: CF, k: CF, v: C, gate: CF, beta: CF, state: F, y: F, length: c_int, heads: c_int, s: S) Error!void {
+    return holdWith(l, l.kda.hold_t16, q, k, v, gate, beta, state, y, length, heads, s);
+}
+
+fn holdWith(l: *const Launcher, f: Function, q: CF, k: CF, v: C, gate: CF, beta: CF, state: F, y: F, length: c_int, heads: c_int, s: S) Error!void {
     if (heads < 1 or length < 1 or length > 16) return invalid("kda hold");
     var a: Args = .{};
     inline for (.{ ad(q), ad(k), ad(v), ad(gate), ad(beta), ad(state), ad(y), length, heads }) |x| try a.add(x);
-    try l.go(l.kda.hold, dim(kda_dim / 8, heads, 1), dim(32, 8, 1), 0, s, &a);
+    try l.go(f, dim(kda_dim / 8, heads, 1), dim(32, 8, 1), 0, s, &a);
 }
 
 /// A keep on the CUDA window saves (cuda_forward.zig commit's replay_layers inputs): `layers` states (layer z at

@@ -963,6 +963,140 @@ test "KDA: R-1, the prep's and out's block and wave forms give a row the same by
     std.debug.print("KDA R-1: {d} launches (block, wave, auto) of prep and out bit-equal to the 2,048-row reference\n", .{checked});
 }
 
+/// tf_kda at staging width `steps` over rows [from, from + rows) of `in` (state in place, no snapshots).
+fn scanAs(t: *Rig, steps: Launcher.KdaSteps, heads: usize, in: Saves, state: u64, y: u64, from: usize, rows: usize) !void {
+    const n = heads * d;
+    try t.on.tf_kda_as(steps, cf(in.q + from * n * 4), cf(in.k + from * n * 4), cv(in.v + from * n * 2), cf(in.g + from * n * 4), cf(in.b + from * heads * 4), mf(state), mf(y + from * n * 4), @intCast(rows), @intCast(heads), t.stream.handle, null, 0);
+}
+
+test "KDA: K-5, the scans at 12 and 8 staged steps give the bytes of 16 at every length, cut and verify window" {
+    // The oracle: the scans as before K-5 (tf_kda_as .t16: the prompt blocks and the tile at 16 steps). Lengths under
+    // 64 take the tile, from 64 the prompt blocks; cuts off the 8- and 12-step boundaries; holds of 1-8 rows.
+    const t = try Rig.open(1 << 20);
+    defer t.close();
+    const heads = glm_heads;
+    const n = heads * d;
+    const total = 2048;
+    const in = try ScanIn.make(heads, total, 0x4b35);
+    defer in.free();
+    var h: Held = .{};
+    defer h.deinit();
+    const dev = try in.dev(&h, t);
+    const state = try h.up(t, in.state);
+    const y = try h.zeros(t, total * n * 4);
+    var checked: usize = 0;
+    const lengths = [_]usize{ 1, 2, 3, 4, 5, 7, 8, 9, 11, 12, 13, 15, 16, 17, 24, 25, 31, 32, 33, 63, 64, 65, 100, 127, 128, 129, 1000, 2045, 2048 };
+    for (lengths) |len| {
+        var want: [2][]u8 = undefined;
+        for ([_]Launcher.KdaSteps{ .t16, .t12, .t8 }, 0..) |steps, i| {
+            try state.upload(0, std.mem.sliceAsBytes(in.state));
+            try y.fill8(0);
+            try scanAs(t, steps, heads, dev, at(state), at(y), 0, len);
+            try t.stream.synchronize();
+            const gy = try download(u8, t, at(y), len * n * 4);
+            const gs = try rig.download(u8, state);
+            if (i == 0) {
+                want = .{ gy, gs };
+                continue;
+            }
+            defer gpa.free(gy);
+            defer gpa.free(gs);
+            try rig.expect(std.mem.eql(u8, want[0], gy) and std.mem.eql(u8, want[1], gs), "KDA K-5 {s} at {d} rows: y or state differs from 16 steps", .{ @tagName(steps), len });
+            checked += 1;
+        }
+        gpa.free(want[0]);
+        gpa.free(want[1]);
+    }
+    // cuts off the staging boundaries, by the engine's width, against one 2,048-row call at 16
+    const Cut = struct { at: []const usize };
+    try state.upload(0, std.mem.sliceAsBytes(in.state));
+    try scanAs(t, .t16, heads, dev, at(state), at(y), 0, total);
+    try t.stream.synchronize();
+    const one_y = try rig.download(u8, y);
+    defer gpa.free(one_y);
+    const one_s = try rig.download(u8, state);
+    defer gpa.free(one_s);
+    for ([_]Cut{ .{ .at = &.{7} }, .{ .at = &.{13} }, .{ .at = &.{2045} }, .{ .at = &.{ 7, 20, 83, 2045 } }, .{ .at = &.{ 13, 77 } } }) |cut| {
+        for ([_]Launcher.KdaSteps{ .t12, .t8 }) |steps| {
+            try state.upload(0, std.mem.sliceAsBytes(in.state));
+            try y.fill8(0);
+            var from: usize = 0;
+            for (cut.at) |c| {
+                try scanAs(t, steps, heads, dev, at(state), at(y), from, c - from);
+                from = c;
+            }
+            try scanAs(t, steps, heads, dev, at(state), at(y), from, total - from);
+            try t.stream.synchronize();
+            const gy = try rig.download(u8, y);
+            defer gpa.free(gy);
+            const gs = try rig.download(u8, state);
+            defer gpa.free(gs);
+            try rig.expect(std.mem.eql(u8, one_y, gy) and std.mem.eql(u8, one_s, gs), "KDA K-5 {s} cut at {any}: y or state differs from one call at 16", .{ @tagName(steps), cut.at });
+            checked += 1;
+        }
+    }
+    // verify windows: the hold at 8 steps against 16, 1-8 rows; the state untouched
+    for (1..window_rows + 1) |rows| {
+        var ys: [2][]u8 = undefined;
+        for (0..2) |i| {
+            try state.upload(0, std.mem.sliceAsBytes(in.state));
+            try y.fill8(0);
+            if (i == 0) {
+                try t.on.tf_kda_hold_t16(cf(dev.q), cf(dev.k), cv(dev.v), cf(dev.g), cf(dev.b), mf(at(state)), mf(at(y)), @intCast(rows), heads, t.stream.handle);
+            } else try t.on.tf_kda_hold(cf(dev.q), cf(dev.k), cv(dev.v), cf(dev.g), cf(dev.b), mf(at(state)), mf(at(y)), @intCast(rows), heads, t.stream.handle);
+            try t.stream.synchronize();
+            ys[i] = try download(u8, t, at(y), rows * n * 4);
+            const gs = try rig.download(f32, state);
+            defer gpa.free(gs);
+            try std.testing.expectEqualSlices(u32, @ptrCast(in.state), @ptrCast(gs));
+        }
+        defer for (ys) |x| gpa.free(x);
+        try rig.expect(std.mem.eql(u8, ys[0], ys[1]), "KDA K-5 hold at {d} rows differs from 16 steps", .{rows});
+        checked += 1;
+    }
+    std.debug.print("KDA K-5: {d} launches at 12 and 8 staged steps bit-equal to 16 (lengths 1-2,048, cuts 7, 13, 2,045, holds 1-8)\n", .{checked});
+}
+
+test "KDA: speed facts (no gate): K-5, the scans by staged steps, one layer, 64 heads" {
+    const t = try Rig.open(1 << 20);
+    defer t.close();
+    const heads = glm_heads;
+    const n = heads * d;
+    const rows = 2048;
+    const in = try ScanIn.make(heads, rows, 0x5eed5);
+    defer in.free();
+    var h: Held = .{};
+    defer h.deinit();
+    const dev = try in.dev(&h, t);
+    const state = at(try h.up(t, in.state));
+    const y = at(try h.zeros(t, rows * n * 4));
+    const Ctx = struct { t: *Rig, dev: Saves, state: u64, y: u64, rows: usize, steps: Launcher.KdaSteps, hold: bool };
+    const run = struct {
+        fn f(c: Ctx) anyerror!void {
+            const x = c.dev;
+            const r: c_int = @intCast(c.rows);
+            const s = c.t.stream.handle;
+            if (c.hold) {
+                if (c.steps == .t16) return c.t.on.tf_kda_hold_t16(cf(x.q), cf(x.k), cv(x.v), cf(x.g), cf(x.b), mf(c.state), mf(c.y), r, glm_heads, s);
+                return c.t.on.tf_kda_hold(cf(x.q), cf(x.k), cv(x.v), cf(x.g), cf(x.b), mf(c.state), mf(c.y), r, glm_heads, s);
+            }
+            return c.t.on.tf_kda_as(c.steps, cf(x.q), cf(x.k), cv(x.v), cf(x.g), cf(x.b), mf(c.state), mf(c.y), r, glm_heads, s, null, 0);
+        }
+    };
+    const Case = struct { name: []const u8, rows: usize, hold: bool, steps: []const Launcher.KdaSteps };
+    for ([_]Case{
+        .{ .name = "prompt scan, 2048 rows", .rows = rows, .hold = false, .steps = &.{ .t16, .t12, .t8 } },
+        .{ .name = "decode tile, 1 row", .rows = 1, .hold = false, .steps = &.{ .t16, .t12 } },
+        .{ .name = "verify hold, 4 rows", .rows = 4, .hold = true, .steps = &.{ .t16, .t12 } },
+    }) |cs| {
+        for (cs.steps) |steps| {
+            const m = try timeMs(t, 15, Ctx{ .t = t, .dev = dev, .state = state, .y = y, .rows = cs.rows, .steps = steps, .hold = cs.hold }, run.f);
+            const label = if (cs.rows < 64 and steps != .t16) "8 (tile)" else @tagName(steps);
+            std.debug.print("KDA speed K-5 {s}: staged {s}: {d:.4} ms\n", .{ cs.name, label, m });
+        }
+    }
+}
+
 /// The median of `runs` launches of `f` in ms, by events on the rig's stream, after two warm-up launches.
 fn timeMs(t: *Rig, runs: usize, ctx: anytype, comptime f: fn (@TypeOf(ctx)) anyerror!void) !f64 {
     const Event = @import("../stream.zig").Event;

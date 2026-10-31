@@ -339,13 +339,14 @@ __device__ __forceinline__ float quad_sum(const float (&part)[8]) {
     return c;
 }
 
-// GD and VT as the tile's: KDA's decays stage transposed like k, and lane p takes its 32 in registers like k.
-template <int WAVES, int GD = 1, typename VT = float>
+// GD and VT as the tile's: KDA's decays stage transposed like k, and lane p takes its 32 in registers like k. T: steps
+// staged in LDS at a time (a step's arithmetic does not depend on it; it sets the LDS a block takes, so occupancy).
+template <int WAVES, int GD = 1, typename VT = float, int T = kPromptSteps>
 __device__ __forceinline__ void
 gated_delta_prompt_body(const float* __restrict__ q, const float* __restrict__ k, const VT* __restrict__ v,
                         const float* __restrict__ gate, const float* __restrict__ beta, float* __restrict__ state,
                         float* __restrict__ y, int length, int key_heads, int value_heads) {
-    constexpr int DK = 128, DV = 128, T = kPromptSteps, THREADS = 32 * WAVES, ROWS = 16 * WAVES;
+    constexpr int DK = 128, DV = 128, THREADS = 32 * WAVES, ROWS = 16 * WAVES;
     const int lane = threadIdx.x, wave = threadIdx.y;
     const int tid = wave * 32 + lane;
     const int p = lane & 3;
@@ -526,17 +527,22 @@ tf_gdn_prompt_128(const float* q, const float* k, const float* v, const float* g
 // GLM-5.3-Flash's KDA: the scans above with a decay a key channel (gate (rows, heads, 128) fp32) and v as bf16 bits
 // (the CUDA chain's saved v), Dk = Dv = 128, key heads = value heads. The DeltaNet's sums in its order; only the decay's
 // operand and v's load differ. Prep, out and the conv shift are recurrence/kda.hpp's ports of cuda/glm_kda.cu.
+// KDA stages 8 steps at a time (the DeltaNet 16): its 128 decays a step make the 16-step tiles' LDS cut occupancy
+// (25,152 B a block against 17,024), and its verify windows are at most 4 rows. A step's arithmetic does not change.
+constexpr int kKdaSteps = 8;
+
 extern "C" __global__ void __launch_bounds__(256)
 tf_kda_tile_128(const float* q, const float* k, const uint16_t* v, const float* gate, const float* beta, float* state,
                 float* y, int length, int heads, float* states, const int* from) {
-    tf::rocm::gated_delta_tile_body<128, 8, 16, 128, uint16_t>(q, k, v, gate, beta, state, y, length, heads, heads, 128,
-                                                               states, 0, true, from);
+    tf::rocm::gated_delta_tile_body<128, 8, kKdaSteps, 128, uint16_t>(q, k, v, gate, beta, state, y, length, heads,
+                                                                      heads, 128, states, 0, true, from);
 }
 
 extern "C" __global__ void __launch_bounds__(256)
 tf_kda_hold_128(const float* q, const float* k, const uint16_t* v, const float* gate, const float* beta, float* state,
                 float* y, int length, int heads) {
-    tf::rocm::gated_delta_hold<128, 8, 16, 128, uint16_t>(q, k, v, gate, beta, state, y, length, heads, heads, 128);
+    tf::rocm::gated_delta_hold<128, 8, kKdaSteps, 128, uint16_t>(q, k, v, gate, beta, state, y, length, heads, heads,
+                                                                 128);
 }
 
 // A keep on the CUDA window saves (cuda_state.zig State.save_*): layer z = blockIdx.z's state (at state + z
@@ -546,16 +552,46 @@ extern "C" __global__ void __launch_bounds__(256)
 tf_kda_keep_128(float* state, long long state_stride, const float* k, const uint16_t* v, const float* gate,
                 const float* beta, long long kv_stride, long long b_stride, int kept, int heads) {
     const long long z = blockIdx.z;
-    tf::rocm::gated_delta_tile_body<128, 8, 16, 128, uint16_t>(nullptr, k + z * kv_stride, v + z * kv_stride,
-                                                               gate + z * kv_stride, beta + z * b_stride,
-                                                               state + z * state_stride, nullptr, kept, heads, heads,
-                                                               128, nullptr, 0);
+    tf::rocm::gated_delta_tile_body<128, 8, kKdaSteps, 128, uint16_t>(nullptr, k + z * kv_stride, v + z * kv_stride,
+                                                                      gate + z * kv_stride, beta + z * b_stride,
+                                                                      state + z * state_stride, nullptr, kept, heads,
+                                                                      heads, 128, nullptr, 0);
 }
 
+// The prompt scan stages 12 steps (21,552 B a block: 3 blocks a CU, occupancy 6, the DeltaNet's; 16 steps took
+// 28,736 B, occupancy 4) or 8 (about 14.4 KiB: occupancy 7, the VGPR bound). Both are timed (kernel_tests/kda.zig
+// speed facts); the launcher takes tf_kda_prompt_128 (12).
 extern "C" __global__ void __launch_bounds__(128)
 tf_kda_prompt_128(const float* q, const float* k, const uint16_t* v, const float* gate, const float* beta, float* state,
                   float* y, int length, int heads) {
-    tf::rocm::gated_delta_prompt_body<4, 128, uint16_t>(q, k, v, gate, beta, state, y, length, heads, heads);
+    tf::rocm::gated_delta_prompt_body<4, 128, uint16_t, 12>(q, k, v, gate, beta, state, y, length, heads, heads);
+}
+
+extern "C" __global__ void __launch_bounds__(128)
+tf_kda_prompt_128_t8(const float* q, const float* k, const uint16_t* v, const float* gate, const float* beta,
+                     float* state, float* y, int length, int heads) {
+    tf::rocm::gated_delta_prompt_body<4, 128, uint16_t, 8>(q, k, v, gate, beta, state, y, length, heads, heads);
+}
+
+// The KDA scans as they were before K-5 (16 steps staged): the bit oracle of kernel_tests/kda.zig's K-5 test and the
+// timings' control; not launched by the engine.
+extern "C" __global__ void __launch_bounds__(128)
+tf_kda_prompt_128_t16(const float* q, const float* k, const uint16_t* v, const float* gate, const float* beta,
+                      float* state, float* y, int length, int heads) {
+    tf::rocm::gated_delta_prompt_body<4, 128, uint16_t, 16>(q, k, v, gate, beta, state, y, length, heads, heads);
+}
+
+extern "C" __global__ void __launch_bounds__(256)
+tf_kda_tile_128_t16(const float* q, const float* k, const uint16_t* v, const float* gate, const float* beta,
+                    float* state, float* y, int length, int heads, float* states, const int* from) {
+    tf::rocm::gated_delta_tile_body<128, 8, 16, 128, uint16_t>(q, k, v, gate, beta, state, y, length, heads, heads, 128,
+                                                               states, 0, true, from);
+}
+
+extern "C" __global__ void __launch_bounds__(256)
+tf_kda_hold_128_t16(const float* q, const float* k, const uint16_t* v, const float* gate, const float* beta,
+                    float* state, float* y, int length, int heads) {
+    tf::rocm::gated_delta_hold<128, 8, 16, 128, uint16_t>(q, k, v, gate, beta, state, y, length, heads, heads, 128);
 }
 
 #include "recurrence/gated_delta_wy.hpp"
