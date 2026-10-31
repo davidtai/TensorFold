@@ -299,12 +299,13 @@ pub const Hip = struct {
         try hip.runtime.check(e.r.api.hipMemcpyDtoDAsync(@ptrFromInt(dst), @ptrFromInt(src), n, e.stream.handle));
     }
 
-    /// A drafting stream's prompt rows [from, from + rows) through the MTP layer, each with the next prompt id
-    /// (lane F's `mtp`: row j is h_j and token j + 1). The prompt's last row waits for the first drawn token. The
-    /// chunk's own final-normed rows are the input: `mtp` reads them before it writes b.fnormed (stream order).
+    /// A drafting stream's prompt rows [from, from + rows) into the MTP layer's caches, each with the next prompt id
+    /// (`mtpCache`: row j is h_j and token j + 1; the drafts read only these caches, the bytes `mtp` writes). The
+    /// prompt's last row waits for the first drawn token (`draft` runs it through the whole layer). The chunk's own
+    /// final-normed rows are the input; `mtpCache` does not write b.fnormed.
     fn mtpPrompt(h: *Hip, l: *Lane, prompt: []const u32, from: usize, rows: usize) !void {
         if (!l.mtp or rows == 0) return;
-        try h.e.fp.mtp(&l.st, prompt[from + 1 ..][0..rows], h.e.fp.b.fnormed);
+        try h.e.fp.mtpCache(&l.st, prompt[from + 1 ..][0..rows], h.e.fp.b.fnormed);
     }
 
     pub fn advance(h: *Hip, l: *Lane, prompt: []const u32, from: usize, to: usize, _: ?void) !void {

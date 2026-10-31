@@ -17,7 +17,7 @@
 //!     --mtp-draft d: greedy decode in MTP rounds (Forward.draft, window, keep): d drafts (at most 3) from the MTP
 //!     layer, the pending token and the drafts in one window, the rows up to the first rejected draft kept. The ids
 //!     and the LOGITS sha (the kept rows') equal the plain greedy run's when a window row has a serial row's bits.
-//!     --mtp-prompt full|cache (with --mtp-draft; default full): the prompt's MTP pass as the whole MTP layer, or only
+//!     --mtp-prompt full|cache (with --mtp-draft; default cache, as the server): the prompt's MTP pass as the whole MTP layer, or only
 //!     its cache writes (Forward.mtpCache); prints MTP-PROMPT (rows, seconds) and MTP-CACHE, the sha256 of the MTP
 //!     layer's latent rows, index keys and gates, and pools after the pass (the same for both modes).
 //!     Prints the generated ids and sha256 of every logits row computed (the numerics=exact hash; the same for any R).
@@ -42,7 +42,7 @@ const usage =
     \\
 ;
 
-const Opts = struct { gen: usize = 16, chunk: usize = glm.state.prompt_rows, tf: bool = false, mtp: bool = false, seam: Seam = .{}, draft: ?usize = null, mtp_prompt: MtpPrompt = .full };
+const Opts = struct { gen: usize = 16, chunk: usize = glm.state.prompt_rows, tf: bool = false, mtp: bool = false, seam: Seam = .{}, draft: ?usize = null, mtp_prompt: MtpPrompt = .cache };
 
 /// --mtp-prompt: the prompt's MTP pass through the whole MTP layer, or through its cache writes only.
 const MtpPrompt = enum { full, cache };
@@ -74,7 +74,7 @@ fn opts(args: []const [:0]const u8) !Opts {
         if (o.seam.window > glm.state.window_rows or o.seam.keep == 0 or o.seam.keep > o.seam.window) return error.BadWindowKeep;
     }
     if (o.draft) |d| if (d > fwd.Forward.max_drafts or o.mtp or o.seam.from != null) return error.BadMtpDraft;
-    if (o.mtp_prompt != .full and o.draft == null) return error.MtpPromptWithoutDraft;
+    if (o.mtp_prompt != .cache and o.draft == null) return error.MtpPromptWithoutDraft;
     return o;
 }
 
@@ -102,7 +102,7 @@ const Run = struct {
     keep_us: [glm.state.window_rows + 1]f64 = @splat(0),
     keep_n: [glm.state.window_rows + 1]usize = @splat(0),
     /// --mtp-prompt
-    mtp_prompt: MtpPrompt = .full,
+    mtp_prompt: MtpPrompt = .cache,
 
     fn now(io: std.Io) f64 {
         return @as(f64, @floatFromInt(std.Io.Timestamp.now(io, .awake).nanoseconds)) / 1e9;
