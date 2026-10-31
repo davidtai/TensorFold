@@ -70,7 +70,8 @@ pub fn run(o: Ops, e: Experts, x: u64, x_stride: usize, plan: Plan, rows: usize,
     const z = try o.arena.of(f32, @max(2 * sk[0] * e.width, sk[1] * e.dims) * pairs);
     try launch.rotate(l, x, x_stride, plan.pick, e.suh_g, e.suh_u, xg, xu, if (shx) rows else pairs, e.dims, slots, e.count, !shx, s);
     const gu: launch.Product = .{ .x0 = xg, .x1 = xu, .x_div = if (shx) slots else 1, .tp0 = e.gate, .tp1 = e.up, .mats = 2, .items = plan.items, .count = plan.count, .members = plan.members, .z = z, .k = e.dims, .n = e.width, .pairs = pairs, .experts = e.count };
-    if (gemm) try launch.gemm(l, gu, s) else try launch.gemv(l, gu, sk[0], @min(plan.tile, pairs), s);
+    // an item holds at most one pair a row (a row picks an expert once): the window's rows bound its members
+    if (gemm) try launch.gemm(l, gu, s) else try launch.gemv(l, gu, sk[0], @min(plan.tile, rows), s);
     try launch.gateup(l, z, plan.pick, e.svh_g, e.svh_u, e.suh_d, xd, pairs, e.width, sk[0], e.count, e.limit, s);
     var dn = gu;
     dn.x0 = xd;
@@ -82,7 +83,7 @@ pub fn run(o: Ops, e: Experts, x: u64, x_stride: usize, plan: Plan, rows: usize,
     dn.k = e.width;
     dn.n = e.dims;
     if (gemm) return launch.gemmDown(l, dn, e.svh_d, y, s); // the down epilogue fused: the same bits, no z round trip
-    try launch.gemv(l, dn, sk[1], @min(plan.tile, pairs), s);
+    try launch.gemv(l, dn, sk[1], @min(plan.tile, rows), s);
     try launch.down(l, z, plan.pick, e.svh_d, y, pairs, e.dims, sk[1], e.count, s);
 }
 

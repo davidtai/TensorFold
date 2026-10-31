@@ -207,13 +207,29 @@ __device__ void gemv(const uint16_t* X0, const uint16_t* X1, int x_div, const ui
     }
 }
 
+// tf_exl3_gemv_<MR>: a block takes the smallest row pass that holds its item (1, 2, 4, then MR): an item of one member
+// in a launch of 4-row windows dots one staged row, not four. A row's sums do not depend on the pass (above), so the
+// bytes are the same at every choice. The launch's LDS is the MR pass's (the largest).
+template <int K2, int CB, int MR>
+__device__ void gemv_fit(const uint16_t* X0, const uint16_t* X1, int x_div, const uint64_t* tp0, const uint64_t* tp1,
+                         const int* items, const int* members, float* z, int k, int n, int pairs, int sk, int experts) {
+    const int count = items[3 * blockIdx.y + 2];
+    if constexpr (MR > 1)
+        if (count <= 1) return gemv<K2, CB, 1>(X0, X1, x_div, tp0, tp1, items, members, z, k, n, pairs, sk, experts);
+    if constexpr (MR > 2)
+        if (count <= 2) return gemv<K2, CB, 2>(X0, X1, x_div, tp0, tp1, items, members, z, k, n, pairs, sk, experts);
+    if constexpr (MR > 4)
+        if (count <= 4) return gemv<K2, CB, 4>(X0, X1, x_div, tp0, tp1, items, members, z, k, n, pairs, sk, experts);
+    gemv<K2, CB, MR>(X0, X1, x_div, tp0, tp1, items, members, z, k, n, pairs, sk, experts);
+}
+
 }  // namespace
 
 #define TF_EXL3_GEMV(MR_)                                                                                            \
     extern "C" __global__ void __launch_bounds__(256) tf_exl3_gemv_##MR_(                                            \
         const uint16_t* X0, const uint16_t* X1, int x_div, const uint64_t* tp0, const uint64_t* tp1, const int* items, \
         const int* members, float* z, int k, int n, int pairs, int sk, int experts) {                                \
-        gemv<8, kMcg, MR_>(X0, X1, x_div, tp0, tp1, items, members, z, k, n, pairs, sk, experts);                    \
+        gemv_fit<8, kMcg, MR_>(X0, X1, x_div, tp0, tp1, items, members, z, k, n, pairs, sk, experts); \
     }
 TF_EXL3_GEMV(1)
 TF_EXL3_GEMV(2)

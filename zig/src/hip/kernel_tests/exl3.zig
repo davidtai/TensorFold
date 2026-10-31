@@ -687,6 +687,59 @@ test "EXL3 routed experts, contract 7: a row's prompt slots in a 2,048-row chunk
     std.debug.print("RESULT EXL3 contract 7 (prompt): {d} rows in 1-16-row windows byte-equal to the 2,048-row chunk\n", .{compared});
 }
 
+/// Code contract 7 on the decode path (the GEMV at a window's rows, its pass fitted to each item): a row's routed slots
+/// in windows of 1-4 and 8 rows, at several places among other rows, equal its slots as a 1-row window (the 1-row pass).
+fn decodeRowInvariance(t: *Rig, rng: *rig.Rng, name: []const u8, d: *const Dev, experts: usize) !usize {
+    const D = d.e.dims;
+    const rows = 24;
+    const x = try inputs(rng, rows * D);
+    defer gpa.free(x);
+    const pk = try picks(rng, rows, experts);
+    defer gpa.free(pk);
+    // each row alone: the reference bytes
+    const alone_all = try gpa.alloc(f32, rows * slots * D);
+    defer gpa.free(alone_all);
+    for (0..rows) |r| {
+        const one = try run(t, d, x[r * D ..][0..D], pk[r * slots ..][0..slots], 1, 8, false);
+        defer gpa.free(one);
+        @memcpy(alone_all[r * slots * D ..][0 .. slots * D], one);
+    }
+    var compared: usize = 0;
+    for ([_]usize{ 1, 2, 3, 4, 8 }) |w| {
+        for ([_]usize{ 0, 5, 13, rows - w }) |r0| {
+            const got = try run(t, d, x[r0 * D ..][0 .. w * D], pk[r0 * slots ..][0 .. w * slots], w, 8, false);
+            defer gpa.free(got);
+            for (0..w) |i| {
+                const row = r0 + i;
+                const want = std.mem.sliceAsBytes(alone_all[row * slots * D ..][0 .. top_k * D]);
+                const mine = std.mem.sliceAsBytes(got[i * slots * D ..][0 .. top_k * D]);
+                try rig.expect(std.mem.eql(u8, mine, want), "{s}: row {d} in a {d}-row window at {d} differs from the row alone", .{ name, row, w, r0 });
+                compared += 1;
+            }
+        }
+    }
+    return compared;
+}
+
+test "EXL3 routed experts, contract 7: a row's decode slots in 1-4- and 8-row windows equal its slots alone" {
+    const t = try Rig.open(256 << 20);
+    defer t.close();
+    var rng: rig.Rng = .{ .state = 0xC7D };
+    var compared: usize = 0;
+    // 12 or 9 experts, top-8: the windows' items hold 1-8 members, so every fitted pass runs (9 also at GLM's shape)
+    for ([_]Shape{ .{ .experts = 12, .dims = 512, .width = 256 }, .{ .experts = 9, .dims = 512, .width = 256 }, .{ .experts = 9, .dims = 4096, .width = 2048 } }) |sh| {
+        if (sh.dims > 512 and heavySkipped()) continue;
+        var h = try synthetic(&rng, sh, true);
+        defer h.deinit();
+        var d = try Dev.init(t, &h);
+        defer d.deinit();
+        var name_buf: [64]u8 = undefined;
+        const name = try std.fmt.bufPrint(&name_buf, "EXL3 contract 7 decode, {d} experts, D {d}", .{ sh.experts, sh.dims });
+        compared += try decodeRowInvariance(t, &rng, name, &d, sh.experts);
+    }
+    std.debug.print("RESULT EXL3 contract 7 (decode): {d} rows in 1-4- and 8-row windows byte-equal to the row alone\n", .{compared});
+}
+
 /// TF_GLM_DIR: a GLM-5.3-Flash EXL3 4 bpw checkpoint (Mia-AiLab's); the real-weight tests are skipped when unset, and in
 /// a Debug build (hip-kernel-test), where their float64 references take many minutes (hip-glm-kernel-test is ReleaseSafe).
 fn checkpointDir() ?[]const u8 {
