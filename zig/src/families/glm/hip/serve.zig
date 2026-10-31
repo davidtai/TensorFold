@@ -136,6 +136,13 @@ fn bf16(v: f32) u16 {
     return @intCast((b + 0x7fff + ((b >> 16) & 1)) >> 16);
 }
 
+/// Whether `r` is drawn on the device (lane F's `greedy`: head, argmax, one 4-byte id a row): a greedy row with no
+/// mask and no kept logits. Any other row downloads its logits and is drawn by `drawRow` on the host.
+fn onDevice(r: draw.Request) bool {
+    const greedy = if (r.sampling) |x| x.temperature <= 0 else true;
+    return greedy and r.mask.len == 0 and r.keep == null;
+}
+
 /// The token of one fp32 logits row per `r`: greedy is the first maximum (ties to the lower id, lane F's rule); a
 /// sampled row is drawn among the whole vocabulary in float64; a mask leaves only its allowed ids.
 pub fn drawRow(gpa: std.mem.Allocator, row: []const f32, r: draw.Request) !u32 {
@@ -317,12 +324,18 @@ pub const Hip = struct {
         const e = h.e;
         const n = prompt.len - from;
         try e.fp.run(&l.st, prompt[from..]);
-        const lg = try e.fp.head(e.fp.b.fnormed + (n - 1) * D * 2, 1);
-        try e.fp.download(f32, lg, e.row);
-        if (req.keep) |k| for (k, e.row) |*x, v| {
-            x.* = bf16(v);
-        };
-        const token = try drawRow(h.gpa, e.row, req);
+        const last = e.fp.b.fnormed + (n - 1) * D * 2;
+        var token: u32 = undefined;
+        if (onDevice(req)) {
+            try e.fp.greedy(last, 1, (&token)[0..1]);
+        } else {
+            const lg = try e.fp.head(last, 1);
+            try e.fp.download(f32, lg, e.row);
+            if (req.keep) |k| for (k, e.row) |*x, v| {
+                x.* = bf16(v);
+            };
+            token = try drawRow(h.gpa, e.row, req);
+        }
         if (l.mtp) {
             // the last row is the first draft's to absorb (with the token just drawn); the rest go through now
             try copy(e, l.hidden.base(), e.fp.b.fnormed + (n - 1) * D * 2, D * 2);
@@ -336,8 +349,9 @@ pub const Hip = struct {
     pub fn keepCut(_: *Hip, _: *Lane, _: []const u32, _: usize) !void {}
 
     /// Each stream's window from its kept length, one forward a stream: the pending token and its drafts, each row
-    /// drawn per its request. A drafting stream's window is held (lane F's `window`) until its keep; its final-normed
-    /// rows are kept for the next draft. Another stream's window is the serial forward's one row.
+    /// drawn per its request (all greedy and unmasked: on the device, one id a row downloaded; else on the host). A
+    /// drafting stream's window is held (lane F's `window`) until its keep; its final-normed rows are kept for the next
+    /// draft. Another stream's window is the serial forward's one row.
     pub fn verify(h: *Hip, ws: []const be.Window, out: []be.Verified) !void {
         const e = h.e;
         for (ws, out) |w, *o| {
@@ -357,10 +371,17 @@ pub const Hip = struct {
                 try e.fd.run(&l.st, toks[0..n]);
             }
             l.windowed = l.mtp;
-            const lg = try e.fd.head(e.fd.b.fnormed, n);
-            for (0..n) |r| {
-                try e.fd.download(f32, lg + r * V * 4, e.row);
-                o.sampled[r] = try drawRow(h.gpa, e.row, reqs[r]);
+            const device = for (reqs[0..n]) |r| {
+                if (!onDevice(r)) break false;
+            } else true;
+            if (device) {
+                try e.fd.greedy(e.fd.b.fnormed, n, o.sampled[0..n]);
+            } else {
+                const lg = try e.fd.head(e.fd.b.fnormed, n);
+                for (0..n) |r| {
+                    try e.fd.download(f32, lg + r * V * 4, e.row);
+                    o.sampled[r] = try drawRow(h.gpa, e.row, reqs[r]);
+                }
             }
             @memcpy(o.drafts, toks[1..n]);
             l.pending = .{ .rows = n };
@@ -434,4 +455,14 @@ test "glm serve: bf16 of a logit rounds to nearest even" {
 
 test {
     _ = load;
+}
+
+test "glm serve: only a greedy, unmasked row without kept logits is drawn on the device" {
+    try std.testing.expect(onDevice(.{ .sampling = null, .position = 0 }));
+    try std.testing.expect(onDevice(.{ .sampling = .{ .seed = 1, .temperature = 0, .top_k = 0, .top_p = 1 }, .position = 0 }));
+    try std.testing.expect(!onDevice(.{ .sampling = .{ .seed = 1, .temperature = 0.7, .top_k = 0, .top_p = 1 }, .position = 0 }));
+    const mask = [_]u32{1};
+    try std.testing.expect(!onDevice(.{ .sampling = null, .position = 0, .mask = &mask }));
+    var kept: [4]u16 = undefined;
+    try std.testing.expect(!onDevice(.{ .sampling = null, .position = 0, .keep = &kept }));
 }
