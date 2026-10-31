@@ -403,15 +403,20 @@ pub const Forward = struct {
     /// the main model's final-normed rows, `next` each row's next token. The shared_head-normed rows in b.fnormed (the
     /// head's input: the BF16 lm_head, D-2; no 4-bit draft copy).
     pub fn mtp(f: *Forward, st: *State, next: []const u32, hin: u64) !void {
-        const n = next.len;
+        if (next.len == 0 or next.len > f.b.rows) return error.BadWindow;
+        try f.upload(f.b.ids, std.mem.sliceAsBytes(next));
+        try f.mtpAt(st, f.b.ids, next.len, hin);
+    }
+
+    /// mtp of `n` rows whose next tokens are already on the device (i32 [n] at `ids`: a draft's greedy picks).
+    fn mtpAt(f: *Forward, st: *State, ids: u64, n: usize, hin: u64) !void {
         const b = f.b;
         const cfg = f.cfg;
         const t = f.w.mtp;
         const ly = t.layer;
         if (n == 0 or n > b.rows) return error.BadWindow;
         try st.readyMtp(f.s, n);
-        try f.upload(b.ids, std.mem.sliceAsBytes(next));
-        try glue.embed(f.l, c(b.ids), c(f.w.embed), m(b.me), int(n), int(D), 1, f.s);
+        try glue.embed(f.l, c(ids), c(f.w.embed), m(b.me), int(n), int(D), 1, f.s);
         if (st.mtp_len == 0) try hip.runtime.check(f.l.r.api.hipMemsetAsync(m(b.me), 0, D * 2, f.s)); // position 0's embedding
         try glue.rms(f.l, c(b.me), @intCast(D), c(t.enorm), m(b.mcat), @intCast(2 * D), int(n), int(D), cfg.eps, f.s);
         try glue.rms(f.l, c(hin), @intCast(D), c(t.hnorm), m(b.mcat + D * 2), @intCast(2 * D), int(n), int(D), cfg.eps, f.s);
@@ -437,9 +442,11 @@ pub const Forward = struct {
 
     /// decode.draft (cuda_engine.zig draft): the MTP layer absorbs the pairs (row j of `hin`, bf16 [rows][D] the main
     /// model's final-normed rows; follow[j], the token after it) at mtp_len, then chains `depth` greedy drafts from the
-    /// last pair into `out` (the BF16 lm_head's top-1, ties to the lower id); returns depth. The draft steps' MTP rows
-    /// are not kept: mtp_len ends at the absorbed rows, and the next absorb rewrites them. On buffers of its own
-    /// (decode, rows >= follow.len): `hin` is usually the window's b.fnormed. Needs mtp_len + follow.len = st.pos.
+    /// last pair into `out` (the BF16 lm_head's greedy pick, `argmax`); returns depth. The chain stays on the device:
+    /// each pick is the next step's token without a host copy, and the picks come back in one download at the end. The
+    /// draft steps' MTP rows are not kept: mtp_len ends at the absorbed rows, and the next absorb rewrites them. On
+    /// buffers of its own (decode, rows >= follow.len): `hin` is usually the window's b.fnormed. Needs
+    /// mtp_len + follow.len = st.pos.
     pub fn draft(f: *Forward, st: *State, hin: u64, follow: []const u32, depth: usize, out: []u32) !usize {
         if (f.b.prompt or depth > max_drafts or depth > out.len) return error.BadDraft;
         if (st.mtp_len + follow.len != st.pos) return error.MtpOutOfStep;
@@ -453,29 +460,39 @@ pub const Forward = struct {
         if (depth == 0) return 0;
         if (follow.len == 0) return error.BadDraft;
         const kept = st.mtp_len;
-        const lg = try f.host.alloc(f32, V);
-        defer f.host.free(lg);
         for (0..depth) |j| {
-            out[j] = try f.top1(last, lg);
+            const id = f.b.drawn + j * 4;
+            try f.argmax(try f.head(last, 1), 1, id);
             if (j + 1 < depth) {
-                try f.mtp(st, out[j..][0..1], last);
+                try f.mtpAt(st, id, 1, last);
                 last = f.b.fnormed;
             }
         }
+        var ids: [max_drafts]i32 = undefined;
+        try f.download(i32, f.b.drawn, ids[0..depth]);
+        for (ids[0..depth], out[0..depth]) |id, *o| o.* = if (id < 0) return error.NoGreedyToken else @intCast(id);
         try st.setMtpLen(f.s, kept);
         return depth;
     }
 
-    /// The greedy pick of one final-normed bf16 row at `x`: lm_head's fp32 row, its first largest value (ties to the
-    /// lower id, as dump.top8's first).
-    pub fn top1(f: *Forward, x: u64, lg: []f32) !u32 {
-        const at = try f.head(x, 1);
-        try f.download(f32, at, lg[0..V]);
-        var best: usize = 0;
-        for (lg[0..V], 0..) |v, i| if (v > lg[best]) {
-            best = i;
-        };
-        return @intCast(best);
+    /// The greedy pick of `rows` fp32 logits rows at `logits` (head's output) into device i32 `out`, as serve.zig
+    /// drawRow's greedy: the first largest value, NaNs skipped (-1 for a row of NaNs), -0 = +0. No host copy; the parts'
+    /// scratch from the arena after the head's logits.
+    pub fn argmax(f: *Forward, logits: u64, rows: usize, out: u64) !void {
+        const P = state.draw_parts;
+        const pv = try f.b.arena.of(f32, rows * P);
+        const pi = try f.b.arena.of(i32, rows * P);
+        try f.l.tf_argmax_f32(c(logits), int(rows), int(V), state.draw_per, int(P), m(pv), mi(pi), mi(out), f.s);
+    }
+
+    /// lm_head and the greedy pick of `rows` (at most state.window_rows) final-normed rows at `x` into `out`: one
+    /// rows x 4-byte download, not the rows' logits.
+    pub fn greedy(f: *Forward, x: u64, rows: usize, out: []u32) !void {
+        if (rows == 0 or rows > @min(f.b.rows, state.window_rows) or out.len < rows) return error.BadWindow;
+        try f.argmax(try f.head(x, rows), rows, f.b.drawn);
+        var ids: [state.window_rows]i32 = undefined;
+        try f.download(i32, f.b.drawn, ids[0..rows]);
+        for (ids[0..rows], out[0..rows]) |id, *o| o.* = if (id < 0) return error.NoGreedyToken else @intCast(id);
     }
 
     // ---- TF_GLM_DUMP (inert when `seq` is null) ----

@@ -148,6 +148,8 @@ pub const Launcher = struct {
         argmax: Function,
         argmax_part: Function,
         argmax_join: Function,
+        argmax_f32_part: Function,
+        argmax_f32_join: Function,
         topk: Function,
         topk_part: Function,
         topk_join: Function,
@@ -228,6 +230,8 @@ pub const Launcher = struct {
             .argmax = try ops.function("tf_argmax"),
             .argmax_part = try ops.function("tf_argmax_part"),
             .argmax_join = try ops.function("tf_argmax_join"),
+            .argmax_f32_part = try ops.function("tf_argmax_f32_part"),
+            .argmax_f32_join = try ops.function("tf_argmax_f32_join"),
             .topk = try ops.function("tf_topk"),
             .topk_part = try ops.function("tf_topk_part"),
             .topk_join = try ops.function("tf_topk_join"),
@@ -363,6 +367,7 @@ pub const Launcher = struct {
     pub const tf_kv_write_at = attention.tf_kv_write_at;
     pub const tf_argmax_rows = draw.tf_argmax_rows;
     pub const tf_argmax_parts = draw.tf_argmax_parts;
+    pub const tf_argmax_f32 = draw.tf_argmax_f32;
     pub const tf_topk_rows = draw.tf_topk_rows;
     pub const tf_topk_parts = draw.tf_topk_parts;
     pub const tf_add_wide = tp.tf_add_wide;

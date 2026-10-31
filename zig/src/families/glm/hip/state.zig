@@ -234,9 +234,10 @@ pub const Buffers = struct {
     me: u64, // bf16 [rows][D]: the next tokens' embedding
     mcat: u64, // bf16 [rows][2 D]: [enorm(me) | hnorm(hin)]
     mx: u64, // bf16 [rows][D]: the MTP layer's residual
+    drawn: u64, // i32 [rows + 3]: the greedy picks on the device (Forward.argmax: a window's rows, a draft's chain)
 
     fn fixed(rows: usize) [15]usize {
-        return .{ rows * 4, rows * 4 * D * 2, rows * D * 2, rows * 4 * 4, rows * 16 * 4, hip.launches.glm.hcPartBytes(rows), rows * D * 4, rows * D * 2, rows * D * 2, rows * D * 2, rows * D * 2, rows * 2 * D * 2, rows * D * 2, 0, 0 };
+        return .{ rows * 4, rows * 4 * D * 2, rows * D * 2, rows * 4 * 4, rows * 16 * 4, hip.launches.glm.hcPartBytes(rows), rows * D * 4, rows * D * 2, rows * D * 2, rows * D * 2, rows * D * 2, rows * 2 * D * 2, rows * D * 2, (rows + 3) * 4, 0 };
     }
 
     /// Buffers for windows of up to `rows` rows (`prompt`: prompt chunks on the WMMA tiles) of a stream of `capacity`.
@@ -253,7 +254,7 @@ pub const Buffers = struct {
         for (f, &p) |n, *x| x.* = c.take(n);
         var arena = try hip.Arena.init(r, scratchBytes(rows, prompt, capacity));
         errdefer arena.deinit();
-        return .{ .buf = buf, .arena = arena, .rows = rows, .prompt = prompt, .ids = p[0], .x = p[1], .normed = p[2], .post = p[3], .comb = p[4], .hcpart = p[5], .part = p[6], .hidden = p[7], .fnormed = p[8], .hin = p[9], .me = p[10], .mcat = p[11], .mx = p[12] };
+        return .{ .buf = buf, .arena = arena, .rows = rows, .prompt = prompt, .ids = p[0], .x = p[1], .normed = p[2], .post = p[3], .comb = p[4], .hcpart = p[5], .part = p[6], .hidden = p[7], .fnormed = p[8], .hin = p[9], .me = p[10], .mcat = p[11], .mx = p[12], .drawn = p[13] };
     }
 
     pub fn deinit(b: *Buffers) void {
@@ -265,6 +266,10 @@ pub const Buffers = struct {
 
 /// The vocabulary rows the head writes a call: logits fp32 [head_rows][V] in the arena.
 pub const head_rows = 256;
+/// The greedy pick's parts of a vocabulary row (Forward.argmax): 1,024 values each, their best values and ids in the
+/// arena after the head's logits.
+pub const draw_per = 1024;
+pub const draw_parts = (c0.vocab + draw_per - 1) / draw_per;
 /// Rows a dense or listed attention call takes, and a pool-score block (cuda_dsa_block.zig prompt_att_rows).
 pub const att_rows = 512;
 /// Attention parts a row may need: 2,051 keys at most (dense under the limit, or a listed row) in parts of 512.
@@ -291,7 +296,7 @@ pub fn scratchBytes(rows: usize, prompt: bool, capacity: usize) usize {
     const moe = R * E * 4 + 2 * pairs * 4 + pairs * 4 + 3 * (@min(pairs, E + 1) + pairs) * 4 +
         hip.Launcher.routeScratch(pairs, E + 1) + pairs * D * 4 + x3 + (if (prompt) R * 2 * c0.shared_inter * 4 else 0) +
         R * c0.shared_inter * 2 + R * D * 4;
-    const head = @as(usize, @min(R, head_rows)) * V * 4;
+    const head = @as(usize, @min(R, head_rows)) * (V * 4 + draw_parts * 8);
     return @max(@max(kda, dsa), @max(@max(dense, moe), head)) + (64 << 10);
 }
 
