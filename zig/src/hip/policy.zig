@@ -11,8 +11,7 @@ pub const Attention = enum { auto, f32 };
 pub const Pick = enum { auto, reference };
 
 /// Where a single rank reads host-held row tables (Flash Next's n-gram rows) from: a copy in anonymous memory made at
-/// load (a round never faults, and reclaim cannot take it without swap), or the checkpoint's mapping: no readahead, and
-/// a gather asks for its rows' pages before it copies them (the tables then stay on disk, cached in the page cache).
+/// load (a round never faults, and reclaim cannot take it without swap), or the checkpoint's mapping as it is.
 pub const Rows = enum { resident, mapped };
 
 /// Which kernels may change a result's bits: `exact` runs only the kernels whose output bytes equal the reference path's
