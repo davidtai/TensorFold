@@ -1,5 +1,5 @@
 //! tf-glm-hip-test forward: GLM-5.3-Flash's eager forward (zig/src/families/glm/hip/forward.zig) on a whole checkpoint.
-//!   forward <checkpoint> <ids.u32> [--gen N] [--chunk R] [--tf] [--mtp] [--mtp-draft d]
+//!   forward <checkpoint> <ids.u32> [--gen N] [--chunk R] [--tf] [--mtp] [--mtp-draft d] [--device-draw]
 //!           [--decode-from P [--decode-to E [--resume-mark]] [--window W --keep K]]
 //!     ids.u32: uint32 little-endian token ids (G5's <prompt>/ids.u32). The prompt in chunks of R rows (default
 //!     2,048), then N greedy tokens (default 16; the first from the last prompt row), ties to the lower id.
@@ -17,6 +17,8 @@
 //!     --mtp-draft d: greedy decode in MTP rounds (Forward.draft, window, keep): d drafts (at most 3) from the MTP
 //!     layer, the pending token and the drafts in one window, the rows up to the first rejected draft kept. The ids
 //!     and the LOGITS sha (the kept rows') equal the plain greedy run's when a window row has a serial row's bits.
+//!     --device-draw: the decode picks (serial steps, verify windows) on the device (Forward.greedy): one 4-byte id a
+//!     row comes back, not its logits, so the LOGITS sha covers the prompt rows only; the ids must equal the host's.
 //!     Prints the generated ids and sha256 of every logits row computed (the numerics=exact hash; the same for any R).
 //!   forward <checkpoint> - [--chunk R]   with TF_GLM_DUMP and TF_GLM_DUMP_REF set: every prompt of the reference
 //!     run, as run_ref.py runs it (teacher-forced prompt, greedy gen, the MTP pass), dumped in G5-ref.md section 4's
@@ -34,12 +36,12 @@ const V: usize = dump.V;
 
 const usage =
     \\usage: tf-glm-hip-test forward <checkpoint> <ids.u32 | -> [--gen N] [--chunk R] [--tf] [--mtp]
-    \\       [--mtp-draft d] [--decode-from P [--decode-to E [--resume-mark]] [--window W --keep K]]
+    \\       [--mtp-draft d] [--device-draw] [--decode-from P [--decode-to E [--resume-mark]] [--window W --keep K]]
     \\       (ids "-": the prompts of TF_GLM_DUMP_REF, dumped into TF_GLM_DUMP)
     \\
 ;
 
-const Opts = struct { gen: usize = 16, chunk: usize = glm.state.prompt_rows, tf: bool = false, mtp: bool = false, seam: Seam = .{}, draft: ?usize = null };
+const Opts = struct { gen: usize = 16, chunk: usize = glm.state.prompt_rows, tf: bool = false, mtp: bool = false, seam: Seam = .{}, draft: ?usize = null, device: bool = false };
 
 /// The prompt/decode seam test's cuts (all null: the plain run); `window` > 0: the decode rows in verify windows.
 const Seam = struct { from: ?usize = null, to: ?usize = null, mark: bool = false, window: usize = 0, keep: usize = 0 };
@@ -49,7 +51,7 @@ fn opts(args: []const [:0]const u8) !Opts {
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         const a = args[i];
-        if (std.mem.eql(u8, a, "--tf")) o.tf = true else if (std.mem.eql(u8, a, "--mtp")) o.mtp = true else if (std.mem.eql(u8, a, "--resume-mark")) o.seam.mark = true else {
+        if (std.mem.eql(u8, a, "--tf")) o.tf = true else if (std.mem.eql(u8, a, "--mtp")) o.mtp = true else if (std.mem.eql(u8, a, "--resume-mark")) o.seam.mark = true else if (std.mem.eql(u8, a, "--device-draw")) o.device = true else {
             if (i + 1 >= args.len) return error.MissingArgument;
             const v = try std.fmt.parseInt(usize, args[i + 1], 10);
             if (std.mem.eql(u8, a, "--gen")) o.gen = v else if (std.mem.eql(u8, a, "--chunk")) o.chunk = v else if (std.mem.eql(u8, a, "--decode-from")) o.seam.from = v else if (std.mem.eql(u8, a, "--decode-to")) o.seam.to = v else if (std.mem.eql(u8, a, "--window")) o.seam.window = v else if (std.mem.eql(u8, a, "--keep")) o.seam.keep = v else if (std.mem.eql(u8, a, "--mtp-draft")) o.draft = v else return error.UnknownOption;
@@ -90,6 +92,8 @@ const Run = struct {
     /// Forward.keep's time by kept rows (host-timed between stream syncs), microseconds.
     keep_us: [glm.state.window_rows + 1]f64 = @splat(0),
     keep_n: [glm.state.window_rows + 1]usize = @splat(0),
+    /// --device-draw: the decode picks by Forward.greedy (no logits rows to the host).
+    device: bool = false,
 
     fn now(io: std.Io) f64 {
         return @as(f64, @floatFromInt(std.Io.Timestamp.now(io, .awake).nanoseconds)) / 1e9;
@@ -302,15 +306,17 @@ fn mtpRounds(a: std.mem.Allocator, io: std.Io, run: *Run, q: *Seq, d: usize) !vo
         fv.row0 = row;
         try fv.window(&run.st, ids[0..R]);
         try run.keep(fv, row, R);
-        const lg = try fv.head(fv.b.fnormed, R);
-        try fv.download(f32, lg, run.logits[0 .. R * V]);
-        for (0..R) |r| out[r] = @intCast(dump.top8(run.logits[r * V ..][0..V]).ids[0]);
+        if (run.device) try fv.greedy(fv.b.fnormed, R, out[0..R]) else {
+            const lg = try fv.head(fv.b.fnormed, R);
+            try fv.download(f32, lg, run.logits[0 .. R * V]);
+            for (0..R) |r| out[r] = @intCast(dump.top8(run.logits[r * V ..][0..V]).ids[0]);
+        }
         var kept: usize = 1;
         while (kept < R and out[kept - 1] == drafts[kept - 1]) kept += 1;
         try keepTimed(run, io, kept);
         for (0..kept) |r| {
             if (q.gen.items.len >= q.max_gen or q.isEos(q.gen.items[q.gen.items.len - 1])) break;
-            run.hash.update(std.mem.sliceAsBytes(run.logits[r * V ..][0..V]));
+            if (!run.device) run.hash.update(std.mem.sliceAsBytes(run.logits[r * V ..][0..V]));
             try q.gen.append(a, out[r]);
         }
         rounds += 1;
@@ -352,7 +358,11 @@ fn runSeq(a: std.mem.Allocator, io: std.Io, run: *Run, q: *Seq, chunk: usize, mt
         run.fd.row0 = row;
         try run.fd.run(&run.st, q.gen.items[q.gen.items.len - 1 ..]);
         try run.keep(&run.fd, row, 1);
-        try run.heads(&run.fd, run.fd.b.fnormed, 1, Greedy{ .q = q, .a = a }, Greedy.each);
+        if (run.device) {
+            var id: [1]u32 = undefined;
+            try run.fd.greedy(run.fd.b.fnormed, 1, &id);
+            try q.gen.append(a, id[0]);
+        } else try run.heads(&run.fd, run.fd.b.fnormed, 1, Greedy{ .q = q, .a = a }, Greedy.each);
     }
     try run.fd.sync();
     const t2 = Run.now(io);
@@ -458,6 +468,8 @@ pub fn command(init: std.process.Init, args: []const [:0]const u8) !void {
     std.debug.print("FORWARD context {d}: state {d:.3} GiB, prompt buffers {d:.3} GiB\n", .{ capacity, gib(State.bytes(capacity)), gib(rn.pb.arena.len + rn.pb.buf.len) });
     rn.fp = try fwd.Forward.init(&l, opened.model(), cfg, rn.s.handle, &rn.pb);
     rn.fd = try fwd.Forward.init(&l, opened.model(), cfg, rn.s.handle, &rn.db);
+    if (o.device and dumps != null) return error.DeviceDrawWithDump;
+    rn.device = o.device;
     // --window, --mtp-draft: the verify windows' and the MTP drafts' decode buffers
     var wb: ?Buffers = null;
     var mb: ?Buffers = null;

@@ -14,6 +14,7 @@ const config = @import("../config.zig");
 const weights = @import("weights.zig");
 const forward = @import("forward.zig");
 const state = @import("state.zig");
+const serve = @import("serve.zig");
 
 const fmt = core.exl3_format;
 const State = state.State;
@@ -1019,6 +1020,68 @@ test "glm fwd: decode windows of 2, 3, 4 and 8 rows = the same rows one at a tim
         }
         std.debug.print("RESULT {s}: 2, 3, 4 and 8 rows = one at a time, bit for bit\n", .{name});
     }
+}
+
+// ---- the greedy pick on the device (F-2) ----
+
+test "glm fwd: the device greedy pick (Forward.argmax) = serve.zig drawRow's greedy on fp32 rows with ties, NaNs, -0, infinities" {
+    const t = try Rig.open();
+    defer t.close();
+    const a = t.a();
+    const V: usize = (config.Config{}).vocab;
+    const nan = std.math.nan(f32);
+    const inf = std.math.inf(f32);
+    var rng: Rng = .{ .state = 0xd7a_3a1 };
+    const R = 11;
+    const rows = try a.alloc(f32, R * V);
+    for (rows) |*v| v.* = @floatCast(rng.normal());
+    const row = struct {
+        fn of(x: []f32, r: usize, n: usize) []f32 {
+            return x[r * n ..][0..n];
+        }
+    }.of;
+    // 1: the maximum twice, in parts 0 and 146: the lower id
+    row(rows, 1, V)[7] = 100;
+    row(rows, 1, V)[150000] = 100;
+    // 2: a tie across a part boundary (1,023 | 1,024)
+    row(rows, 2, V)[1023] = 50;
+    row(rows, 2, V)[1024] = 50;
+    // 3: a NaN at id 0 (a scan from id 0 must skip it), the maximum at 500
+    row(rows, 3, V)[0] = nan;
+    row(rows, 3, V)[500] = 60;
+    // 4: NaNs in every part, +inf twice
+    for (0..V / 1024) |q| row(rows, 4, V)[q * 1024 + 3] = nan;
+    row(rows, 4, V)[99999] = inf;
+    row(rows, 4, V)[120000] = inf;
+    // 5: every value -inf
+    @memset(row(rows, 5, V), -inf);
+    // 6: zeros, -0 first: -0 = +0, so id 0
+    @memset(row(rows, 6, V), 0);
+    row(rows, 6, V)[0] = -0.0;
+    // 7: every value NaN: no pick (drawRow refuses; the device writes -1)
+    @memset(row(rows, 7, V), nan);
+    // 8: the maximum at the last id; 9: one finite value among NaNs; 10: random (row 0 too)
+    row(rows, 8, V)[V - 1] = 70;
+    @memset(row(rows, 9, V), nan);
+    row(rows, 9, V)[77777] = -5;
+    const lg = try t.up(rows);
+    var b = try Buffers.init(&t.r, state.window_rows, false, 64);
+    defer b.deinit();
+    var f = try t.fwd(&b);
+    const out = try t.up(try a.alloc(i32, R));
+    try f.argmax(lg, R, out);
+    const got = try t.get(i32, out, R);
+    for (0..R) |r| {
+        const want: i32 = if (serve.drawRow(a, row(rows, r, V), .{ .sampling = null, .position = 0 })) |id| @intCast(id) else |err| switch (err) {
+            error.NoAllowedToken => -1,
+            else => return err,
+        };
+        if (got[r] != want) {
+            std.debug.print("FAIL glm fwd device greedy: row {d}: {d}, drawRow {d}\n", .{ r, got[r], want });
+            return error.TestExpectedEqual;
+        }
+    }
+    std.debug.print("RESULT glm fwd device greedy pick: {d} rows of {d} (ties within and across parts, NaN at 0 and in every part, +-inf, -0, all NaN) = drawRow's greedy\n", .{ R, V });
 }
 
 // ---- the DSA block on real weights, op by op (TF_GLM_DIR: the checkpoint; TF_GLM_FWD_DUMP: a TF_GLM_DUMP prompt dir) ----

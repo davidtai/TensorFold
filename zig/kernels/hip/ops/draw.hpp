@@ -118,6 +118,73 @@ extern "C" __global__ void __launch_bounds__(kPartThreads)
     if (threadIdx.x == 0) out[blockIdx.x] = si[0];
 }
 
+// The greedy pick of fp32 rows as a host scan for the first maximum (GLM serve.zig drawRow): a NaN never wins, then
+// the larger value, then the lower index (-0 and +0 equal). A row of NaNs gives -1.
+__device__ __forceinline__ bool first_max(float a, int ia, float b, int ib) {
+    if (a != a) return false;
+    if (b != b) return true;
+    return a > b || (a == b && ia < ib);
+}
+
+// The best of a block's candidates (value, index; index -1: none) by first_max into thread 0's.
+__device__ __forceinline__ void first_max_block(float top, int at, float* sv, int* si) {
+    sv[threadIdx.x] = top;
+    si[threadIdx.x] = at;
+    __syncthreads();
+    for (int stride = kPartThreads / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            int j = threadIdx.x + stride;
+            if (si[j] >= 0 && (si[threadIdx.x] < 0 || first_max(sv[j], si[j], sv[threadIdx.x], si[threadIdx.x]))) {
+                sv[threadIdx.x] = sv[j];
+                si[threadIdx.x] = si[j];
+            }
+        }
+        __syncthreads();
+    }
+}
+
+// first_max over part p of each fp32 row (`per` values of `n`): its best value and index.
+extern "C" __global__ void __launch_bounds__(kPartThreads)
+    tf_argmax_f32_part(const float* logits, int n, int per, float* part_v, int* part_i) {
+    const float* row = logits + static_cast<long long>(blockIdx.y) * n;
+    const int from = blockIdx.x * per, to = from + per < n ? from + per : n;
+    float top = 0.0f;
+    int at = -1;
+    for (int i = from + threadIdx.x; i < to; i += kPartThreads) {
+        const float v = row[i];
+        if (at < 0 || first_max(v, i, top, at)) {
+            top = v;
+            at = i;
+        }
+    }
+    __shared__ float sv[kPartThreads];
+    __shared__ int si[kPartThreads];
+    first_max_block(top, at, sv, si);
+    if (threadIdx.x == 0) {
+        part_v[blockIdx.y * gridDim.x + blockIdx.x] = sv[0];
+        part_i[blockIdx.y * gridDim.x + blockIdx.x] = si[0];
+    }
+}
+
+// The best of a row's `parts` candidates (tf_argmax_f32_part's): the row's id, -1 for a row of NaNs.
+extern "C" __global__ void __launch_bounds__(kPartThreads)
+    tf_argmax_f32_join(const float* part_v, const int* part_i, int parts, int* out) {
+    float top = 0.0f;
+    int at = -1;
+    for (int p = threadIdx.x; p < parts; p += kPartThreads) {
+        const float v = part_v[blockIdx.x * parts + p];
+        const int i = part_i[blockIdx.x * parts + p];
+        if (i >= 0 && (at < 0 || first_max(v, i, top, at))) {
+            top = v;
+            at = i;
+        }
+    }
+    __shared__ float sv[kPartThreads];
+    __shared__ int si[kPartThreads];
+    first_max_block(top, at, sv, si);
+    if (threadIdx.x == 0) out[blockIdx.x] = (si[0] < 0 || sv[0] != sv[0]) ? -1 : si[0];
+}
+
 // A monotone 16-bit key of a value's bits (-0 and +0 share one), so equal keys are equal values.
 __device__ __forceinline__ uint32_t order_key(uint16_t bits) {
     if (bits == 0x8000) bits = 0;
