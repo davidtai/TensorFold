@@ -263,6 +263,28 @@ pub const Forward = struct {
         try f.lin(out, w.o, R, b.part, false);
     }
 
+    /// The DSA block's cache writes for R rows of b.normed at pos (the block before its attention): xProj, kv_norm,
+    /// the index gate, the latent rows, the index keys and gates, the pools they complete. In the arena: dp (the xProj
+    /// rows) and lat. Each cache row depends on its own row only, so the MTP layer's cache-only prompt pass
+    /// (`mtpCache`) writes the bytes the whole block writes.
+    fn dsaCache(f: *Forward, cs: state.Caches, pos: u64, w: weights.Mla, R: usize) !struct { dp: u64, lat: u64 } {
+        const b = f.b;
+        const ar = &b.arena;
+        const cfg = f.cfg;
+        const X: usize = cfg.xProj(); // [q_a | kv_a | wk | weights_proj]
+        const ql: usize = cfg.q_lora;
+        const lw: usize = cfg.kv_lora;
+        const dp = try ar.of(u16, R * X);
+        const lat = try ar.of(u16, R * lw);
+        const igr = try ar.of(f32, R * cfg.i_dim);
+        try f.lin(b.normed, w.x, R, dp, true);
+        try glue.rms(f.l, c(dp + ql * 2), @intCast(X), c(w.kv_norm), m(lat), @intCast(lw), int(R), int(lw), cfg.eps, f.s);
+        try f.lin(b.normed, w.index.gate, R, igr, false);
+        try dsa.latentWrite(f.k, f.s, lat, lw, cs.lc, pos, 0, R);
+        try dsa.indexUpdate(f.k, f.s, dp + (ql + lw) * 2, X, igr, w.index.ln_w, w.index.ln_b, w.index.ape, cs.ik, cs.ig, cs.pk, pos, 0, R);
+        return .{ .dp = dp, .lat = lat };
+    }
+
     /// cuda_dsa_block.zig body + fill on cache set `cs` at device position `pos` (host_pos on the host): projections,
     /// norms, absorbed query, latent and index caches, dense or listed latent attention in 512-row calls, expand,
     /// o_proj into b.part fp32.
@@ -276,23 +298,18 @@ pub const Forward = struct {
         const ql: usize = cfg.q_lora;
         const lw: usize = cfg.kv_lora;
         const H = mla_heads;
-        const dp = try ar.of(u16, R * X);
+        const cached = try f.dsaCache(cs, pos, w, R);
+        const dp = cached.dp;
+        const lat = cached.lat;
         const qr = try ar.of(u16, R * ql);
-        const lat = try ar.of(u16, R * lw);
         const qq = try ar.of(u16, R * Q);
-        const igr = try ar.of(f32, R * cfg.i_dim);
         const qa = try ar.of(u16, R * H * lw);
         const ol = try ar.of(u16, R * H * lw);
         const vn = try ar.of(u16, R * H * cfg.v_dim);
-        try f.lin(b.normed, w.x, R, dp, true);
         try glue.rms(f.l, c(dp), @intCast(X), c(w.q_norm), m(qr), @intCast(ql), int(R), int(ql), cfg.eps, f.s);
-        try glue.rms(f.l, c(dp + ql * 2), @intCast(X), c(w.kv_norm), m(lat), @intCast(lw), int(R), int(lw), cfg.eps, f.s);
         try f.lin(qr, w.qr, R, qq, true);
-        try f.lin(b.normed, w.index.gate, R, igr, false);
         try dsa.absorbQ(f.k, f.s, qq, Q, dsa.kvKeys(w.kv_b.w), dsa.kv_head, qa, R, H);
-        try dsa.latentWrite(f.k, f.s, lat, lw, cs.lc, pos, 0, R);
         const wk_col = ql + lw; // the indexer's key rows, then its head weights, in the xProj rows
-        try dsa.indexUpdate(f.k, f.s, dp + wk_col * 2, X, igr, w.index.ln_w, w.index.ln_b, w.index.ape, cs.ik, cs.ig, cs.pk, pos, 0, R);
         // rows past the dense limit (2,051 keys) select their tokens; a window that has none attends densely
         const listed = host_pos + R - 1 >= cfg.keyWidth();
         const B: usize = @min(R, state.att_rows);
@@ -408,15 +425,7 @@ pub const Forward = struct {
         const cfg = f.cfg;
         const t = f.w.mtp;
         const ly = t.layer;
-        if (n == 0 or n > b.rows) return error.BadWindow;
-        try st.readyMtp(f.s, n);
-        try f.upload(b.ids, std.mem.sliceAsBytes(next));
-        try glue.embed(f.l, c(b.ids), c(f.w.embed), m(b.me), int(n), int(D), 1, f.s);
-        if (st.mtp_len == 0) try hip.runtime.check(f.l.r.api.hipMemsetAsync(m(b.me), 0, D * 2, f.s)); // position 0's embedding
-        try glue.rms(f.l, c(b.me), @intCast(D), c(t.enorm), m(b.mcat), @intCast(2 * D), int(n), int(D), cfg.eps, f.s);
-        try glue.rms(f.l, c(hin), @intCast(D), c(t.hnorm), m(b.mcat + D * 2), @intCast(2 * D), int(n), int(D), cfg.eps, f.s);
-        try f.lin(b.mcat, t.eh, n, b.mx, true);
-        try glue.rms(f.l, c(b.mx), @intCast(D), c(ly.in_norm), m(b.normed), @intCast(D), int(n), int(D), cfg.eps, f.s);
+        try f.mtpIn(st, next, hin);
         try f.dumpMtp(0, b.normed, true, n);
         try f.dsaBlock(st.mtp, st.mtp_pos_dev, st.mtp_len, ly.mixer.mla, n);
         try f.dumpMtp(1, b.part, false, n);
@@ -430,6 +439,34 @@ pub const Forward = struct {
         try f.dumpMtpStream(1, n);
         try glue.rms(f.l, c(b.mx), @intCast(D), c(t.norm), m(b.fnormed), @intCast(D), int(n), int(D), cfg.eps, f.s);
         try st.setMtpLen(f.s, st.mtp_len + n);
+    }
+
+    /// The MTP layer's input of `next.len` rows at mtp_len: embed, enorm and hnorm, eh_proj into b.mx (the residual),
+    /// in_norm into b.normed.
+    fn mtpIn(f: *Forward, st: *State, next: []const u32, hin: u64) !void {
+        const n = next.len;
+        const b = f.b;
+        const cfg = f.cfg;
+        const t = f.w.mtp;
+        if (n == 0 or n > b.rows) return error.BadWindow;
+        try st.readyMtp(f.s, n);
+        try f.upload(b.ids, std.mem.sliceAsBytes(next));
+        try glue.embed(f.l, c(b.ids), c(f.w.embed), m(b.me), int(n), int(D), 1, f.s);
+        if (st.mtp_len == 0) try hip.runtime.check(f.l.r.api.hipMemsetAsync(m(b.me), 0, D * 2, f.s)); // position 0's embedding
+        try glue.rms(f.l, c(b.me), @intCast(D), c(t.enorm), m(b.mcat), @intCast(2 * D), int(n), int(D), cfg.eps, f.s);
+        try glue.rms(f.l, c(hin), @intCast(D), c(t.hnorm), m(b.mcat + D * 2), @intCast(2 * D), int(n), int(D), cfg.eps, f.s);
+        try f.lin(b.mcat, t.eh, n, b.mx, true);
+        try glue.rms(f.l, c(b.mx), @intCast(D), c(t.layer.in_norm), m(b.normed), @intCast(D), int(n), int(D), cfg.eps, f.s);
+    }
+
+    /// The MTP layer's prompt pass, cache only: `mtp`'s rows up to its DSA block's cache writes (the latent rows, the
+    /// index keys and gates, the pools), then mtp_len + n. The drafts read only these caches of the prompt rows; the
+    /// rows' attention, MoE and b.fnormed are not computed, and the caches' bytes are `mtp`'s (fwd_test.zig).
+    pub fn mtpCache(f: *Forward, st: *State, next: []const u32, hin: u64) !void {
+        try f.mtpIn(st, next, hin);
+        f.b.arena.reset();
+        _ = try f.dsaCache(st.mtp, st.mtp_pos_dev, f.w.mtp.layer.mixer.mla, next.len);
+        try st.setMtpLen(f.s, st.mtp_len + next.len);
     }
 
     /// The most drafts a round chains (cuda_engine.zig max_drafts).

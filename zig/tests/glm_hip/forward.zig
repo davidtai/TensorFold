@@ -17,6 +17,9 @@
 //!     --mtp-draft d: greedy decode in MTP rounds (Forward.draft, window, keep): d drafts (at most 3) from the MTP
 //!     layer, the pending token and the drafts in one window, the rows up to the first rejected draft kept. The ids
 //!     and the LOGITS sha (the kept rows') equal the plain greedy run's when a window row has a serial row's bits.
+//!     --mtp-prompt full|cache (with --mtp-draft; default full): the prompt's MTP pass as the whole MTP layer, or only
+//!     its cache writes (Forward.mtpCache); prints MTP-PROMPT (rows, seconds) and MTP-CACHE, the sha256 of the MTP
+//!     layer's latent rows, index keys and gates, and pools after the pass (the same for both modes).
 //!     Prints the generated ids and sha256 of every logits row computed (the numerics=exact hash; the same for any R).
 //!   forward <checkpoint> - [--chunk R]   with TF_GLM_DUMP and TF_GLM_DUMP_REF set: every prompt of the reference
 //!     run, as run_ref.py runs it (teacher-forced prompt, greedy gen, the MTP pass), dumped in G5-ref.md section 4's
@@ -34,12 +37,15 @@ const V: usize = dump.V;
 
 const usage =
     \\usage: tf-glm-hip-test forward <checkpoint> <ids.u32 | -> [--gen N] [--chunk R] [--tf] [--mtp]
-    \\       [--mtp-draft d] [--decode-from P [--decode-to E [--resume-mark]] [--window W --keep K]]
+    \\       [--mtp-draft d [--mtp-prompt full|cache]] [--decode-from P [--decode-to E [--resume-mark]] [--window W --keep K]]
     \\       (ids "-": the prompts of TF_GLM_DUMP_REF, dumped into TF_GLM_DUMP)
     \\
 ;
 
-const Opts = struct { gen: usize = 16, chunk: usize = glm.state.prompt_rows, tf: bool = false, mtp: bool = false, seam: Seam = .{}, draft: ?usize = null };
+const Opts = struct { gen: usize = 16, chunk: usize = glm.state.prompt_rows, tf: bool = false, mtp: bool = false, seam: Seam = .{}, draft: ?usize = null, mtp_prompt: MtpPrompt = .full };
+
+/// --mtp-prompt: the prompt's MTP pass through the whole MTP layer, or through its cache writes only.
+const MtpPrompt = enum { full, cache };
 
 /// The prompt/decode seam test's cuts (all null: the plain run); `window` > 0: the decode rows in verify windows.
 const Seam = struct { from: ?usize = null, to: ?usize = null, mark: bool = false, window: usize = 0, keep: usize = 0 };
@@ -49,7 +55,11 @@ fn opts(args: []const [:0]const u8) !Opts {
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         const a = args[i];
-        if (std.mem.eql(u8, a, "--tf")) o.tf = true else if (std.mem.eql(u8, a, "--mtp")) o.mtp = true else if (std.mem.eql(u8, a, "--resume-mark")) o.seam.mark = true else {
+        if (std.mem.eql(u8, a, "--tf")) o.tf = true else if (std.mem.eql(u8, a, "--mtp")) o.mtp = true else if (std.mem.eql(u8, a, "--resume-mark")) o.seam.mark = true else if (std.mem.eql(u8, a, "--mtp-prompt")) {
+            if (i + 1 >= args.len) return error.MissingArgument;
+            o.mtp_prompt = std.meta.stringToEnum(MtpPrompt, args[i + 1]) orelse return error.BadMtpPrompt;
+            i += 1;
+        } else {
             if (i + 1 >= args.len) return error.MissingArgument;
             const v = try std.fmt.parseInt(usize, args[i + 1], 10);
             if (std.mem.eql(u8, a, "--gen")) o.gen = v else if (std.mem.eql(u8, a, "--chunk")) o.chunk = v else if (std.mem.eql(u8, a, "--decode-from")) o.seam.from = v else if (std.mem.eql(u8, a, "--decode-to")) o.seam.to = v else if (std.mem.eql(u8, a, "--window")) o.seam.window = v else if (std.mem.eql(u8, a, "--keep")) o.seam.keep = v else if (std.mem.eql(u8, a, "--mtp-draft")) o.draft = v else return error.UnknownOption;
@@ -64,6 +74,7 @@ fn opts(args: []const [:0]const u8) !Opts {
         if (o.seam.window > glm.state.window_rows or o.seam.keep == 0 or o.seam.keep > o.seam.window) return error.BadWindowKeep;
     }
     if (o.draft) |d| if (d > fwd.Forward.max_drafts or o.mtp or o.seam.from != null) return error.BadMtpDraft;
+    if (o.mtp_prompt != .full and o.draft == null) return error.MtpPromptWithoutDraft;
     return o;
 }
 
@@ -90,6 +101,8 @@ const Run = struct {
     /// Forward.keep's time by kept rows (host-timed between stream syncs), microseconds.
     keep_us: [glm.state.window_rows + 1]f64 = @splat(0),
     keep_n: [glm.state.window_rows + 1]usize = @splat(0),
+    /// --mtp-prompt
+    mtp_prompt: MtpPrompt = .full,
 
     fn now(io: std.Io) f64 {
         return @as(f64, @floatFromInt(std.Io.Timestamp.now(io, .awake).nanoseconds)) / 1e9;
@@ -224,6 +237,34 @@ fn promptRows(run: *Run, q: *Seq, from: usize, to: usize, chunk: usize) !void {
     }
 }
 
+/// sha256 of the MTP layer's caches over its mtp_len positions: the latent rows, the index keys and gates the rings
+/// hold (from mtp_base), the complete pools.
+fn mtpCacheSha(run: *Run) ![32]u8 {
+    const st = &run.st;
+    const L = st.mtp_len;
+    var h: std.crypto.hash.sha2.Sha256 = .init(.{});
+    const host = try std.heap.page_allocator.alloc(u8, 1 << 20);
+    defer std.heap.page_allocator.free(host);
+    try run.s.synchronize();
+    const spans = [_]struct { at: u64, lo: usize, hi: usize, row: usize }{
+        .{ .at = st.mtp.lc, .lo = 0, .hi = L, .row = 512 * 2 },
+        .{ .at = st.mtp.ik, .lo = st.mtp_base, .hi = L, .row = 128 * 2 },
+        .{ .at = st.mtp.ig, .lo = st.mtp_base, .hi = L, .row = 128 * 2 },
+        .{ .at = st.mtp.pk, .lo = 0, .hi = L / glm.state.pool, .row = 128 * 2 },
+    };
+    for (spans) |sp| {
+        var off = sp.lo * sp.row;
+        const end = sp.hi * sp.row;
+        while (off < end) {
+            const n = @min(host.len, end - off);
+            try hip.runtime.check(run.r.api.hipMemcpyDtoH(@ptrCast(host.ptr), @ptrFromInt(sp.at + off), n));
+            h.update(host[0..n]);
+            off += n;
+        }
+    }
+    return h.finalResult();
+}
+
 /// Forward.keep of `rows`, timed.
 fn keepTimed(run: *Run, io: std.Io, rows: usize) !void {
     const f = &run.fv.?;
@@ -276,12 +317,22 @@ fn mtpRounds(a: std.mem.Allocator, io: std.Io, run: *Run, q: *Seq, d: usize) !vo
     const fv = &run.fv.?;
     const fm = &run.fm.?;
     // the prompt's pairs (h_j, token j + 1) for j < t - 1, on the prompt buffers (the server's prefill)
+    try run.fp.sync();
+    const p0 = Run.now(io);
     var j0: usize = 0;
     while (j0 + 1 < t) : (j0 += run.fp.b.rows) {
         const n = @min(run.fp.b.rows, t - 1 - j0);
         run.fp.seq = null;
-        try run.fp.mtp(&run.st, q.ids[j0 + 1 ..][0..n], run.hid.base() + j0 * D * 2);
+        const next = q.ids[j0 + 1 ..][0..n];
+        const hin = run.hid.base() + j0 * D * 2;
+        switch (run.mtp_prompt) {
+            .full => try run.fp.mtp(&run.st, next, hin),
+            .cache => try run.fp.mtpCache(&run.st, next, hin),
+        }
     }
+    try run.fp.sync();
+    std.debug.print("MTP-PROMPT {d} rows in {d:.3} s ({s})\n", .{ t - 1, Run.now(io) - p0, @tagName(run.mtp_prompt) });
+    std.debug.print("MTP-CACHE sha256 {s} (latent rows, index keys and gates, pools after the prompt pass)\n", .{&std.fmt.bytesToHex(try mtpCacheSha(run), .lower)});
     var drafts: [fwd.Forward.max_drafts]u32 = undefined;
     var ids: [fwd.Forward.max_drafts + 1]u32 = undefined;
     var out: [fwd.Forward.max_drafts + 1]u32 = undefined;
@@ -443,6 +494,7 @@ pub fn command(init: std.process.Init, args: []const [:0]const u8) !void {
         .logits = undefined,
     };
     defer rn.s.deinit();
+    rn.mtp_prompt = o.mtp_prompt;
     rn.logits = try init.gpa.alloc(f32, glm.state.head_rows * V);
     defer init.gpa.free(rn.logits);
     rn.st = try State.init(&r, capacity);

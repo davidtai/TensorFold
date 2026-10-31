@@ -1137,3 +1137,70 @@ test "glm fwd: layer 3's DSA block on the checkpoint's weights from a dumped mix
     try writeNpy(a, out_dir, "part.npy", f32, &.{ R, D }, try t.get(f32, b.part, R * D));
     std.debug.print("RESULT glm fwd DSA layer {d} on real weights: {d} rows, intermediates in {s}\n", .{ L, R, out_dir });
 }
+
+// ---- the MTP layer's prompt pass ----
+
+/// The MTP layer's caches over its mtp_len positions (the latent rows, the index keys and gates the rings hold, the
+/// complete pools) as bytes.
+fn mtpCacheBytes(t: *Rig, st: *const State) ![]u8 {
+    const L = st.mtp_len;
+    var out: std.ArrayList(u8) = .empty;
+    try out.appendSlice(t.a(), try t.get(u8, st.mtp.lc, L * 512 * 2));
+    try out.appendSlice(t.a(), try t.get(u8, st.mtp.ik + st.mtp_base * 128 * 2, (L - st.mtp_base) * 128 * 2));
+    try out.appendSlice(t.a(), try t.get(u8, st.mtp.ig + st.mtp_base * 128 * 2, (L - st.mtp_base) * 128 * 2));
+    try out.appendSlice(t.a(), try t.get(u8, st.mtp.pk, L / state.pool * 128 * 2));
+    return out.items;
+}
+
+test "glm fwd: the MTP layer's prompt pass, cache only (Forward.mtpCache) = the whole layer (Forward.mtp): its caches bit for bit; 2,200 rows across the 2,051-key limit in two cuts" {
+    const t = try Rig.open();
+    defer t.close();
+    const a = t.a();
+    var rng: Rng = .{ .state = 0x3_7c_0001 };
+    const dw = try DsaW.make(t, &rng);
+    const E: usize = 288;
+    const ex = try Experts.make(t, &rng, 2);
+    const router = try Lin.make(t, &rng, E, D, null);
+    const bias = try a.alloc(f32, E);
+    for (bias) |*v| v.* = @floatCast((rng.uniform() - 0.5) * 0.1);
+    const sgu = try Lin.make(t, &rng, 2 * 2048, D, null);
+    const sdown = try Lin.make(t, &rng, D, 2048, null);
+    const mw: weights.Moe = .{ .router = router.w, .bias = try t.up(bias), .shared_gu = sgu.w, .shared_down = sdown.w, .experts = ex.e, .stacks = undefined };
+    const eh = try Lin.make(t, &rng, D, 2 * D, null);
+    var norms: [5]u64 = undefined;
+    for (&norms) |*n| n.* = try t.up((try bfs(t, &rng, D, 1.0)).bits);
+    const vocab: usize = 1024; // the embedding rows the test's ids use
+    t.model.embed = try t.up((try bfs(t, &rng, vocab * D, 1.0)).bits);
+    t.model.mtp = .{ .enorm = norms[0], .hnorm = norms[1], .eh = eh.w, .norm = norms[2], .layer = .{ .index = 45, .in_norm = norms[3], .post_norm = norms[4], .attn_hc = null, .ffn_hc = null, .mixer = .{ .mla = dw.w }, .ffn = .{ .moe = mw } } };
+    const cap = 2240;
+    const rows = 2200;
+    const ids = try a.alloc(u32, rows);
+    for (ids) |*v| v.* = @intCast(rng.next() % vocab);
+    const hin = try t.up((try bfs(t, &rng, rows * D, 1.0)).bits); // the main model's final-normed rows
+    const Way = struct { cache: bool, chunks: []const usize, name: []const u8 };
+    const ways = [_]Way{
+        .{ .cache = false, .chunks = &.{ 2048, 152 }, .name = "the whole layer, 2,048 + 152" },
+        .{ .cache = true, .chunks = &.{ 2048, 152 }, .name = "cache only, 2,048 + 152" },
+        .{ .cache = true, .chunks = &.{ 512, 512, 512, 504, 160 }, .name = "cache only, 512 x 3 + 504 + 160" },
+    };
+    var got: [ways.len][]u8 = undefined;
+    for (ways, 0..) |w, i| {
+        var st = try State.init(&t.r, cap);
+        defer st.deinit();
+        var pb = try Buffers.init(&t.r, 2048, true, cap);
+        defer pb.deinit();
+        var f = try t.fwd(&pb);
+        try st.reset(t.s.handle);
+        var at: usize = 0;
+        for (w.chunks) |n| {
+            if (w.cache) try f.mtpCache(&st, ids[at..][0..n], hin + at * D * 2) else try f.mtp(&st, ids[at..][0..n], hin + at * D * 2);
+            at += n;
+        }
+        try std.testing.expectEqual(@as(usize, rows), st.mtp_len);
+        got[i] = try mtpCacheBytes(t, &st);
+    }
+    for (1..ways.len) |i| {
+        var name: [160]u8 = undefined;
+        try expectSame(try std.fmt.bufPrint(&name, "glm fwd MTP prompt pass: the caches of {s} = of {s}", .{ ways[i].name, ways[0].name }), got[0], got[i]);
+    }
+}
