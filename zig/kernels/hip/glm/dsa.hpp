@@ -31,6 +31,10 @@ tf_glm_lat_write(const uint16_t* __restrict__ lat, long long lat_stride, uint16_
     reinterpret_cast<uint4*>(cache + at * kLw)[threadIdx.x] = src[threadIdx.x];
 }
 
+// The _ref kernels (expand, scores) are the first forms, kept as the byte oracles of the fast forms' tests
+// (kernel_tests/glm/dsa_fast.zig): each fast kernel computes every output with the _ref kernel's fp32 ops in the same
+// order, so the bytes are equal at every row count.
+
 // ---- The absorb: qa [rows][heads][512] bf16 = q [rows][heads][256] . Wk_h [256][512], fp32 fma in k order. q rows are
 // q_stride values apart (q_b's columns of the [q_b | wq_b] rows); head h's Wk at wk + h w_head (kv_b as stored: Wk_h is
 // rows 512 h .. 512 h + 255, w_head 512 x 512). Block (head, 256 columns, RB rows), a thread a column.
@@ -66,7 +70,7 @@ tf_glm_absorb_q(const uint16_t* __restrict__ q, long long q_stride, const uint16
 constexpr int kExpandRows = 8;
 
 extern "C" __global__ void __launch_bounds__(256)
-tf_glm_expand_v(const uint16_t* __restrict__ ol, const uint16_t* __restrict__ wv, long long w_head,
+tf_glm_expand_v_ref(const uint16_t* __restrict__ ol, const uint16_t* __restrict__ wv, long long w_head,
                 uint16_t* __restrict__ out, int rows, int heads) {
     __shared__ float os[kExpandRows][kLw];
     const int h = blockIdx.x, r0 = blockIdx.z * kExpandRows;
@@ -166,7 +170,7 @@ tf_glm_pool_keys(const uint16_t* ik, const uint16_t* ig, const uint16_t* __restr
 // lane l holds dims 4 l .. 4 l + 3. The block of pools 0 also writes the row's complete (pools) and end (P + 1) for
 // tf_fn_idx_select. qi rows are qi_stride values apart (wq_b's columns of [q_b | wq_b] rows). A score is written + 0 (so -0 is +0: the two are one order key, as sparse._order_key).
 extern "C" __global__ void __launch_bounds__(128)
-tf_glm_scores(const uint16_t* __restrict__ qi, long long qi_stride, const uint16_t* __restrict__ wts, long long w_stride,
+tf_glm_scores_ref(const uint16_t* __restrict__ qi, long long qi_stride, const uint16_t* __restrict__ wts, long long w_stride,
               const uint16_t* __restrict__ pk, float* __restrict__ out, long long np, int* __restrict__ complete,
               int* __restrict__ ends, const int* __restrict__ pos, int row0, int cols, float scale, float wscale,
               int top) {
@@ -209,6 +213,129 @@ tf_glm_scores(const uint16_t* __restrict__ qi, long long qi_stride, const uint16
         }
         if (lane == 0) out[r * np + p] = total + 0.f;
     }
+}
+
+// ---- The fast forms of the expand and the scores (G3-P3, P4): the _ref kernels' arithmetic for every output; only
+// the loads, the LDS layout and the work a thread or block takes change. (An absorb with Wk tiles in LDS was slower:
+// 48 KB a block left one block a CU; the absorb keeps its first form.)
+
+// Expand: block (32 outputs, head, a tile of kExpandTile rows), 8 waves of 4 outputs as tf_glm_expand_v_ref; a lane's
+// 16 Wv values of each output stay in registers for the block's rows, which go through LDS 8 at a time. LDS row
+// layout: lane l's 16 values at 17 l (no bank conflicts). Each output: 16 fma in order from 0, then xor 16 .. 1.
+constexpr int kExpandTile = 256;
+constexpr int kExpandPad = 17;
+
+extern "C" __global__ void __launch_bounds__(256)
+tf_glm_expand_v(const uint16_t* __restrict__ ol, const uint16_t* __restrict__ wv, long long w_head,
+                uint16_t* __restrict__ out, int rows, int heads) {
+    __shared__ float os[kExpandRows][32 * kExpandPad];
+    const int g = blockIdx.x, h = blockIdx.y;
+    const int lane = threadIdx.x & 31, wave = threadIdx.x >> 5;
+    float w[4][16];
+#pragma unroll
+    for (int o = 0; o < 4; ++o) {
+        const int jo = g * 32 + wave * 4 + o;
+        const uint16_t* wrow = wv + h * w_head + static_cast<long long>(jo) * kLw + lane * 16;
+        const uint4 a = reinterpret_cast<const uint4*>(wrow)[0], b = reinterpret_cast<const uint4*>(wrow)[1];
+        const uint32_t ws[8] = {a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w};
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            w[o][2 * i] = bf16_to_float(static_cast<uint16_t>(ws[i] & 0xffffu));
+            w[o][2 * i + 1] = bf16_to_float(static_cast<uint16_t>(ws[i] >> 16));
+        }
+    }
+    const int t0 = blockIdx.z * kExpandTile, t1 = min(rows, t0 + kExpandTile);
+    for (int r0 = t0; r0 < t1; r0 += kExpandRows) {
+        const int nr = min(kExpandRows, t1 - r0);
+        __syncthreads();
+        for (int i = threadIdx.x; i < nr * kLw; i += 256) {
+            const int j = i / kLw, k = i % kLw;
+            os[j][(k >> 4) * kExpandPad + (k & 15)] = bf16_to_float(ol[(static_cast<long long>(r0 + j) * heads + h) * kLw + k]);
+        }
+        __syncthreads();
+        for (int j = 0; j < nr; ++j) {
+            const float* x = &os[j][lane * kExpandPad];
+            float s[4];
+#pragma unroll
+            for (int o = 0; o < 4; ++o) {
+                float v = 0.f;
+#pragma unroll
+                for (int i = 0; i < 16; ++i) v = fmaf(x[i], w[o][i], v);
+                s[o] = v;
+            }
+#pragma unroll
+            for (int m = 16; m > 0; m >>= 1)
+#pragma unroll
+                for (int o = 0; o < 4; ++o) s[o] += __shfl_xor(s[o], m, 32);
+            if (lane < 4) {
+                const float v = lane == 0 ? s[0] : lane == 1 ? s[1] : lane == 2 ? s[2] : s[3];
+                out[(static_cast<long long>(r0 + j) * heads + h) * kDv + g * 32 + wave * 4 + lane] = float_to_bf16(v);
+            }
+        }
+    }
+}
+
+// Scores: one thread a (row, pool) score, a block a row's 256 pools. tf_glm_scores_ref forms each head's dot as 32
+// lane partials (lane l: q[4 l] k[4 l] then 3 fma over 4 l + 1 .. 3) summed by the butterfly xor 16, 8, 4, 2, 1 (lane
+// 0's value: t[l] = t[l] + t[l + m] for l < m, m = 16 .. 1); here the thread forms the 32 partials and the same tree
+// in registers, with no shuffles, then the heads' weighted relu sum in head order: the same scores, bit for bit.
+constexpr int kScoresPools = 256;
+
+extern "C" __global__ void __launch_bounds__(kScoresPools)
+tf_glm_scores(const uint16_t* __restrict__ qi, long long qi_stride, const uint16_t* __restrict__ wts, long long w_stride,
+              const uint16_t* __restrict__ pk, float* __restrict__ out, long long np, int* __restrict__ complete,
+              int* __restrict__ ends, const int* __restrict__ pos, int row0, int cols, float scale, float wscale,
+              int top) {
+    __shared__ __attribute__((aligned(16))) float qs[kIdxHeads][kIdxD];
+    __shared__ float ws[kIdxHeads];
+    const long long r = blockIdx.x;
+    const int at = pos[0] + row0 + static_cast<int>(r);
+    const int npool = (at + 1) / kPool;
+    if (blockIdx.y == 0 && threadIdx.x == 0) {
+        complete[r] = npool;
+        ends[r] = at + 1;
+    }
+    if (npool <= top) return;
+    for (int i = threadIdx.x; i < kIdxHeads * kIdxD; i += kScoresPools)
+        qs[i / kIdxD][i % kIdxD] = bf16_to_float(qi[r * qi_stride + i]);
+    if (threadIdx.x < kIdxHeads) ws[threadIdx.x] = bf16_to_float(wts[r * w_stride + threadIdx.x]) * wscale;
+    __syncthreads();
+    const int p = blockIdx.y * kScoresPools + threadIdx.x;
+    if (p >= min(cols, static_cast<int>(np))) return;
+    if (p >= npool) {
+        out[r * np + p] = -INFINITY;
+        return;
+    }
+    uint32_t k[kIdxD / 2];  // the pool key's 128 bf16 values, two a register
+    const uint4* src = reinterpret_cast<const uint4*>(pk + static_cast<long long>(p) * kIdxD);
+#pragma unroll
+    for (int u = 0; u < kIdxD / 8; ++u) {
+        const uint4 v = src[u];
+        k[4 * u] = v.x;
+        k[4 * u + 1] = v.y;
+        k[4 * u + 2] = v.z;
+        k[4 * u + 3] = v.w;
+    }
+    float total = 0.f;
+    for (int h = 0; h < kIdxHeads; ++h) {
+        float t[32];
+#pragma unroll
+        for (int l = 0; l < 32; ++l) {
+            const float4 q = *reinterpret_cast<const float4*>(&qs[h][4 * l]);
+            const uint32_t a = k[2 * l], b = k[2 * l + 1];
+            float x = q.x * bf16_to_float(static_cast<uint16_t>(a & 0xffffu));
+            x = fmaf(q.y, bf16_to_float(static_cast<uint16_t>(a >> 16)), x);
+            x = fmaf(q.z, bf16_to_float(static_cast<uint16_t>(b & 0xffffu)), x);
+            x = fmaf(q.w, bf16_to_float(static_cast<uint16_t>(b >> 16)), x);
+            t[l] = x;
+        }
+#pragma unroll
+        for (int m = 16; m > 0; m >>= 1)
+#pragma unroll
+            for (int l = 0; l < m; ++l) t[l] = t[l] + t[l + m];
+        total = fmaf(ws[h], fmaxf(t[0] * scale, 0.f), total);
+    }
+    out[r * np + p] = total + 0.f;
 }
 
 // ---- The latent attention on the gfx11 matrix cores (v_wmma_f32_16x16x16_bf16).

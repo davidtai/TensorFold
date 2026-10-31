@@ -813,7 +813,7 @@ test "GLM DSA: rows under the dense limit get the same bits from a dense call an
 }
 
 /// Mean microseconds of `body` over `n` runs after 2 warm-ups (events on the stream).
-fn timeUs(t: *Rig, n: usize, ctx: anytype, comptime body: fn (*Rig, @TypeOf(ctx)) anyerror!void) !f64 {
+pub fn timeUs(t: *Rig, n: usize, ctx: anytype, comptime body: fn (*Rig, @TypeOf(ctx)) anyerror!void) !f64 {
     try body(t, ctx);
     try body(t, ctx);
     const api = &t.base.r.api;

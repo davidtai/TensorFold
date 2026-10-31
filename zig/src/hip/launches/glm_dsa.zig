@@ -41,6 +41,8 @@ pub const Kernels = struct {
     lat_write: Function,
     absorb_q: Function,
     expand_v: Function,
+    expand_v_ref: Function,
+    scores_ref: Function,
     index_write: Function,
     pool_keys: Function,
     scores: Function,
@@ -58,6 +60,8 @@ pub const Kernels = struct {
             .lat_write = try m.function("tf_glm_lat_write"),
             .absorb_q = try m.function("tf_glm_absorb_q"),
             .expand_v = try m.function("tf_glm_expand_v"),
+            .expand_v_ref = try m.function("tf_glm_expand_v_ref"),
+            .scores_ref = try m.function("tf_glm_scores_ref"),
             .index_write = try m.function("tf_glm_index_write"),
             .pool_keys = try m.function("tf_glm_pool_keys"),
             .scores = try m.function("tf_glm_scores"),
@@ -105,10 +109,15 @@ pub fn kvValues(kv_b: u64) u64 {
     return kv_b + qk * lw * 2;
 }
 
+/// Which form of the expand and the scores runs: `fast` (served) or `ref` (the first form, the byte oracle of
+/// kernel_tests/glm/dsa_fast.zig). Both give every output the same bytes.
+pub const Form = enum { fast, ref };
+
 /// latent.absorb_q: qa [rows][heads][512] bf16 = q_h . Wk_h; q rows `q_stride` values apart (head h at column 256 h),
 /// Wk_h [256][512] at wk + h w_head elements.
 pub fn absorbQ(k: Kernels, s: S, q: u64, q_stride: usize, wk: u64, w_head: usize, qa: u64, rows: usize, heads: usize) Error!void {
     if (rows == 0) return;
+    try shape(wk % 16 == 0 and w_head % 8 == 0);
     var a: Args = .{};
     inline for (.{ q, @as(i64, @intCast(q_stride)), wk, @as(i64, @intCast(w_head)), qa, @as(c_int, @intCast(rows)), @as(c_int, @intCast(heads)) }) |v| try a.add(v);
     try k.go(k.absorb_q, dim(heads, lw / 256, cdiv(rows, 16)), dim(256, 1, 1), s, &a);
@@ -116,11 +125,18 @@ pub fn absorbQ(k: Kernels, s: S, q: u64, q_stride: usize, wk: u64, w_head: usize
 
 /// latent.expand_v: out [rows][heads][256] bf16 = o_lat [rows][heads][512] . Wv_h^T, Wv_h [256][512] at wv + h w_head.
 pub fn expandV(k: Kernels, s: S, ol: u64, wv: u64, w_head: usize, out: u64, rows: usize, heads: usize) Error!void {
+    return expandVForm(k, .fast, s, ol, wv, w_head, out, rows, heads);
+}
+
+pub fn expandVForm(k: Kernels, form: Form, s: S, ol: u64, wv: u64, w_head: usize, out: u64, rows: usize, heads: usize) Error!void {
     if (rows == 0) return;
     try shape(wv % 16 == 0 and w_head % 8 == 0);
     var a: Args = .{};
     inline for (.{ ol, wv, @as(i64, @intCast(w_head)), out, @as(c_int, @intCast(rows)), @as(c_int, @intCast(heads)) }) |v| try a.add(v);
-    try k.go(k.expand_v, dim(heads, dv / 32, cdiv(rows, 8)), dim(256, 1, 1), s, &a);
+    switch (form) {
+        .fast => try k.go(k.expand_v, dim(dv / 32, heads, cdiv(rows, 256)), dim(256, 1, 1), s, &a),
+        .ref => try k.go(k.expand_v_ref, dim(heads, dv / 32, cdiv(rows, 8)), dim(256, 1, 1), s, &a),
+    }
 }
 
 /// sparse.index_update: rows pos[0] + row0 .. of the LayerNormed index keys (k_raw bf16, stride `k_stride`) and the
@@ -167,12 +183,21 @@ pub fn scratchBytes(rows: usize, np: usize) usize {
 /// scores' row stride.
 pub fn selectTokens(k: Kernels, s: S, qi: u64, qi_stride: usize, wts: u64, w_stride: usize, pk: u64, pos: u64, row0: usize, host_pos: usize, rows: usize, np: usize, sc: Scratch, tokens: u64, counts: u64, sparse: u64) Error!void {
     if (rows == 0) return;
+    try scores(k, .fast, s, qi, qi_stride, wts, w_stride, pk, pos, row0, host_pos, rows, np, sc);
+    try selectLists(k, s, sc, np, rows, tokens, counts, sparse);
+}
+
+/// selectTokens' pool scores alone (and each row's complete and ends) into `sc`, in `form`.
+pub fn scores(k: Kernels, form: Form, s: S, qi: u64, qi_stride: usize, wts: u64, w_stride: usize, pk: u64, pos: u64, row0: usize, host_pos: usize, rows: usize, np: usize, sc: Scratch) Error!void {
+    if (rows == 0) return;
     const cols = scoreColumns(host_pos + row0, rows, np);
     var a: Args = .{};
     const scale: f32 = @floatCast(1.0 / @sqrt(@as(f64, index_dims)));
     inline for (.{ qi, @as(i64, @intCast(qi_stride)), wts, @as(i64, @intCast(w_stride)), pk, sc.scores, @as(i64, @intCast(np)), sc.complete, sc.ends, pos, @as(c_int, @intCast(row0)), @as(c_int, @intCast(cols)), scale, head_scale, @as(c_int, topk_pools) }) |v| try a.add(v);
-    try k.go(k.scores, dim(rows, cdiv(cols, 64), 1), dim(128, 1, 1), s, &a);
-    try selectLists(k, s, sc, np, rows, tokens, counts, sparse);
+    switch (form) {
+        .fast => try k.go(k.scores, dim(rows, cdiv(cols, 256), 1), dim(256, 1, 1), s, &a),
+        .ref => try k.go(k.scores_ref, dim(rows, cdiv(cols, 64), 1), dim(128, 1, 1), s, &a),
+    }
 }
 
 /// The select alone (tf_fn_idx_select) over scores, complete and ends already in `sc`: each row's list as selectTokens.
