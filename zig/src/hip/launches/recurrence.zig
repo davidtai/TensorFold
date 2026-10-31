@@ -126,6 +126,8 @@ pub const KdaFns = struct {
     prompt: Function,
     out: Function,
     conv_shift: Function,
+    prep_wave: Function,
+    out_wave: Function,
 
     pub fn load(m: Module) Error!KdaFns {
         return .{
@@ -136,6 +138,8 @@ pub const KdaFns = struct {
             .prompt = try m.function("tf_kda_prompt_128"),
             .out = try m.function("tf_kda_out"),
             .conv_shift = try m.function("tf_kda_conv_shift"),
+            .prep_wave = try m.function("tf_kda_prep_wave"),
+            .out_wave = try m.function("tf_kda_out_wave"),
         };
     }
 };
@@ -143,15 +147,39 @@ pub const KdaFns = struct {
 /// KDA's key and value channels a head.
 pub const kda_dim = 128;
 
+/// The two launch forms of tf_kda_prep and tf_kda_out (kda.hpp). They give every row the same bytes (LANES.md code
+/// contract 7; kernel_tests/kda.zig R-1): `block` a block a (row, head), CUDA's shape; `wave` the DeltaNet's shapes, a
+/// wave a (16-row segment, head, part) for prep and a wave a (row, head) for out.
+pub const KdaForm = enum { block, wave };
+
+/// Rows from which tf_kda_prep and tf_kda_out take the wave form (fewer: the block form's more blocks).
+pub const kda_wave_rows = 16;
+
+fn aligned(addr: anytype, to: usize) bool {
+    return ad(addr) % to == 0;
+}
+
 /// kda.chain's prep (glm_kda.cu tf_glm_kda_prep): `rows` rows of the stacked bf16 projection p (row stride p_stride,
 /// q | k | v from column 0, beta's logits at b_off), the bf16 decay rows a (stride a_stride) and the bf16 conv window cs
 /// [3][3 heads 128] (read, not written); taps cw bf16 [3 heads 128][4] as stored. Out: q fp32, k fp32, v bf16, decays
-/// fp32 and beta fp32, row-major (rows, heads, 128) and (rows, heads).
+/// fp32 and beta fp32, row-major (rows, heads, 128) and (rows, heads). The wave form from kda_wave_rows rows where the
+/// buffers suit its vector loads; the block form otherwise: the same bytes.
 pub fn tf_kda_prep(l: *const Launcher, p: C, p_stride: c_int, b_off: c_int, a: C, a_stride: c_int, cs: C, cw: C, a_log: CF, dt_bias: CF, lower: f32, q: F, k: F, v: P, g: F, b: F, rows: c_int, heads: c_int, s: S) Error!void {
+    const vec = @rem(p_stride, 4) == 0 and @rem(a_stride, 4) == 0 and aligned(p, 8) and aligned(a, 8) and aligned(cs, 8) and
+        aligned(cw, 16) and aligned(q, 16) and aligned(k, 16) and aligned(v, 8) and aligned(g, 16);
+    const form: KdaForm = if (rows >= kda_wave_rows and vec) .wave else .block;
+    return tf_kda_prep_as(l, form, p, p_stride, b_off, a, a_stride, cs, cw, a_log, dt_bias, lower, q, k, v, g, b, rows, heads, s);
+}
+
+/// tf_kda_prep in a named form (the tests', and the timings').
+pub fn tf_kda_prep_as(l: *const Launcher, form: KdaForm, p: C, p_stride: c_int, b_off: c_int, a: C, a_stride: c_int, cs: C, cw: C, a_log: CF, dt_bias: CF, lower: f32, q: F, k: F, v: P, g: F, b: F, rows: c_int, heads: c_int, s: S) Error!void {
     if (heads < 1 or rows < 1 or p_stride < 3 * heads * kda_dim or b_off + heads > p_stride) return invalid("kda prep");
     var x: Args = .{};
     inline for (.{ heads, ad(p), p_stride, b_off, ad(a), a_stride, ad(cs), ad(cw), ad(a_log), ad(dt_bias), lower, ad(q), ad(k), ad(v), ad(g), ad(b) }) |e| try x.add(e);
-    try l.go(l.kda.prep, dim(rows, heads, 1), dim(512, 1, 1), 0, s, &x);
+    if (form == .block) return l.go(l.kda.prep, dim(rows, heads, 1), dim(512, 1, 1), 0, s, &x);
+    try x.add(rows);
+    const waves = cdiv(rows, 16) * @as(usize, @intCast(heads)) * 4;
+    try l.go(l.kda.prep_wave, dim(cdiv(waves, 8), 1, 1), dim(256, 1, 1), 0, s, &x);
 }
 
 /// KDA's delta rule over `length` rows from `state` (fp32 (heads, 128 v, 128 k), stored back): q, k fp32, v bf16, decays
@@ -188,12 +216,22 @@ pub fn tf_kda_keep(l: *const Launcher, state: F, state_stride: i64, k: CF, v: C,
 }
 
 /// kda.chain's out (glm_kda.cu tf_glm_kda_out): bf16 out (rows, heads, 128) = norm_w rms(y) sigmoid(g), y fp32 rounded
-/// to bf16 on read (CUDA's rounding point), the gate rows g bf16 (stride g_stride), norm_w bf16 [128].
+/// to bf16 on read (CUDA's rounding point), the gate rows g bf16 (stride g_stride), norm_w bf16 [128]. The wave form
+/// from kda_wave_rows rows where the buffers suit its vector loads; the block form otherwise: the same bytes.
 pub fn tf_kda_out(l: *const Launcher, y: CF, g: C, g_stride: c_int, norm_w: C, eps: f32, out: P, rows: c_int, heads: c_int, s: S) Error!void {
+    const vec = @rem(g_stride, 4) == 0 and aligned(y, 16) and aligned(g, 8) and aligned(norm_w, 8) and aligned(out, 8);
+    const form: KdaForm = if (rows >= kda_wave_rows and vec) .wave else .block;
+    return tf_kda_out_as(l, form, y, g, g_stride, norm_w, eps, out, rows, heads, s);
+}
+
+/// tf_kda_out in a named form (the tests', and the timings').
+pub fn tf_kda_out_as(l: *const Launcher, form: KdaForm, y: CF, g: C, g_stride: c_int, norm_w: C, eps: f32, out: P, rows: c_int, heads: c_int, s: S) Error!void {
     if (heads < 1 or rows < 1) return invalid("kda out");
     var a: Args = .{};
     inline for (.{ heads, ad(y), ad(g), g_stride, ad(norm_w), eps, ad(out) }) |x| try a.add(x);
-    try l.go(l.kda.out, dim(rows, heads, 1), dim(kda_dim, 1, 1), 0, s, &a);
+    if (form == .block) return l.go(l.kda.out, dim(rows, heads, 1), dim(kda_dim, 1, 1), 0, s, &a);
+    try a.add(rows);
+    try l.go(l.kda.out_wave, dim(cdiv(@as(usize, @intCast(rows)) * @as(usize, @intCast(heads)), 8), 1, 1), dim(256, 1, 1), 0, s, &a);
 }
 
 /// forward._conv_shift (glue.convShift): each of `layers` bf16 conv windows (3 rows of c columns, conv_layer elements

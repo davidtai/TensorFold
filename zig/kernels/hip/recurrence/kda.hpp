@@ -132,6 +132,154 @@ tf_kda_out(int H, const float* __restrict__ y, const uint16_t* __restrict__ G, i
     out[base + t] = bf16_bits(yw * sigmoid(gate));
 }
 
+// The wave forms of prep and out (G2 K-1 / K-2): the block forms' values, a byte for a byte, in the DeltaNet's launch
+// shapes. A lane owns channels 4 lane .. 4 lane + 3 of a head, as the block forms' norms read them (lane x 4 + i), so
+// every sum keeps its order: the conv's taps in order, a channel at a time; the norms' i = 0..3 then xor 16 ... 1.
+constexpr int kKdaSeg = 16;  // rows a prep wave slides its conv window over
+
+// A wave a (16-row segment, head, part), 8 waves a block: part 0 q, 1 k (conv, SiLU, bf16, L2 norm), 2 v (conv, SiLU,
+// bf16), 3 the decays of the head's 128 key channels and beta. tf_kda_prep's inputs and outputs. Wave u of the grid:
+// part = u % 4, head = (u / 4) % H, segment = u / (4 H).
+extern "C" __global__ void __launch_bounds__(256)
+tf_kda_prep_wave(int H, const uint16_t* __restrict__ P, int p_stride, int b_off, const uint16_t* __restrict__ A,
+                 int a_stride, const uint16_t* __restrict__ cs, const uint16_t* __restrict__ cw,
+                 const float* __restrict__ a_log, const float* __restrict__ dt_bias, float lower,
+                 float* __restrict__ q_out, float* __restrict__ k_save, uint16_t* __restrict__ v_save,
+                 float* __restrict__ g_save, float* __restrict__ b_save, int rows) {
+    using namespace tf_kda;
+    constexpr int DK = kDim;
+    const int C = 3 * H * DK;
+    const int lane = threadIdx.x & 31;
+    const int u = blockIdx.x * 8 + (threadIdx.x >> 5);
+    if (u >= ((rows + kKdaSeg - 1) / kKdaSeg) * H * 4) return;
+    const int part = u % 4, h = (u / 4) % H, seg = u / (4 * H);
+    const int r0 = seg * kKdaSeg, r1 = min(rows, r0 + kKdaSeg);
+    const int ch = h * DK + lane * 4;  // the lane's first channel within a part
+    if (part == 3) {
+        const float rate = a_log[h];
+        float dtb[4];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) dtb[i] = dt_bias[ch + i];
+        for (int r = r0; r < r1; ++r) {
+            const uint2 a4 = *reinterpret_cast<const uint2*>(A + static_cast<size_t>(r) * a_stride + ch);
+            const uint16_t a[4] = {static_cast<uint16_t>(a4.x & 0xffffu), static_cast<uint16_t>(a4.x >> 16),
+                                   static_cast<uint16_t>(a4.y & 0xffffu), static_cast<uint16_t>(a4.y >> 16)};
+            float4 g;
+            g.x = decay(widen(a[0]), dtb[0], rate, lower);
+            g.y = decay(widen(a[1]), dtb[1], rate, lower);
+            g.z = decay(widen(a[2]), dtb[2], rate, lower);
+            g.w = decay(widen(a[3]), dtb[3], rate, lower);
+            *reinterpret_cast<float4*>(g_save + (static_cast<size_t>(r) * H + h) * DK + lane * 4) = g;
+            if (lane == 0) b_save[r * H + h] = bf(sigmoid(widen(P[static_cast<size_t>(r) * p_stride + b_off + h])));
+        }
+        return;
+    }
+    const int c = part * H * DK + ch;  // the lane's first conv channel
+    float w[4][kTaps], win[4][kTaps];
+    {
+        const uint4 lo = *reinterpret_cast<const uint4*>(cw + static_cast<size_t>(c) * kTaps);
+        const uint4 hi = *reinterpret_cast<const uint4*>(cw + static_cast<size_t>(c) * kTaps + 8);
+        const uint32_t ws[8] = {lo.x, lo.y, lo.z, lo.w, hi.x, hi.y, hi.z, hi.w};
+#pragma unroll
+        for (int i = 0; i < 4; ++i)
+#pragma unroll
+            for (int tap = 0; tap < kTaps; ++tap) {
+                const uint32_t word = ws[(i * kTaps + tap) >> 1];
+                w[i][tap] = widen(static_cast<uint16_t>(((i * kTaps + tap) & 1) ? word >> 16 : word & 0xffffu));
+            }
+    }
+    // input t of the window [conv window; P rows] for the lane's 4 channels
+    auto input = [&](int t, float (&x)[4]) {
+        const uint16_t* src = t < kTaps - 1 ? cs + static_cast<size_t>(t) * C + c
+                                            : P + static_cast<size_t>(t - (kTaps - 1)) * p_stride + c;
+        const uint2 v = *reinterpret_cast<const uint2*>(src);
+        x[0] = widen(static_cast<uint16_t>(v.x & 0xffffu));
+        x[1] = widen(static_cast<uint16_t>(v.x >> 16));
+        x[2] = widen(static_cast<uint16_t>(v.y & 0xffffu));
+        x[3] = widen(static_cast<uint16_t>(v.y >> 16));
+    };
+#pragma unroll
+    for (int tap = 0; tap < kTaps - 1; ++tap) {
+        float x[4];
+        input(r0 + tap, x);
+#pragma unroll
+        for (int i = 0; i < 4; ++i) win[i][tap] = x[i];
+    }
+    for (int r = r0; r < r1; ++r) {
+        float x[4];
+        input(r + kTaps - 1, x);
+        float act[4];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            win[i][kTaps - 1] = x[i];
+            float acc = 0.0f;
+#pragma unroll
+            for (int tap = 0; tap < kTaps; ++tap) acc = acc + w[i][tap] * win[i][tap];
+            act[i] = bf(acc / (1.0f + expf(-acc)));
+#pragma unroll
+            for (int tap = 0; tap + 1 < kTaps; ++tap) win[i][tap] = win[i][tap + 1];
+        }
+        const size_t base = (static_cast<size_t>(r) * H + h) * DK + lane * 4;
+        if (part == 2) {
+            uint2 o;
+            o.x = static_cast<uint32_t>(bf16_bits(act[0])) | (static_cast<uint32_t>(bf16_bits(act[1])) << 16);
+            o.y = static_cast<uint32_t>(bf16_bits(act[2])) | (static_cast<uint32_t>(bf16_bits(act[3])) << 16);
+            *reinterpret_cast<uint2*>(v_save + base) = o;
+            continue;
+        }
+        float ss = 0.0f;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) ss = ss + act[i] * act[i];
+        ss = wave_sum(ss);
+        const float inv = 1.0f / sqrtf(ss + 1e-6f);
+        float4 y;
+        float* yv = reinterpret_cast<float*>(&y);
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            float e = act[i] * inv;
+            if (part == 0) e = e * (1.0f / sqrtf(static_cast<float>(DK)));
+            yv[i] = e;
+        }
+        *reinterpret_cast<float4*>((part == 0 ? q_out : k_save) + base) = y;
+    }
+}
+
+// A wave a (row, head), 8 waves a block: tf_kda_out's values; the wave's lane x 4 + i sum and butterfly as its wave 0.
+extern "C" __global__ void __launch_bounds__(256)
+tf_kda_out_wave(int H, const float* __restrict__ y, const uint16_t* __restrict__ G, int g_stride,
+                const uint16_t* __restrict__ norm_w, float eps, uint16_t* __restrict__ out, int rows) {
+    using namespace tf_kda;
+    constexpr int DV = kDim;
+    const int lane = threadIdx.x & 31;
+    const int u = blockIdx.x * 8 + (threadIdx.x >> 5);
+    if (u >= rows * H) return;
+    const int r = u / H, h = u % H;
+    const size_t base = static_cast<size_t>(u) * DV + lane * 4;
+    const float4 y4 = *reinterpret_cast<const float4*>(y + base);
+    const float v[4] = {bf(y4.x), bf(y4.y), bf(y4.z), bf(y4.w)};
+    float ss = 0.0f;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) ss = ss + v[i] * v[i];
+    ss = wave_sum(ss);
+    const float rinv = 1.0f / sqrtf(ss / static_cast<float>(DV) + eps);
+    const uint2 g4 = *reinterpret_cast<const uint2*>(G + static_cast<size_t>(r) * g_stride + h * DV + lane * 4);
+    const uint2 n4 = *reinterpret_cast<const uint2*>(norm_w + lane * 4);
+    const uint32_t gw[2] = {g4.x, g4.y}, nw[2] = {n4.x, n4.y};
+    uint16_t o[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const uint16_t gb = static_cast<uint16_t>((i & 1) ? gw[i >> 1] >> 16 : gw[i >> 1] & 0xffffu);
+        const uint16_t nb = static_cast<uint16_t>((i & 1) ? nw[i >> 1] >> 16 : nw[i >> 1] & 0xffffu);
+        const float yn = v[i] * rinv;
+        const float yw = widen(nb) * yn;
+        o[i] = bf16_bits(yw * sigmoid(widen(gb)));
+    }
+    uint2 w;
+    w.x = static_cast<uint32_t>(o[0]) | (static_cast<uint32_t>(o[1]) << 16);
+    w.y = static_cast<uint32_t>(o[2]) | (static_cast<uint32_t>(o[3]) << 16);
+    *reinterpret_cast<uint2*>(out + base) = w;
+}
+
 // tf_glm_conv_shift: layer blockIdx.x's 3-row bf16 window takes rows keep .. keep + 2 of [window; projection rows],
 // c columns (3 heads 128) a row; window rows conv_layer apart a layer, projection rows proj_row apart, proj_layer a layer.
 extern "C" __global__ void __launch_bounds__(256)

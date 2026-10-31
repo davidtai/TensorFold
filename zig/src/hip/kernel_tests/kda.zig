@@ -852,6 +852,117 @@ test "KDA: the window and prompt chains on the CUDA buffers against the float64 
     }
 }
 
+/// Launches `rows` rows of the prep from row `row0` of b (its conv window `cs`: the 3 inputs before row0) into `out`,
+/// in `form` (null: tf_kda_prep's own choice).
+fn prepAt(t: *Rig, form: ?Launcher.KdaForm, b: Block, dev: BlockDev, cs: u64, row0: usize, rows: usize, out: Saves) !void {
+    const W = b.width();
+    const n = b.n();
+    const p = cv(dev.p + row0 * W * 2);
+    const a = cv(dev.a + row0 * n * 2);
+    const r: c_int = @intCast(rows);
+    const hh: c_int = @intCast(b.heads);
+    const s = t.stream.handle;
+    if (form) |fm| return t.on.tf_kda_prep_as(fm, p, @intCast(W), @intCast(b.bOff()), a, @intCast(n), cv(cs), cv(dev.cw), cf(dev.a_log), cf(dev.dt_bias), lower, mf(out.q), mf(out.k), mv(out.v), mf(out.g), mf(out.b), r, hh, s);
+    return t.on.tf_kda_prep(p, @intCast(W), @intCast(b.bOff()), a, @intCast(n), cv(cs), cv(dev.cw), cf(dev.a_log), cf(dev.dt_bias), lower, mf(out.q), mf(out.k), mv(out.v), mf(out.g), mf(out.b), r, hh, s);
+}
+
+/// The conv window a launch from row `row0` reads: the 3 inputs before it (the window's rows, then b's projection rows).
+fn windowAt(b: Block, row0: usize) ![]u16 {
+    const c = 3 * b.n();
+    const w = try gpa.alloc(u16, 3 * c);
+    for (0..3) |j| {
+        const src = row0 + j; // input index: window rows 0..2, then projection rows
+        if (src < 3) @memcpy(w[j * c ..][0..c], b.cs[src * c ..][0..c]) else @memcpy(w[j * c ..][0..c], b.p[(src - 3) * b.width() ..][0..c]);
+    }
+    return w;
+}
+
+/// Bytes of the prep's outputs for `rows` rows at `out`, in one buffer: q, k, v, decays, beta.
+fn prepBytes(t: *Rig, out: Saves, rows: usize, heads: usize) ![]u8 {
+    const n = heads * d;
+    var all: std.ArrayList(u8) = .empty;
+    errdefer all.deinit(gpa);
+    for ([_]u64{ out.q, out.k, out.v, out.g, out.b }, [_]usize{ rows * n * 4, rows * n * 4, rows * n * 2, rows * n * 4, rows * heads * 4 }) |addr, bytes| {
+        const part = try download(u8, t, addr, bytes);
+        defer gpa.free(part);
+        try all.appendSlice(gpa, part);
+    }
+    return all.toOwnedSlice(gpa);
+}
+
+/// The reference's bytes of rows [row0, row0 + rows) in prepBytes' layout.
+fn prepSlice(ref: Saves, t: *Rig, row0: usize, rows: usize, heads: usize) ![]u8 {
+    const n = heads * d;
+    const at_rows: Saves = .{ .q = ref.q + row0 * n * 4, .k = ref.k + row0 * n * 4, .v = ref.v + row0 * n * 2, .g = ref.g + row0 * n * 4, .b = ref.b + row0 * heads * 4 };
+    return prepBytes(t, at_rows, rows, heads);
+}
+
+test "KDA: R-1, the prep's and out's block and wave forms give a row the same bytes at every count, place and seam" {
+    // LANES.md code contract 7. Reference: the block form over 2,048 rows from row 0. Every launch below (each form,
+    // and tf_kda_prep / tf_kda_out's own choice, which switches at kda_wave_rows) must give its rows the reference's bytes.
+    const t = try Rig.open(1 << 20);
+    defer t.close();
+    const heads = glm_heads;
+    const n = heads * d;
+    const total = 2048;
+    const b = try Block.make(heads, total, 0x21ef, false);
+    defer b.free();
+    var h: Held = .{};
+    defer h.deinit();
+    const dev = try blockDev(&h, t, b);
+    const ref = try saves(&h, t, total, heads);
+    try prepAt(t, .block, b, dev, dev.cs, 0, total, ref);
+    // out's inputs: y fp32 and the gate rows (b.g), the reference out by the block form
+    var rng: rig.Rng = .{ .state = 0x0be7 };
+    const yh = try gpa.alloc(f32, total * n);
+    defer gpa.free(yh);
+    for (yh) |*v| v.* = @floatCast(rng.normal());
+    const y = at(try h.up(t, yh));
+    const out_ref = at(try h.zeros(t, total * n * 2));
+    try t.on.tf_kda_out_as(.block, cf(y), cv(dev.g), @intCast(n), cv(dev.norm), eps_out, mv(out_ref), total, heads, t.stream.handle);
+    try t.stream.synchronize();
+    const Launch = struct { row0: usize, rows: usize };
+    var launches: std.ArrayList(Launch) = .empty;
+    defer launches.deinit(gpa);
+    for (1..18) |r| try launches.append(gpa, .{ .row0 = 0, .rows = r }); // every count across the switch at 16
+    for ([_]usize{ 31, 32, 33, 64, 65 }) |r| try launches.append(gpa, .{ .row0 = 0, .rows = r });
+    for ([_]usize{ 0, 1, 15, 16, 1000, 2047 }) |r0| try launches.append(gpa, .{ .row0 = r0, .rows = 1 }); // a row alone
+    for ([_]usize{ 14, 15, 62, 63, 2045 }) |r0| try launches.append(gpa, .{ .row0 = r0, .rows = 3 }); // seams
+    try launches.append(gpa, .{ .row0 = 7, .rows = 33 }); // a launch whose 16-row segments straddle the reference's
+    var checked: usize = 0;
+    for (launches.items) |ln| {
+        const win = try windowAt(b, ln.row0);
+        defer gpa.free(win);
+        var lh: Held = .{};
+        defer lh.deinit();
+        const cs = at(try lh.up(t, win));
+        const want = try prepSlice(ref, t, ln.row0, ln.rows, heads);
+        defer gpa.free(want);
+        const want_out = try download(u8, t, out_ref + ln.row0 * n * 2, ln.rows * n * 2);
+        defer gpa.free(want_out);
+        for ([_]?Launcher.KdaForm{ .block, .wave, null }) |form| {
+            const out = try saves(&lh, t, ln.rows, heads);
+            try prepAt(t, form, b, dev, cs, ln.row0, ln.rows, out);
+            const o = at(try lh.zeros(t, ln.rows * n * 2));
+            const yy = cf(y + ln.row0 * n * 4);
+            const gg = cv(dev.g + ln.row0 * n * 2);
+            if (form) |fm| {
+                try t.on.tf_kda_out_as(fm, yy, gg, @intCast(n), cv(dev.norm), eps_out, mv(o), @intCast(ln.rows), heads, t.stream.handle);
+            } else try t.on.tf_kda_out(yy, gg, @intCast(n), cv(dev.norm), eps_out, mv(o), @intCast(ln.rows), heads, t.stream.handle);
+            try t.stream.synchronize();
+            const got = try prepBytes(t, out, ln.rows, heads);
+            defer gpa.free(got);
+            const name = if (form) |fm| @tagName(fm) else "auto";
+            try rig.expect(std.mem.eql(u8, want, got), "KDA R-1 prep {s}: rows {d} from row {d} differ from the reference", .{ name, ln.rows, ln.row0 });
+            const got_out = try download(u8, t, o, ln.rows * n * 2);
+            defer gpa.free(got_out);
+            try rig.expect(std.mem.eql(u8, want_out, got_out), "KDA R-1 out {s}: rows {d} from row {d} differ from the reference", .{ name, ln.rows, ln.row0 });
+            checked += 1;
+        }
+    }
+    std.debug.print("KDA R-1: {d} launches (block, wave, auto) of prep and out bit-equal to the 2,048-row reference\n", .{checked});
+}
+
 /// The median of `runs` launches of `f` in ms, by events on the rig's stream, after two warm-up launches.
 fn timeMs(t: *Rig, runs: usize, ctx: anytype, comptime f: fn (@TypeOf(ctx)) anyerror!void) !f64 {
     const Event = @import("../stream.zig").Event;
@@ -922,17 +1033,18 @@ test "KDA: speed facts (no gate): prep, scans, out and keep at GLM's 64 heads, o
     const bd = try blockDev(&h, t, b);
     const sv = try saves(&h, t, rows, heads);
     const out = at(try h.zeros(t, rows * n * 2));
-    const PO = struct { t: *Rig, b: *const Block, bd: BlockDev, sv: Saves, y: u64, out: u64, rows: usize, which: u1 };
+    const PO = struct { t: *Rig, b: *const Block, bd: BlockDev, sv: Saves, y: u64, out: u64, rows: usize, which: u1, form: Launcher.KdaForm };
     const po = struct {
         fn f(c: PO) anyerror!void {
             const s = c.t.stream.handle;
-            if (c.which == 0) return c.t.on.tf_kda_prep(cv(c.bd.p), @intCast(c.b.width()), @intCast(c.b.bOff()), cv(c.bd.a), @intCast(c.b.n()), cv(c.bd.cs), cv(c.bd.cw), cf(c.bd.a_log), cf(c.bd.dt_bias), lower, mf(c.sv.q), mf(c.sv.k), mv(c.sv.v), mf(c.sv.g), mf(c.sv.b), @intCast(c.rows), glm_heads, s);
-            return c.t.on.tf_kda_out(cf(c.y), cv(c.bd.g), @intCast(c.b.n()), cv(c.bd.norm), eps_out, mv(c.out), @intCast(c.rows), glm_heads, s);
+            if (c.which == 0) return c.t.on.tf_kda_prep_as(c.form, cv(c.bd.p), @intCast(c.b.width()), @intCast(c.b.bOff()), cv(c.bd.a), @intCast(c.b.n()), cv(c.bd.cs), cv(c.bd.cw), cf(c.bd.a_log), cf(c.bd.dt_bias), lower, mf(c.sv.q), mf(c.sv.k), mv(c.sv.v), mf(c.sv.g), mf(c.sv.b), @intCast(c.rows), glm_heads, s);
+            return c.t.on.tf_kda_out_as(c.form, cf(c.y), cv(c.bd.g), @intCast(c.b.n()), cv(c.bd.norm), eps_out, mv(c.out), @intCast(c.rows), glm_heads, s);
         }
     };
-    for ([_]usize{ rows, 1 }) |r| for ([_]u1{ 0, 1 }, [_][]const u8{ "prep", "out" }) |which, name| {
-        const m = try timeMs(t, 15, PO{ .t = t, .b = &b, .bd = bd, .sv = sv, .y = at(y), .out = out, .rows = r, .which = which }, po.f);
-        std.debug.print("KDA speed {s}, {d} rows, 64 heads: {d:.4} ms\n", .{ name, r, m });
+    for ([_]usize{ rows, 4, 1 }) |r| for ([_]u1{ 0, 1 }, [_][]const u8{ "prep", "out" }) |which, name| {
+        var ms: [2]f64 = undefined;
+        for (&ms, [_]Launcher.KdaForm{ .block, .wave }) |*m, form| m.* = try timeMs(t, 15, PO{ .t = t, .b = &b, .bd = bd, .sv = sv, .y = at(y), .out = out, .rows = r, .which = which, .form = form }, po.f);
+        std.debug.print("KDA speed {s}, {d} rows, 64 heads: block form {d:.4} ms, wave form {d:.4} ms\n", .{ name, r, ms[0], ms[1] });
     };
     // the keep of 4 rows over GLM's 34 KDA layers on the window saves (one launch), and the conv shift of all 34
     const layers = 34;
