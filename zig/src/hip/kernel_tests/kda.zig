@@ -969,8 +969,9 @@ fn scanAs(t: *Rig, steps: Launcher.KdaSteps, heads: usize, in: Saves, state: u64
     try t.on.tf_kda_as(steps, cf(in.q + from * n * 4), cf(in.k + from * n * 4), cv(in.v + from * n * 2), cf(in.g + from * n * 4), cf(in.b + from * heads * 4), mf(state), mf(y + from * n * 4), @intCast(rows), @intCast(heads), t.stream.handle, null, 0);
 }
 
-test "KDA: K-5, the scans at 12 and 8 staged steps give the bytes of 16 at every length, cut and verify window" {
-    // The oracle: the scans as before K-5 (tf_kda_as .t16: the prompt blocks and the tile at 16 steps). Lengths under
+test "KDA: K-5, the scans at 8 staged steps give the bytes of 16 at every length, cut and verify window" {
+    // The oracle: the scans as before K-5 (tf_kda_as .t16: the prompt blocks and the tile at 16 steps), against the
+    // engine's 8 (.t8). Lengths under
     // 64 take the tile, from 64 the prompt blocks; cuts off the 8- and 12-step boundaries; holds of 1-8 rows.
     const t = try Rig.open(1 << 20);
     defer t.close();
@@ -988,7 +989,7 @@ test "KDA: K-5, the scans at 12 and 8 staged steps give the bytes of 16 at every
     const lengths = [_]usize{ 1, 2, 3, 4, 5, 7, 8, 9, 11, 12, 13, 15, 16, 17, 24, 25, 31, 32, 33, 63, 64, 65, 100, 127, 128, 129, 1000, 2045, 2048 };
     for (lengths) |len| {
         var want: [2][]u8 = undefined;
-        for ([_]Launcher.KdaSteps{ .t16, .t12, .t8 }, 0..) |steps, i| {
+        for ([_]Launcher.KdaSteps{ .t16, .t8 }, 0..) |steps, i| {
             try state.upload(0, std.mem.sliceAsBytes(in.state));
             try y.fill8(0);
             try scanAs(t, steps, heads, dev, at(state), at(y), 0, len);
@@ -1017,7 +1018,7 @@ test "KDA: K-5, the scans at 12 and 8 staged steps give the bytes of 16 at every
     const one_s = try rig.download(u8, state);
     defer gpa.free(one_s);
     for ([_]Cut{ .{ .at = &.{7} }, .{ .at = &.{13} }, .{ .at = &.{2045} }, .{ .at = &.{ 7, 20, 83, 2045 } }, .{ .at = &.{ 13, 77 } } }) |cut| {
-        for ([_]Launcher.KdaSteps{ .t12, .t8 }) |steps| {
+        for ([_]Launcher.KdaSteps{.t8}) |steps| {
             try state.upload(0, std.mem.sliceAsBytes(in.state));
             try y.fill8(0);
             var from: usize = 0;
@@ -1054,7 +1055,7 @@ test "KDA: K-5, the scans at 12 and 8 staged steps give the bytes of 16 at every
         try rig.expect(std.mem.eql(u8, ys[0], ys[1]), "KDA K-5 hold at {d} rows differs from 16 steps", .{rows});
         checked += 1;
     }
-    std.debug.print("KDA K-5: {d} launches at 12 and 8 staged steps bit-equal to 16 (lengths 1-2,048, cuts 7, 13, 2,045, holds 1-8)\n", .{checked});
+    std.debug.print("KDA K-5: {d} launches at 8 staged steps bit-equal to 16 (lengths 1-2,048, cuts 7, 13, 2,045, holds 1-8)\n", .{checked});
 }
 
 test "KDA: speed facts (no gate): K-5, the scans by staged steps, one layer, 64 heads" {
@@ -1085,13 +1086,13 @@ test "KDA: speed facts (no gate): K-5, the scans by staged steps, one layer, 64 
     };
     const Case = struct { name: []const u8, rows: usize, hold: bool, steps: []const Launcher.KdaSteps };
     for ([_]Case{
-        .{ .name = "prompt scan, 2048 rows", .rows = rows, .hold = false, .steps = &.{ .t16, .t12, .t8 } },
-        .{ .name = "decode tile, 1 row", .rows = 1, .hold = false, .steps = &.{ .t16, .t12 } },
-        .{ .name = "verify hold, 4 rows", .rows = 4, .hold = true, .steps = &.{ .t16, .t12 } },
+        .{ .name = "prompt scan, 2048 rows", .rows = rows, .hold = false, .steps = &.{ .t16, .t8 } },
+        .{ .name = "decode tile, 1 row", .rows = 1, .hold = false, .steps = &.{ .t16, .t8 } },
+        .{ .name = "verify hold, 4 rows", .rows = 4, .hold = true, .steps = &.{ .t16, .t8 } },
     }) |cs| {
         for (cs.steps) |steps| {
             const m = try timeMs(t, 15, Ctx{ .t = t, .dev = dev, .state = state, .y = y, .rows = cs.rows, .steps = steps, .hold = cs.hold }, run.f);
-            const label = if (cs.rows < 64 and steps != .t16) "8 (tile)" else @tagName(steps);
+            const label = @tagName(steps);
             std.debug.print("KDA speed K-5 {s}: staged {s}: {d:.4} ms\n", .{ cs.name, label, m });
         }
     }

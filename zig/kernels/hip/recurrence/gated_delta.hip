@@ -527,8 +527,9 @@ tf_gdn_prompt_128(const float* q, const float* k, const float* v, const float* g
 // GLM-5.3-Flash's KDA: the scans above with a decay a key channel (gate (rows, heads, 128) fp32) and v as bf16 bits
 // (the CUDA chain's saved v), Dk = Dv = 128, key heads = value heads. The DeltaNet's sums in its order; only the decay's
 // operand and v's load differ. Prep, out and the conv shift are recurrence/kda.hpp's ports of cuda/glm_kda.cu.
-// KDA stages 8 steps at a time (the DeltaNet 16): its 128 decays a step make the 16-step tiles' LDS cut occupancy
-// (25,152 B a block against 17,024), and its verify windows are at most 4 rows. A step's arithmetic does not change.
+// KDA stages 8 steps at a time (the DeltaNet 16): its 128 decays a step make 16-step tiles' LDS cut occupancy
+// (25,152 B a block, occupancy 10; at 8: 12,576 B, 16), and its verify windows are at most 4 rows. A step's arithmetic
+// does not change. Runq 743: the 4-row hold 43.8 -> 36.7 us, the 1-row tile 28.3 -> 24.3 us.
 constexpr int kKdaSteps = 8;
 
 extern "C" __global__ void __launch_bounds__(256)
@@ -558,19 +559,12 @@ tf_kda_keep_128(float* state, long long state_stride, const float* k, const uint
                                                                       heads, 128, nullptr, 0);
 }
 
-// The prompt scan stages 12 steps (21,552 B a block: 3 blocks a CU, occupancy 6, the DeltaNet's; 16 steps took
-// 28,736 B, occupancy 4) or 8 (about 14.4 KiB: occupancy 7, the VGPR bound). Both are timed (kernel_tests/kda.zig
-// speed facts); the launcher takes tf_kda_prompt_128 (12).
+// The prompt scan stages 8 steps: 14,368 B a block, 183 VGPRs, occupancy 8 (16 steps: 28,736 B, occupancy 4). On
+// gfx1151 at 2,048 rows x 64 heads: 7.57 ms against 9.36 at 16 and 9.43 at 12 (occupancy 6) (runq 743).
 extern "C" __global__ void __launch_bounds__(128)
 tf_kda_prompt_128(const float* q, const float* k, const uint16_t* v, const float* gate, const float* beta, float* state,
                   float* y, int length, int heads) {
-    tf::rocm::gated_delta_prompt_body<4, 128, uint16_t, 12>(q, k, v, gate, beta, state, y, length, heads, heads);
-}
-
-extern "C" __global__ void __launch_bounds__(128)
-tf_kda_prompt_128_t8(const float* q, const float* k, const uint16_t* v, const float* gate, const float* beta,
-                     float* state, float* y, int length, int heads) {
-    tf::rocm::gated_delta_prompt_body<4, 128, uint16_t, 8>(q, k, v, gate, beta, state, y, length, heads, heads);
+    tf::rocm::gated_delta_prompt_body<4, 128, uint16_t, kKdaSteps>(q, k, v, gate, beta, state, y, length, heads, heads);
 }
 
 // The KDA scans as they were before K-5 (16 steps staged): the bit oracle of kernel_tests/kda.zig's K-5 test and the
