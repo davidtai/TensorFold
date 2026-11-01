@@ -45,5 +45,17 @@ __global__ void __launch_bounds__(dense_tile::kThreads) bf16_wmma(Affine a) {
     wmma_dense_tile<K, DenseTune<K>::kAhead, false, true>(a);
 }
 
+// The same sums in another block order (G4-4; the bits are bf16_wmma's) for weights too large to stay in cache: row
+// tiles grouped so a group's x rows (at most 16 MiB of bf16) stay in cache while its column tiles' weights stream once;
+// two windows of loads ahead at K 8,192 and up.
+constexpr int bf16_group_rows(int k) {
+    const int g = (16 << 20) / (dense_tile::kBM * k * 2);
+    return g < 1 ? 1 : g > 64 ? 64 : g;
+}
+template <int K>
+__global__ void __launch_bounds__(dense_tile::kThreads) bf16_wmma_ord(Affine a) {
+    wmma_dense_tile<K, K >= 8192 ? 2 : DenseTune<K>::kAhead, false, true, bf16_group_rows(K)>(a);
+}
+
 }  // namespace rocm
 }  // namespace tf

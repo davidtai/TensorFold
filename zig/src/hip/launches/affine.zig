@@ -215,6 +215,8 @@ pub const Kernels = struct {
     /// The same pair with GLM's SwiGLU rounding points (bf16_tiles.hpp StreamGlmSwiglu); its silu table in scale.p.
     bf16_glu: [stream_rows.len]?Function,
     bf16_wmma: [bf16_ks.len]?Function,
+    /// The same sums with row tiles grouped (bf16_tiles.hpp bf16_wmma_ord): bf16Go's tile for weights of 32 MiB and up.
+    bf16_wmma_ord: [bf16_ks.len]?Function,
     kp: [bit_widths.len][kp_tiles.len]Function,
     span: [2]Function,
     fold: Function,
@@ -269,6 +271,7 @@ pub const Kernels = struct {
         }
         inline for (bf16_ks, 0..) |bk, i| {
             k.bf16_wmma[i] = if (k.matrix) try tiles_obj.function(std.fmt.comptimePrint(r ++ "9bf16_wmmaILi{d}EEEvNS0_6AffineE", .{bk})) else null;
+            k.bf16_wmma_ord[i] = if (k.matrix) try tiles_obj.function(std.fmt.comptimePrint(r ++ "13bf16_wmma_ordILi{d}EEEvNS0_6AffineE", .{bk})) else null;
         }
         return k;
     }
@@ -766,7 +769,20 @@ pub const Kernels = struct {
     pub fn bf16Go(k: *const Kernels, r: *const runtime.Runtime, a: Arg, prompt: bool, s: abi.Stream) Error!void {
         if (a.bits != 16 or a.m < 1 or a.n < 1 or @rem(a.k, 32) != 0 or a.x % 16 != 0) return refuse("bf16 shape");
         if (!prompt) return k.streamGo(r, a, .{}, a.n, 1, s);
-        const f = k.bf16_wmma[bf16Index(a.k) orelse return refuse("bf16 K")] orelse return refuse("bf16 wmma tile");
+        return k.bf16Wmma(r, a, bf16Grouped(a.n, a.k), s);
+    }
+
+    /// The WMMA tile's block order for a weight [n, k] (G4-4, measured at GLM's products): row tiles grouped where the
+    /// weights (n k bf16) are 32 MiB or more and k is 1,536 or more, else row-major. Either order gives the same bits.
+    pub fn bf16Grouped(n: c_int, kk: c_int) bool {
+        return kk >= 1536 and @as(u64, @intCast(n)) * @as(u64, @intCast(kk)) * 2 >= 32 << 20;
+    }
+
+    /// bf16Go's prompt product on the WMMA tile, row tiles grouped (`grouped`) or row-major; the same bits.
+    pub fn bf16Wmma(k: *const Kernels, r: *const runtime.Runtime, a: Arg, grouped: bool, s: abi.Stream) Error!void {
+        if (a.bits != 16 or a.m < 1 or a.n < 1 or @rem(a.k, 32) != 0 or a.x % 16 != 0) return refuse("bf16 shape");
+        const i = bf16Index(a.k) orelse return refuse("bf16 K");
+        const f = (if (grouped) k.bf16_wmma_ord[i] else k.bf16_wmma[i]) orelse return refuse("bf16 wmma tile");
         if (a.words % 16 != 0) return refuse("bf16 rows unaligned");
         var args: hl.Args = .{};
         try args.add(a);

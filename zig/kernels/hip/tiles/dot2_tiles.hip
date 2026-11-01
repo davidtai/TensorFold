@@ -404,6 +404,14 @@ TF_HELD(8, 2) TF_HELD(8, 4)
 TF_BF16_STREAM(1) TF_BF16_STREAM(2) TF_BF16_STREAM(4)
 #endif
 #if TF_MATRIX
+template __global__ void bf16_wmma_ord<128>(Affine);
+template __global__ void bf16_wmma_ord<512>(Affine);
+template __global__ void bf16_wmma_ord<1536>(Affine);
+template __global__ void bf16_wmma_ord<2048>(Affine);
+template __global__ void bf16_wmma_ord<4096>(Affine);
+template __global__ void bf16_wmma_ord<8192>(Affine);
+template __global__ void bf16_wmma_ord<12288>(Affine);
+template __global__ void bf16_wmma_ord<16384>(Affine);
 template __global__ void bf16_wmma<128>(Affine);
 template __global__ void bf16_wmma<512>(Affine);
 template __global__ void bf16_wmma<1536>(Affine);

@@ -19,4 +19,5 @@ test {
     _ = @import("kernel_tests/glm/exl3_fold.zig");
     _ = @import("kernel_tests/glm/exl3_epi.zig");
     _ = @import("kernel_tests/glm/mhc.zig");
+    _ = @import("kernel_tests/glm/bf16_tile.zig");
 }
