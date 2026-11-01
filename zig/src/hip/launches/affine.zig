@@ -217,6 +217,8 @@ pub const Kernels = struct {
     bf16_wmma: [bf16_ks.len]?Function,
     /// The same sums with row tiles grouped (bf16_tiles.hpp bf16_wmma_ord): bf16Go's tile for weights of 32 MiB and up.
     bf16_wmma_ord: [bf16_ks.len]?Function,
+    /// G4-4c sweep (test-only): the grouped tile at sweep_ks x load depth 1, 2 x sweep_groups.
+    bf16_wmma_sweep: [sweep_ks.len][2][sweep_groups.len]?Function,
     kp: [bit_widths.len][kp_tiles.len]Function,
     span: [2]Function,
     fold: Function,
@@ -273,6 +275,9 @@ pub const Kernels = struct {
             k.bf16_wmma[i] = if (k.matrix) try tiles_obj.function(std.fmt.comptimePrint(r ++ "9bf16_wmmaILi{d}EEEvNS0_6AffineE", .{bk})) else null;
             k.bf16_wmma_ord[i] = if (k.matrix) try tiles_obj.function(std.fmt.comptimePrint(r ++ "13bf16_wmma_ordILi{d}EEEvNS0_6AffineE", .{bk})) else null;
         }
+        inline for (sweep_ks, 0..) |sk, i| inline for (.{ 1, 2 }, 0..) |ah, j| inline for (sweep_groups, 0..) |sg, g| {
+            k.bf16_wmma_sweep[i][j][g] = if (k.matrix) try tiles_obj.function(std.fmt.comptimePrint(r ++ "15bf16_wmma_sweepILi{d}ELi{d}ELi{d}EEEvNS0_6AffineE", .{ sk, ah, sg })) else null;
+        };
         return k;
     }
 
@@ -776,6 +781,21 @@ pub const Kernels = struct {
     /// weights (n k bf16) are 32 MiB or more and k is 1,536 or more, else row-major. Either order gives the same bits.
     pub fn bf16Grouped(n: c_int, kk: c_int) bool {
         return kk >= 1536 and @as(u64, @intCast(n)) * @as(u64, @intCast(kk)) * 2 >= 32 << 20;
+    }
+
+    /// G4-4c sweep (test-only): the K the sweep compiles and its group sizes (row tiles).
+    pub const sweep_ks = [_]c_int{ 1536, 4096, 8192, 12288, 16384 };
+    pub const sweep_groups = [_]c_int{ 2, 4, 8, 16, 32, 64 };
+
+    /// The grouped tile at load depth `ahead` (1, 2) and group `sweep_groups[g]` (test-only).
+    pub fn bf16Sweep(k: *const Kernels, r: *const runtime.Runtime, a: Arg, ahead: usize, g: usize, s: abi.Stream) Error!void {
+        const i = for (sweep_ks, 0..) |d, j| {
+            if (d == a.k) break j;
+        } else return refuse("bf16 sweep K");
+        const f = k.bf16_wmma_sweep[i][ahead - 1][g] orelse return refuse("bf16 sweep tile");
+        var args: hl.Args = .{};
+        try args.add(a);
+        try go(r, f, .{ .x = cdiv(a.n, 128) * cdiv(a.m, 128) }, .{ .x = 256 }, s, &args);
     }
 
     /// bf16Go's prompt product on the WMMA tile, row tiles grouped (`grouped`) or row-major; the same bits.

@@ -56,6 +56,11 @@ template <int K>
 __global__ void __launch_bounds__(dense_tile::kThreads) bf16_wmma_ord(Affine a) {
     wmma_dense_tile<K, K >= 8192 ? 2 : DenseTune<K>::kAhead, false, true, bf16_group_rows(K)>(a);
 }
+// G4-4c sweep (test-only, not for main): the grouped tile at a given load depth and group size.
+template <int K, int AHEAD, int G>
+__global__ void __launch_bounds__(dense_tile::kThreads) bf16_wmma_sweep(Affine a) {
+    wmma_dense_tile<K, AHEAD, false, true, G>(a);
+}
 
 }  // namespace rocm
 }  // namespace tf
