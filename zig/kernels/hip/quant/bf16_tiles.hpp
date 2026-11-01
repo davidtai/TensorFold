@@ -47,8 +47,10 @@ __global__ void __launch_bounds__(dense_tile::kThreads) bf16_wmma(Affine a) {
 
 // The same sums in another block order (G4-4; the bits are bf16_wmma's) for weights too large to stay in cache: row
 // tiles grouped so a group's x rows (at most 16 MiB of bf16) stay in cache while its column tiles' weights stream once;
-// two windows of loads ahead at K 8,192 and up.
+// two windows of loads ahead at K 8,192 and up. At K 1,536 groups of 4 row tiles (G4-4c's sweep: q_b [20480, 1536] at
+// 8,192 rows 45.1 TFLOPS, against 30.4 at 42 row tiles).
 constexpr int bf16_group_rows(int k) {
+    if (k == 1536) return 4;
     const int g = (16 << 20) / (dense_tile::kBM * k * 2);
     return g < 1 ? 1 : g > 64 ? 64 : g;
 }
