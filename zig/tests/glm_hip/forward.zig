@@ -546,7 +546,9 @@ pub fn command(init: std.process.Init, args: []const [:0]const u8) !void {
     var profiler: Profiler = undefined;
     const prof_on = if (std.c.getenv("TF_GLM_PROFILE")) |v| std.mem.eql(u8, std.mem.span(v), "1") else false;
     if (prof_on) {
-        profiler = .{ .p = try glm.profile.Prof.init(init.gpa, &r, rn.s.handle, 4096, 8 << 20), .a = a, .io = io };
+        // the picks a window copies aside: i32 [8] a row for each of its MoE groups (46 router layers at most)
+        const pick_bytes = @max(8 << 20, dump.router_layers * @max(o.chunk, glm.state.window_rows) * 8 * 4);
+        profiler = .{ .p = try glm.profile.Prof.init(init.gpa, &r, rn.s.handle, 4096, pick_bytes), .a = a, .io = io };
         rn.prof = &profiler;
         rn.fp.prof = &profiler.p;
         rn.fd.prof = &profiler.p;
