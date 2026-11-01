@@ -83,7 +83,7 @@ const Case = struct {
         return c.runOn(t, first, count, if (chain) .chain else .served);
     }
 
-    const Form = enum { served, chain, bk32 };
+    const Form = enum { served, chain, bk32, nola };
 
     fn runOn(c: *Case, t: *Rig, first: usize, count: usize, form: Form) ![]f32 {
         const it = [3]i32{ 0, @intCast(first), @intCast(count) };
@@ -94,6 +94,7 @@ const Case = struct {
             .served => try launch.gemm(&t.on, p, t.stream.handle),
             .chain => try launch.gemmChain(&t.on, p, t.stream.handle),
             .bk32 => try launch.gemmBk32(&t.on, p, t.stream.handle),
+            .nola => try launch.gemmNola(&t.on, p, t.stream.handle),
         }
         try t.stream.synchronize();
         return rig.download(f32, c.z);
@@ -173,7 +174,7 @@ test "glm exl3 fold (F-K6): the prompt GEMM's 64-k groups within float64's bound
     }
 }
 
-test "glm exl3 gemm, 64-k stages: the bits of the 32-k stages (the same 64-k fold groups) at the gate/up and down shapes, over the 64-row passes" {
+test "glm exl3 gemm, 64-k stages with the fragment look-ahead: the bits of the 32-k stages and of no look-ahead at the gate/up and down shapes, over the 64-row passes" {
     const t = try Rig.open(1 << 20);
     defer t.close();
     if (!t.bf16 or @import("../../exl3.zig").matrix() == false) return error.SkipZigTest;
@@ -186,12 +187,14 @@ test "glm exl3 gemm, 64-k stages: the bits of the 32-k stages (the same 64-k fol
         for ([_][2]usize{ .{ 0, m }, .{ 37, 91 }, .{ 199, 1 } }) |cut| {
             const a = try c.runOn(t, cut[0], cut[1], .served);
             defer gpa.free(a);
-            const b = try c.runOn(t, cut[0], cut[1], .bk32);
-            defer gpa.free(b);
-            const same = std.mem.eql(u32, @ptrCast(a), @ptrCast(b));
-            try rig.expect(same, "exl3 gemm K {d}: the 64-k stage differs from the 32-k stage (cut {d}, {d})", .{ kn[0], cut[0], cut[1] });
-            compared += 1;
+            for ([_]Case.Form{ .bk32, .nola }) |ref| {
+                const b = try c.runOn(t, cut[0], cut[1], ref);
+                defer gpa.free(b);
+                const same = std.mem.eql(u32, @ptrCast(a), @ptrCast(b));
+                try rig.expect(same, "exl3 gemm K {d}: the served GEMM differs from the {s} form (cut {d}, {d})", .{ kn[0], @tagName(ref), cut[0], cut[1] });
+                compared += 1;
+            }
         }
     }
-    std.debug.print("RESULT glm exl3 gemm 64-k stages: {d} calls (gate/up and down shapes, 200 rows and cuts) bit-equal to the 32-k stages\n", .{compared});
+    std.debug.print("RESULT glm exl3 gemm 64-k stages, fragment look-ahead: {d} calls (gate/up and down shapes, 200 rows and cuts) bit-equal to the 32-k stages and to no look-ahead\n", .{compared});
 }

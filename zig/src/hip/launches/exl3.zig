@@ -28,6 +28,8 @@ pub const Fns = struct {
     gemm_chain: Function,
     /// The GEMM at 32-k stages (tf_exl3_gemm_bk32): the tests' bit check of the served 64-k stage, not served.
     gemm_bk32: Function,
+    /// The GEMM without the fragment look-ahead (tf_exl3_gemm_nola): the tests' bit check, not served.
+    gemm_nola: Function,
     /// The down GEMM with the down epilogue fused (tf_exl3_gemm_down): y [pair][D] in one launch, the same bits.
     gemm_down: Function,
     gateup: Function,
@@ -41,6 +43,7 @@ pub const Fns = struct {
             .gemm = try m.function("tf_exl3_gemm"),
             .gemm_chain = try m.function("tf_exl3_gemm_chain"),
             .gemm_bk32 = try m.function("tf_exl3_gemm_bk32"),
+            .gemm_nola = try m.function("tf_exl3_gemm_nola"),
             .gemm_down = try m.function("tf_exl3_gemm_down"),
             .gateup = try m.function("tf_exl3_gateup_epilogue"),
             .down = try m.function("tf_exl3_down_epilogue"),
@@ -142,6 +145,11 @@ pub fn gemmChain(l: *const Launcher, p: Product, s: S) Error!void {
 /// The same product at 32-k stages (the tests' bit reference of the 64-k stage).
 pub fn gemmBk32(l: *const Launcher, p: Product, s: S) Error!void {
     return gemmOn(l, l.exl3.gemm_bk32, p, s);
+}
+
+/// The same product without the fragment look-ahead (the tests' bit reference of the look-ahead).
+pub fn gemmNola(l: *const Launcher, p: Product, s: S) Error!void {
+    return gemmOn(l, l.exl3.gemm_nola, p, s);
 }
 
 /// The down GEMM (mats 1) and the down epilogue in one launch: y [pairs][n] fp32 = the routed pairs' down outputs, the bits

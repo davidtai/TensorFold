@@ -257,7 +257,7 @@ constexpr int kBK = 64;  // the served k a stage (BK); 32 is the earlier form, k
 typedef _Float16 h16 __attribute__((ext_vector_type(16)));
 typedef float f8 __attribute__((ext_vector_type(8)));
 
-template <int K2, int CB, int FOLD, int EPI, int BK = kBK>
+template <int K2, int CB, int FOLD, int EPI, int BK = kBK, int LOOKAHEAD = 1>
 __device__ void gemm(const uint16_t* X0, const uint16_t* X1, int x_div, const uint64_t* tp0, const uint64_t* tp1,
                      const int* items, const int* members, float* z, int k, int n, int pairs, int experts,
                      const uint16_t* svh_d, float* y) {
@@ -324,13 +324,23 @@ __device__ void gemm(const uint16_t* X0, const uint16_t* X1, int x_div, const ui
         for (int s = 0; s < iters; ++s) {
             const int buf = s & 1;
             if (s + 1 < iters) gload(s + 1);
+            // the fragments of k tile kk + 1 load from LDS while k tile kk's WMMAs run (the padded rows already put a
+            // wave's 16 fragment rows in distinct banks: the LDS wait is latency)
+            h16 af[2], bf[2], an[2], bn[2];
+            auto frag = [&](int kk, h16 (&a)[2], h16 (&b)[2]) {
+#pragma unroll
+                for (int i = 0; i < 2; ++i) a[i] = *reinterpret_cast<const h16*>(&As[buf][(wm * 32 + i * 16 + l16) * kLK + kk * 16]);
+#pragma unroll
+                for (int j = 0; j < 2; ++j) b[j] = *reinterpret_cast<const h16*>(&Bs[buf][(wn * 32 + j * 16 + l16) * kLK + kk * 16]);
+            };
+            if constexpr (LOOKAHEAD) frag(0, af, bf);
 #pragma unroll
             for (int kk = 0; kk < kKT; ++kk) {
-                h16 af[2], bf[2];
-#pragma unroll
-                for (int i = 0; i < 2; ++i) af[i] = *reinterpret_cast<const h16*>(&As[buf][(wm * 32 + i * 16 + l16) * kLK + kk * 16]);
-#pragma unroll
-                for (int j = 0; j < 2; ++j) bf[j] = *reinterpret_cast<const h16*>(&Bs[buf][(wn * 32 + j * 16 + l16) * kLK + kk * 16]);
+                if constexpr (LOOKAHEAD) {
+                    if (kk + 1 < kKT) frag(kk + 1, an, bn);
+                } else {
+                    frag(kk, af, bf);
+                }
 #pragma unroll
                 for (int i = 0; i < 2; ++i)
 #pragma unroll
@@ -342,6 +352,12 @@ __device__ void gemm(const uint16_t* X0, const uint16_t* X1, int x_div, const ui
                             acc[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(af[i], bf[j], acc[i][j]);
                         }
                     }
+                if constexpr (LOOKAHEAD) {
+                    if (kk + 1 < kKT) {
+#pragma unroll
+                        for (int i = 0; i < 2; ++i) af[i] = an[i], bf[i] = bn[i];
+                    }
+                }
             }
             if constexpr (FOLD > 0) {
                 if ((s + 1) % FOLD == 0 || s + 1 == iters) {
@@ -447,7 +463,15 @@ extern "C" __global__ void __launch_bounds__(256) tf_exl3_gemm_bk32(const uint16
                                                                     const uint64_t* tp0, const uint64_t* tp1,
                                                                     const int* items, const int* members, float* z,
                                                                     int k, int n, int pairs, int experts) {
-    gemm<8, kMcg, 2, 0, 32>(X0, X1, x_div, tp0, tp1, items, members, z, k, n, pairs, experts, nullptr, nullptr);
+    gemm<8, kMcg, 2, 0, 32, 0>(X0, X1, x_div, tp0, tp1, items, members, z, k, n, pairs, experts, nullptr, nullptr);
+}
+
+// The served GEMM without the fragment look-ahead (the kBK 64 form before it): the tests' bit check. Not served.
+extern "C" __global__ void __launch_bounds__(256) tf_exl3_gemm_nola(const uint16_t* X0, const uint16_t* X1, int x_div,
+                                                                    const uint64_t* tp0, const uint64_t* tp1,
+                                                                    const int* items, const int* members, float* z,
+                                                                    int k, int n, int pairs, int experts) {
+    gemm<8, kMcg, kGemmFold, 0, kBK, 0>(X0, X1, x_div, tp0, tp1, items, members, z, k, n, pairs, experts, nullptr, nullptr);
 }
 
 // ---- 5. the epilogues -----------------------------------------------------------------------------------------------
