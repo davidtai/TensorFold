@@ -1,7 +1,8 @@
-//! G4-1 and G4-5: the rewritten mHC kernels against the kernels they replace (kept as test-only references), bit for
-//! bit: the mix with its 24 mixes split over 1-3 blocks, the Sinkhorn finish on 16 lanes, the post 8 columns a thread.
-//! Inputs mix large and small magnitudes (2^-12 .. 2^12) so a changed order of any sum shows as a rounding difference.
-//! Then speed facts (no gate) of each kernel at 4 and 2,048 rows, new and old.
+//! G4-1 and G4-5: the mHC kernels' bits do not depend on how the work is cut. The mix with its 24 mixes split over 2
+//! and 3 blocks gives the 1-block partials; hc pre as served (the split by row count) gives the 1-block mix and the
+//! finish; the post on row cuts gives the post on all rows. Inputs mix large and small magnitudes (2^-12 .. 2^12) so a
+//! changed order of any sum shows as a rounding difference. The values against float64 are hc.zig's tests. Then speed
+//! facts (no gate) of each kernel at 4 and 2,048 rows.
 const std = @import("std");
 const rig = @import("../rig.zig");
 const check = @import("check.zig");
@@ -46,7 +47,7 @@ fn same(name: []const u8, a: DeviceBuffer, b: DeviceBuffer, bytes: usize) !void 
     }
 }
 
-/// One hc pre case: streams, mixing weights, base, scale, the norm weight; outputs twice (new and reference).
+/// One hc pre case: streams, mixing weights, base, scale, the norm weight; outputs twice (two ways to the same bits).
 const Pre = struct {
     rows: usize,
     x: DeviceBuffer,
@@ -92,7 +93,7 @@ const Pre = struct {
     }
 };
 
-test "glm mhc (G4-5): the mix split over 2 and 3 blocks gives the 1-block partials bit for bit; the 16-lane Sinkhorn finish gives the one-thread finish's bits" {
+test "glm mhc (G4-5): the mix split over 2 and 3 blocks gives the 1-block partials bit for bit; hc pre as served gives the 1-block mix and the finish" {
     const t = try Rig.open(1 << 20);
     defer t.close();
     var rng: rig.Rng = .{ .state = 0x4C5A_0001 };
@@ -108,30 +109,25 @@ test "glm mhc (G4-5): the mix split over 2 and 3 blocks gives the 1-block partia
             var name: [64]u8 = undefined;
             try same(try std.fmt.bufPrint(&name, "mix {d} rows, {d} parts", .{ rows, parts }), c.part[0], c.part[1], glm.hcPartBytes(rows));
         }
-        // the finish on the same partials: the new kernel into [0], the reference into [1]
-        try glm.hcFinish(&t.on, t.on.glm.hc_finish, p(c.x), p(c.part[0]), p(c.base), p(c.scale), p(c.nw), p(c.out[0]), p(c.post[0]), p(c.comb[0]), eps, hc_eps, iters, r, t.stream.handle);
-        try glm.hcFinish(&t.on, t.on.glm.hc_finish_ref, p(c.x), p(c.part[0]), p(c.base), p(c.scale), p(c.nw), p(c.out[1]), p(c.post[1]), p(c.comb[1]), eps, hc_eps, iters, r, t.stream.handle);
+        // the finish on the 1-block partials into [1]; hcPre as served into [0]
+        try glm.hcFinish(&t.on, p(c.x), p(c.part[0]), p(c.base), p(c.scale), p(c.nw), p(c.out[1]), p(c.post[1]), p(c.comb[1]), eps, hc_eps, iters, r, t.stream.handle);
+        try glm.hcPre(&t.on, p(c.x), p(c.fnw), p(c.base), p(c.scale), p(c.nw), p(c.out[0]), p(c.post[0]), p(c.comb[0]), p(c.part[1]), eps, hc_eps, iters, r, t.stream.handle);
         try t.stream.synchronize();
         var name: [64]u8 = undefined;
-        try same(try std.fmt.bufPrint(&name, "finish {d} rows: comb", .{rows}), c.comb[0], c.comb[1], rows * S * S * 4);
-        try same(try std.fmt.bufPrint(&name, "finish {d} rows: post", .{rows}), c.post[0], c.post[1], rows * S * 4);
-        try same(try std.fmt.bufPrint(&name, "finish {d} rows: normed", .{rows}), c.out[0], c.out[1], rows * D * 2);
-        // hcPre as served (the split by row count) equals the 1-block mix and the reference finish
-        try glm.hcPre(&t.on, p(c.x), p(c.fnw), p(c.base), p(c.scale), p(c.nw), p(c.out[0]), p(c.post[0]), p(c.comb[0]), p(c.part[0]), eps, hc_eps, iters, r, t.stream.handle);
-        try t.stream.synchronize();
         try same(try std.fmt.bufPrint(&name, "hc pre {d} rows: normed", .{rows}), c.out[0], c.out[1], rows * D * 2);
+        try same(try std.fmt.bufPrint(&name, "hc pre {d} rows: post", .{rows}), c.post[0], c.post[1], rows * S * 4);
         try same(try std.fmt.bufPrint(&name, "hc pre {d} rows: comb", .{rows}), c.comb[0], c.comb[1], rows * S * S * 4);
         cases += 1;
     };
-    std.debug.print("RESULT glm mhc pre: {d} cases (rows 1-5, 70, 2,048; two logit scales), split mixes and the 16-lane finish bit-equal to the references\n", .{cases});
+    std.debug.print("RESULT glm mhc pre: {d} cases (rows 1-5, 70, 2,048; two logit scales), split mixes and hc pre as served bit-equal to the 1-block mix\n", .{cases});
 }
 
-test "glm mhc (G4-1): the post 8 columns a thread gives the one-column post's bits, 1 and 2 partials, in place" {
+test "glm mhc (G4-1): the post on row cuts gives the post on all rows bit for bit, 1 and 2 partials, in place" {
     const t = try Rig.open(1 << 20);
     defer t.close();
     var rng: rig.Rng = .{ .state = 0x4C5A_0002 };
     var cases: usize = 0;
-    for ([_]usize{ 1, 2, 3, 4, 70, 2048 }) |rows| for ([_]c_int{ 1, 2 }) |parts| {
+    for ([_]usize{ 4, 70, 2048 }) |rows| for ([_]c_int{ 1, 2 }) |parts| {
         const hx = try wide(&rng, rows * W, 1.0);
         defer gpa.free(hx);
         const hg = try gpa.alloc(f32, 2 * rows * D);
@@ -152,17 +148,23 @@ test "glm mhc (G4-1): the post 8 columns a thread gives the one-column post's bi
         var comb = try t.upload(hc);
         defer comb.free();
         const stride: i64 = @intCast(rows * D);
-        try glm.hcPostWith(&t.on, true, p(xs[0]), p(xs[0]), p(g), parts, stride, p(post), p(comb), @intCast(rows), t.stream.handle);
-        try glm.hcPostWith(&t.on, false, p(xs[1]), p(xs[1]), p(g), parts, stride, p(post), p(comb), @intCast(rows), t.stream.handle);
+        try glm.hcPost(&t.on, p(xs[0]), p(xs[0]), p(g), parts, stride, p(post), p(comb), @intCast(rows), t.stream.handle);
+        // cuts of 1, 3 and the rest
+        const cuts = [_]usize{ 0, 1, 4, rows };
+        for (cuts[0 .. cuts.len - 1], cuts[1..]) |lo, hi| {
+            if (lo >= hi) continue;
+            const xc: ?*anyopaque = @ptrFromInt(at(xs[1]) + lo * W * 2);
+            try glm.hcPost(&t.on, xc, xc, @ptrFromInt(at(g) + lo * D * 4), parts, stride, @ptrFromInt(at(post) + lo * S * 4), @ptrFromInt(at(comb) + lo * S * S * 4), @intCast(hi - lo), t.stream.handle);
+        }
         try t.stream.synchronize();
         var name: [64]u8 = undefined;
         try same(try std.fmt.bufPrint(&name, "post {d} rows, {d} partials", .{ rows, parts }), xs[0], xs[1], rows * W * 2);
         cases += 1;
     };
-    std.debug.print("RESULT glm mhc post: {d} cases (rows 1-4, 70, 2,048; 1 and 2 partials, in place), the 8-column post bit-equal to the reference\n", .{cases});
+    std.debug.print("RESULT glm mhc post: {d} cases (rows 4, 70, 2,048; 1 and 2 partials, in place), row cuts bit-equal to all rows\n", .{cases});
 }
 
-const Which = enum { pre, mix, finish, finish_ref, mix1, post, post_ref };
+const Which = enum { pre, mix, mix1, finish, post };
 
 const Timed = struct {
     t: *Rig,
@@ -179,15 +181,13 @@ const Timed = struct {
             .pre => try glm.hcPre(&t.on, p(c.x), p(c.fnw), p(c.base), p(c.scale), p(c.nw), p(c.out[0]), p(c.post[0]), p(c.comb[0]), p(c.part[0]), eps, hc_eps, iters, r, h),
             .mix => try glm.hcMix(&t.on, p(c.x), p(c.fnw), p(c.part[0]), r, glm.mixParts(r), h),
             .mix1 => try glm.hcMix(&t.on, p(c.x), p(c.fnw), p(c.part[0]), r, 1, h),
-            .finish => try glm.hcFinish(&t.on, t.on.glm.hc_finish, p(c.x), p(c.part[0]), p(c.base), p(c.scale), p(c.nw), p(c.out[0]), p(c.post[0]), p(c.comb[0]), eps, hc_eps, iters, r, h),
-            .finish_ref => try glm.hcFinish(&t.on, t.on.glm.hc_finish_ref, p(c.x), p(c.part[0]), p(c.base), p(c.scale), p(c.nw), p(c.out[0]), p(c.post[0]), p(c.comb[0]), eps, hc_eps, iters, r, h),
-            .post => try glm.hcPostWith(&t.on, true, p(c.x), p(c.x), @ptrFromInt(s.g), 1, 0, p(c.post[0]), p(c.comb[0]), r, h),
-            .post_ref => try glm.hcPostWith(&t.on, false, p(c.x), p(c.x), @ptrFromInt(s.g), 1, 0, p(c.post[0]), p(c.comb[0]), r, h),
+            .finish => try glm.hcFinish(&t.on, p(c.x), p(c.part[0]), p(c.base), p(c.scale), p(c.nw), p(c.out[0]), p(c.post[0]), p(c.comb[0]), eps, hc_eps, iters, r, h),
+            .post => try glm.hcPost(&t.on, p(c.x), p(c.x), @ptrFromInt(s.g), 1, 0, p(c.post[0]), p(c.comb[0]), r, h),
         }
     }
 };
 
-test "glm mhc (G4-1, G4-5, G4-3): speed facts (no gate) of post, pre, mix and finish at 4 and 2,048 rows, new and old" {
+test "glm mhc (G4-1, G4-5, G4-3): speed facts (no gate) of post, pre, mix and finish at 4 and 2,048 rows" {
     const t = try Rig.open(1 << 20);
     defer t.close();
     var rng: rig.Rng = .{ .state = 0x4C5A_0003 };
@@ -200,10 +200,10 @@ test "glm mhc (G4-1, G4-5, G4-3): speed facts (no gate) of post, pre, mix and fi
         // a first pre so post and comb hold real values
         try glm.hcPre(&t.on, p(c.x), p(c.fnw), p(c.base), p(c.scale), p(c.nw), p(c.out[0]), p(c.post[0]), p(c.comb[0]), p(c.part[0]), eps, hc_eps, iters, @intCast(rows), t.stream.handle);
         const calls: usize = if (rows > 64) 20 else 200;
-        var us: [7]f64 = undefined;
-        for ([_]Which{ .pre, .mix, .mix1, .finish, .finish_ref, .post, .post_ref }, 0..) |w, i| {
+        var us: [5]f64 = undefined;
+        for ([_]Which{ .pre, .mix, .mix1, .finish, .post }, 0..) |w, i| {
             us[i] = try check.timeUs(t, Timed{ .t = t, .c = &c, .which = w, .g = at(g) }, Timed.call, calls);
         }
-        std.debug.print("SPEED glm mhc {d} rows: pre {d:.1} us (mix {d:.1} at {d} parts, 1 part {d:.1}; finish {d:.1}, one-thread finish {d:.1}); post {d:.1} us, one-column post {d:.1}\n", .{ rows, us[0], us[1], glm.mixParts(@intCast(rows)), us[2], us[3], us[4], us[5], us[6] });
+        std.debug.print("SPEED glm mhc {d} rows: pre {d:.1} us (mix {d:.1} at {d} parts, 1 part {d:.1}; finish {d:.1}); post {d:.1} us\n", .{ rows, us[0], us[1], glm.mixParts(@intCast(rows)), us[2], us[3], us[4] });
     }
 }

@@ -135,9 +135,9 @@ extern "C" __global__ void __launch_bounds__(kThreads)
     }
     __syncthreads();
     if (t < 32) {
-        // wave 0: lane l < 16 owns comb entry (i, j) = (l / 4, l % 4); lanes 16-19 pre[k], 20-23 post[k]. Each value's
-        // ops are the one-thread kernel's (tf_glm_hc_finish_ref): a row's or column's 4 values are gathered by shuffle
-        // and summed in the same order from the same start, so every lane of the row gets the same bits.
+        // wave 0: lane l < 16 owns comb entry (i, j) = (l / 4, l % 4); lanes 16-19 pre[k], 20-23 post[k]. A row's or
+        // column's 4 values are gathered by shuffle and summed in one order from one start (the max from -inf, the sum
+        // from 0, element 0 first), so every lane of the row or column gets the same bits.
         const int lane = t;
         const float rinv = 1.f / sqrtf(eps + tot[kMix] / static_cast<float>(kWide));
         if (lane >= 16 && lane < 16 + kS) {
@@ -194,8 +194,8 @@ extern "C" __global__ void __launch_bounds__(kThreads)
 
 // hc post: branch = bf16(the `parts` fp32 partials summed in order, `stride` apart); stream s of the row becomes
 // bf16(post[s] branch + sum_t comb[t][s] x[t]). Block (row, 2,048 hidden columns), 8 contiguous columns a thread in
-// 16-byte loads and stores (x, xout, g 16-byte aligned, stride a multiple of 4); each element's ops are
-// tf_glm_hc_post_ref's. x may be xout (a thread reads its columns before it writes them).
+// 16-byte loads and stores (x, xout, g 16-byte aligned, stride a multiple of 4). x may be xout (a thread reads its
+// columns before it writes them).
 extern "C" __global__ void __launch_bounds__(kThreads)
     tf_glm_hc_post(const uint16_t* x, uint16_t* xout, const float* __restrict__ g, int parts, long long stride,
                    const float* __restrict__ post, const float* __restrict__ comb) {
@@ -327,129 +327,6 @@ extern "C" __global__ void __launch_bounds__(kThreads)
     const float s = bf(tf_glm_silu[gu[r * 2 * w + c]]);
     const float u = fminf(fmaxf(bf(gu[r * 2 * w + w + c]), -limit), limit);
     act[i] = float_to_bf16(u * s);
-}
-
-// ---- test-only references (G4-1, G4-5): the kernels before the rewrite, kept until the merge ----
-
-// hc pre, part 2: a block a row. The 16 blocks' partials summed; mix = dots / rms(x) over all 16,384 inputs;
-//   pre[k]  = hc_eps + sigmoid(mix[k] scale[0] + base[k]),        k < 4
-//   post[k] = 2 sigmoid(mix[4 + k] scale[1] + base[4 + k])
-//   comb    = Sinkhorn(mix[8..24] scale[2] + base[8..24]) as 4 x 4 [i][j]: softmax over j + hc_eps, then columns
-//             (over i) normed, then iters - 1 times rows and columns, each sum + hc_eps;
-// then the collapse c = bf16(sum_k pre[k] x[k]) and out = bf16(w bf16(c / rms(c))). post [row][4], comb [row][16].
-extern "C" __global__ void __launch_bounds__(kThreads)
-    tf_glm_hc_finish_ref(const uint16_t* __restrict__ x, const float* __restrict__ part, const float* __restrict__ base,
-                     const float* __restrict__ scale, const uint16_t* __restrict__ nw, uint16_t* __restrict__ out,
-                     float* __restrict__ post, float* __restrict__ comb, float eps, float hc_eps, int iters) {
-    __shared__ float tot[kMix + 1];
-    __shared__ float pre[kS];
-    __shared__ float scratch[kWaves];
-    const long long r = blockIdx.x;
-    const int t = threadIdx.x;
-    if (t <= kMix) {
-        const float* p = part + r * kBlocks * kPart + t;
-        float a = 0.f;
-#pragma unroll
-        for (int b = 0; b < kBlocks; ++b) a += p[b * kPart];
-        tot[t] = a;
-    }
-    __syncthreads();
-    if (t == 0) {
-        const float rinv = 1.f / sqrtf(eps + tot[kMix] / static_cast<float>(kWide));
-        float mix[kMix];
-#pragma unroll
-        for (int m = 0; m < kMix; ++m) mix[m] = tot[m] * rinv;
-#pragma unroll
-        for (int k = 0; k < kS; ++k) {
-            pre[k] = hc_eps + sigmoid1(fmaf(mix[k], scale[0], base[k]));
-            post[r * kS + k] = 2.f * sigmoid1(fmaf(mix[kS + k], scale[1], base[kS + k]));
-        }
-        float cm[kS][kS];
-#pragma unroll
-        for (int i = 0; i < kS; ++i) {
-            float mx = -INFINITY;
-#pragma unroll
-            for (int j = 0; j < kS; ++j) {
-                cm[i][j] = fmaf(mix[2 * kS + i * kS + j], scale[2], base[2 * kS + i * kS + j]);
-                mx = fmaxf(mx, cm[i][j]);
-            }
-            float sum = 0.f;
-#pragma unroll
-            for (int j = 0; j < kS; ++j) {
-                cm[i][j] = expf(cm[i][j] - mx);
-                sum += cm[i][j];
-            }
-#pragma unroll
-            for (int j = 0; j < kS; ++j) cm[i][j] = cm[i][j] / sum + hc_eps;
-        }
-        for (int it = 0; it < iters; ++it) {
-            if (it > 0) {
-#pragma unroll
-                for (int i = 0; i < kS; ++i) {
-                    const float sum = cm[i][0] + cm[i][1] + cm[i][2] + cm[i][3] + hc_eps;
-#pragma unroll
-                    for (int j = 0; j < kS; ++j) cm[i][j] = cm[i][j] / sum;
-                }
-            }
-#pragma unroll
-            for (int j = 0; j < kS; ++j) {
-                const float sum = cm[0][j] + cm[1][j] + cm[2][j] + cm[3][j] + hc_eps;
-#pragma unroll
-                for (int i = 0; i < kS; ++i) cm[i][j] = cm[i][j] / sum;
-            }
-        }
-#pragma unroll
-        for (int i = 0; i < kS; ++i) {
-#pragma unroll
-            for (int j = 0; j < kS; ++j) comb[r * kS * kS + i * kS + j] = cm[i][j];
-        }
-    }
-    __syncthreads();
-    const float p0 = pre[0], p1 = pre[1], p2 = pre[2], p3 = pre[3];
-    const uint16_t* row = x + r * kWide;
-    constexpr int kPer = kD / kThreads;
-    float c[kPer];
-    float acc = 0.f;
-#pragma unroll
-    for (int j = 0; j < kPer; ++j) {
-        const int d = t + j * kThreads;
-        float m = p0 * bf(row[d]);
-        m = fmaf(p1, bf(row[kD + d]), m);
-        m = fmaf(p2, bf(row[2 * kD + d]), m);
-        m = fmaf(p3, bf(row[3 * kD + d]), m);
-        c[j] = rbf(m);
-        acc = fmaf(c[j], c[j], acc);
-    }
-    const float rinv = 1.f / sqrtf(eps + block_sum(acc, scratch) / static_cast<float>(kD));
-#pragma unroll
-    for (int j = 0; j < kPer; ++j) {
-        const int d = t + j * kThreads;
-        out[r * kD + d] = float_to_bf16(bf(nw[d]) * rbf(rinv * c[j]));
-    }
-}
-
-// hc post: branch = bf16(the `parts` fp32 partials summed in order, `stride` apart); stream s of the row becomes
-// bf16(post[s] branch + sum_t comb[t][s] x[t]). Block (row, 256 hidden columns); x may be xout.
-extern "C" __global__ void __launch_bounds__(kThreads)
-    tf_glm_hc_post_ref(const uint16_t* x, uint16_t* xout, const float* __restrict__ g, int parts, long long stride,
-                   const float* __restrict__ post, const float* __restrict__ comb) {
-    const long long r = blockIdx.x;
-    const int d = blockIdx.y * kThreads + threadIdx.x;
-    float branch = g[r * kD + d];
-    for (int p = 1; p < parts; ++p) branch += g[p * stride + r * kD + d];
-    branch = rbf(branch);
-    float xv[kS];
-#pragma unroll
-    for (int s = 0; s < kS; ++s) xv[s] = bf(x[r * kWide + s * kD + d]);
-    const float* cm = comb + r * kS * kS;
-#pragma unroll
-    for (int s = 0; s < kS; ++s) {
-        float m = xv[1] * cm[kS + s];
-        m = fmaf(xv[0], cm[s], m);
-        m = fmaf(xv[2], cm[2 * kS + s], m);
-        m = fmaf(xv[3], cm[3 * kS + s], m);
-        xout[r * kWide + s * kD + d] = float_to_bf16(fmaf(branch, post[r * kS + s], m));
-    }
 }
 
 }  // namespace glm
