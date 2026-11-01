@@ -31,6 +31,24 @@ __device__ __forceinline__ float wave_sum(float v) {
     return v;
 }
 
+// wave_sum's butterfly on DPP, for the hc pre mix: the same adds in the same order (v + v(lane ^ o) for o = 16, 8, 4,
+// 2, 1; fp add is commutative), so the same bits, with no LDS: xor 16 by v_permlanex16 (identity selects read the
+// other row's same lane), xor 8, 4, 2, 1 by DPP row_xmask. Other callers keep wave_sum.
+template <int CTRL>
+__device__ __forceinline__ float dpp_add(float v) {
+    return v + __int_as_float(__builtin_amdgcn_update_dpp(0, __float_as_int(v), CTRL, 0xf, 0xf, true));
+}
+
+__device__ __forceinline__ float wave_sum_dpp(float v) {
+    v += __int_as_float(
+        __builtin_amdgcn_permlanex16(__float_as_int(v), __float_as_int(v), 0x76543210u, 0xfedcba98u, false, false));
+    v = dpp_add<0x168>(v);  // row_xmask:8
+    v = dpp_add<0x164>(v);  // row_xmask:4
+    v = dpp_add<0x162>(v);  // row_xmask:2
+    v = dpp_add<0x161>(v);  // row_xmask:1
+    return v;
+}
+
 // The block's sum of one value a thread: each wave's butterfly, then the waves' sums in order.
 __device__ __forceinline__ float block_sum(float v, float* scratch) {
     v = wave_sum(v);
@@ -64,8 +82,10 @@ __device__ __forceinline__ uint16_t bf16_of(double v) {
 // x[row] . fn[m] over the block's 1,024 inputs (m < 24), and at 24 the sum of x^2 (part z 0). A thread takes 4
 // contiguous inputs. gridDim.z parts split the 24 mixes (decode rows: more blocks on the 786 KB of fn); a dot's thread
 // chain, butterfly and wave order are the same for any split, so the bits are.
-extern "C" __global__ void __launch_bounds__(kThreads)
-    tf_glm_hc_mix(const uint16_t* __restrict__ x, const uint16_t* __restrict__ fn, float* __restrict__ part, int rows) {
+// BFLY: 1 the served DPP butterfly, 0 the __shfl_xor butterfly (the tests' bit reference).
+template <int BFLY>
+__device__ __forceinline__ void hc_mix(const uint16_t* __restrict__ x, const uint16_t* __restrict__ fn,
+                                       float* __restrict__ part, int rows) {
     __shared__ float red[kWaves][kMixRows][kMix + 1];
     const int r0 = blockIdx.x * kMixRows, b = blockIdx.y, t = threadIdx.x, lane = t & 31, wave = t >> 5;
     const int z = blockIdx.z, zs = gridDim.z;
@@ -79,7 +99,7 @@ extern "C" __global__ void __launch_bounds__(kThreads)
         const uint2 u = *reinterpret_cast<const uint2*>(x + static_cast<long long>(row) * kWide + base);
         xv[q][0] = bf(u.x & 0xffff), xv[q][1] = bf(u.x >> 16), xv[q][2] = bf(u.y & 0xffff), xv[q][3] = bf(u.y >> 16);
         ss[q] = xv[q][0] * xv[q][0] + xv[q][1] * xv[q][1] + xv[q][2] * xv[q][2] + xv[q][3] * xv[q][3];
-        ss[q] = wave_sum(ss[q]);
+        ss[q] = BFLY ? wave_sum_dpp(ss[q]) : wave_sum(ss[q]);
     }
     for (int m = m0; m < m1; ++m) {
         const uint2 u = *reinterpret_cast<const uint2*>(fn + static_cast<long long>(m) * kWide + base);
@@ -90,7 +110,7 @@ extern "C" __global__ void __launch_bounds__(kThreads)
             d = fmaf(xv[q][1], w1, d);
             d = fmaf(xv[q][2], w2, d);
             d = fmaf(xv[q][3], w3, d);
-            d = wave_sum(d);
+            d = BFLY ? wave_sum_dpp(d) : wave_sum(d);
             if (lane == 0) red[wave][q][m] = d;
         }
     }
@@ -109,6 +129,18 @@ extern "C" __global__ void __launch_bounds__(kThreads)
             part[(static_cast<long long>(r0 + q) * kBlocks + b) * kPart + m] = total;
         }
     }
+}
+
+extern "C" __global__ void __launch_bounds__(kThreads)
+    tf_glm_hc_mix(const uint16_t* __restrict__ x, const uint16_t* __restrict__ fn, float* __restrict__ part, int rows) {
+    hc_mix<1>(x, fn, part, rows);
+}
+
+// The mix on the __shfl_xor butterfly (the form before DPP): the tests' bit reference of the DPP butterfly. Not served.
+extern "C" __global__ void __launch_bounds__(kThreads)
+    tf_glm_hc_mix_shfl(const uint16_t* __restrict__ x, const uint16_t* __restrict__ fn, float* __restrict__ part,
+                       int rows) {
+    hc_mix<0>(x, fn, part, rows);
 }
 
 // hc pre, part 2: a block a row. The 16 blocks' partials summed; mix = dots / rms(x) over all 16,384 inputs;

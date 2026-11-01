@@ -187,6 +187,22 @@ const Timed = struct {
     }
 };
 
+test "glm mhc (G4-7): the mix's DPP butterfly gives the __shfl_xor butterfly's partials bit for bit at 4, 8, 33 and 2,048 rows" {
+    const t = try Rig.open(1 << 20);
+    defer t.close();
+    var rng: rig.Rng = .{ .state = 0x4C5A_0007 };
+    for ([_]usize{ 4, 8, 33, 2048 }) |rows| {
+        var c = try Pre.init(t, &rng, rows, 0.5);
+        defer c.deinit();
+        const r: c_int = @intCast(rows);
+        try glm.hcMix(&t.on, p(c.x), p(c.fnw), p(c.part[0]), r, glm.mixParts(r), t.stream.handle);
+        try glm.hcMixShfl(&t.on, p(c.x), p(c.fnw), p(c.part[1]), r, t.stream.handle);
+        try t.stream.synchronize();
+        try same("mix, DPP against __shfl_xor butterfly", c.part[0], c.part[1], glm.hcPartBytes(rows));
+    }
+    std.debug.print("RESULT glm mhc mix: the DPP butterfly's partials equal the __shfl_xor butterfly's at 4, 8, 33 and 2,048 rows\n", .{});
+}
+
 test "glm mhc (G4-1, G4-5, G4-3): speed facts (no gate) of post, pre, mix and finish at 4 and 2,048 rows" {
     const t = try Rig.open(1 << 20);
     defer t.close();

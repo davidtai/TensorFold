@@ -38,6 +38,8 @@ pub const Fns = struct {
     silu_fill: Function,
     swiglu: Function,
     hc_mix: Function,
+    /// The mix on the __shfl_xor butterfly (tf_glm_hc_mix_shfl, tests only): the bit reference of the DPP butterfly.
+    hc_mix_shfl: Function,
     hc_finish: Function,
     hc_post: Function,
     stream_mean: Function,
@@ -84,6 +86,14 @@ pub fn hcMix(l: *const Launcher, x: C, fn_w: C, part: P, rows: c_int, parts: c_i
     var a: Args = .{};
     inline for (.{ ad(x), ad(fn_w), ad(part), rows }) |v| try a.add(v);
     try l.go(l.glm.hc_mix, dim(cdiv(rows, mix_rows), hc_blocks, parts), dim(threads, 1, 1), 0, s, &a);
+}
+
+/// The mix on the __shfl_xor butterfly, 1 part (tests only): the bit reference of the served DPP butterfly.
+pub fn hcMixShfl(l: *const Launcher, x: C, fn_w: C, part: P, rows: c_int, s: S) Error!void {
+    if (rows < 1) return;
+    var a: Args = .{};
+    inline for (.{ ad(x), ad(fn_w), ad(part), rows }) |v| try a.add(v);
+    try l.go(l.glm.hc_mix_shfl, dim(cdiv(rows, mix_rows), hc_blocks, 1), dim(threads, 1, 1), 0, s, &a);
 }
 
 /// hc pre's finish (Sinkhorn, collapse, norm) on the 16-lane kernel.
