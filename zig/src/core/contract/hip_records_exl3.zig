@@ -64,14 +64,14 @@ pub const records = [_]Record{
     } },
     .{ .launch = .{ .name = "EXL3 routed prompt GEMM (WMMA)", .symbol = "tf_exl3_gemm", .image = "exl3", .threads = 256, .served = limits.gfx11_only }, .usage = .{
         .{ .vgprs = 0, .sgprs = 0, .lds = 0, .private = 0, .bound = 256, .wave = 32 },
-        .{ .vgprs = 181, .sgprs = 32, .lds = 55296, .private = 0, .bound = 256, .wave = 32 },
-        .{ .vgprs = 180, .sgprs = 32, .lds = 55296, .private = 0, .bound = 256, .wave = 32 },
+        .{ .vgprs = 246, .sgprs = 46, .lds = 55296, .private = 0, .bound = 256, .wave = 32 },
+        .{ .vgprs = 245, .sgprs = 46, .lds = 55296, .private = 0, .bound = 256, .wave = 32 },
         .{ .vgprs = 0, .sgprs = 0, .lds = 0, .private = 0, .bound = 256, .wave = 32 },
     } },
     .{ .launch = .{ .name = "EXL3 routed prompt down GEMM, epilogue fused (WMMA)", .symbol = "tf_exl3_gemm_down", .image = "exl3", .threads = 256, .served = limits.gfx11_only }, .usage = .{
         .{ .vgprs = 0, .sgprs = 0, .lds = 0, .private = 0, .bound = 256, .wave = 32 },
-        .{ .vgprs = 181, .sgprs = 38, .lds = 55296, .private = 0, .bound = 256, .wave = 32 },
-        .{ .vgprs = 180, .sgprs = 38, .lds = 55296, .private = 0, .bound = 256, .wave = 32 },
+        .{ .vgprs = 246, .sgprs = 46, .lds = 55296, .private = 0, .bound = 256, .wave = 32 },
+        .{ .vgprs = 245, .sgprs = 46, .lds = 55296, .private = 0, .bound = 256, .wave = 32 },
         .{ .vgprs = 0, .sgprs = 0, .lds = 0, .private = 0, .bound = 256, .wave = 32 },
     } },
     .{ .launch = .{ .name = "EXL3 gate/up epilogue", .symbol = "tf_exl3_gateup_epilogue", .image = "exl3", .threads = 256 }, .usage = .{
