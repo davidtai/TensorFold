@@ -338,6 +338,75 @@ tf_glm_scores(const uint16_t* __restrict__ qi, long long qi_stride, const uint16
     out[r * np + p] = total + 0.f;
 }
 
+// ---- G3-AE: the absorb register-tiled for prompt rows. Each output keeps tf_glm_absorb_q's fp32 ops in order; only
+// the loads and the work a thread takes change. The launcher takes it from 64 rows; fewer rows keep tf_glm_absorb_q
+// (the same bytes).
+
+__device__ __forceinline__ float bf_lo(uint32_t w) { return bf16_to_float(static_cast<uint16_t>(w & 0xffffu)); }
+__device__ __forceinline__ float bf_hi(uint32_t w) { return bf16_to_float(static_cast<uint16_t>(w >> 16)); }
+
+// Absorb tile: block (256 columns, 64 rows, head), a thread 16 rows x 4 columns: acc = fma(q[k], w[k], acc) from 0 for
+// k = 0 .. 255, as tf_glm_absorb_q. q goes through LDS 64 k at a time as qt[k][row] (row stride 68 floats: float4 row
+// reads, few bank conflicts on the transposed writes); each k: 4 float4 q reads (a wave's lanes share them), one 8-byte
+// Wk load, 64 fma.
+constexpr int kAbsorbTileRows = 64;
+constexpr int kAbsorbTileK = 64;
+constexpr int kAbsorbTilePad = kAbsorbTileRows + 4;
+
+extern "C" __global__ void __launch_bounds__(256)
+tf_glm_absorb_q_tile(const uint16_t* __restrict__ q, long long q_stride, const uint16_t* __restrict__ wk,
+                     long long w_head, uint16_t* __restrict__ qa, int rows, int heads) {
+    __shared__ __attribute__((aligned(16))) float qt[kAbsorbTileK][kAbsorbTilePad];
+    const int h = blockIdx.z, r0 = blockIdx.y * kAbsorbTileRows;
+    const int cg = threadIdx.x & 63, rg = threadIdx.x >> 6;
+    const int n0 = blockIdx.x * 256 + 4 * cg;
+    const int nr = min(kAbsorbTileRows, rows - r0);
+    float acc[16][4];
+#pragma unroll
+    for (int j = 0; j < 16; ++j)
+#pragma unroll
+        for (int c = 0; c < 4; ++c) acc[j][c] = 0.f;
+    const uint16_t* w = wk + h * w_head + n0;
+    for (int k0 = 0; k0 < kQk; k0 += kAbsorbTileK) {
+        __syncthreads();
+        // 64 rows x 64 k: 512 loads of 8 values, 2 a thread
+        for (int i = threadIdx.x; i < kAbsorbTileRows * kAbsorbTileK / 8; i += 256) {
+            const int j = i / (kAbsorbTileK / 8), kk = (i % (kAbsorbTileK / 8)) * 8;
+            uint4 v = make_uint4(0u, 0u, 0u, 0u);
+            if (j < nr) v = *reinterpret_cast<const uint4*>(q + static_cast<long long>(r0 + j) * q_stride + h * kQk + k0 + kk);
+            const uint32_t w4[4] = {v.x, v.y, v.z, v.w};
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                qt[kk + 2 * e][j] = bf_lo(w4[e]);
+                qt[kk + 2 * e + 1][j] = bf_hi(w4[e]);
+            }
+        }
+        __syncthreads();
+        for (int k = 0; k < kAbsorbTileK; ++k) {
+            const uint2 wv = *reinterpret_cast<const uint2*>(w + static_cast<long long>(k0 + k) * kLw);
+            const float wf[4] = {bf_lo(wv.x), bf_hi(wv.x), bf_lo(wv.y), bf_hi(wv.y)};
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const float4 qv = *reinterpret_cast<const float4*>(&qt[k][16 * rg + 4 * i]);
+                const float qq[4] = {qv.x, qv.y, qv.z, qv.w};
+#pragma unroll
+                for (int jj = 0; jj < 4; ++jj)
+#pragma unroll
+                    for (int c = 0; c < 4; ++c) acc[4 * i + jj][c] = fmaf(qq[jj], wf[c], acc[4 * i + jj][c]);
+            }
+        }
+    }
+#pragma unroll
+    for (int j = 0; j < 16; ++j) {
+        const int r = 16 * rg + j;
+        if (r >= nr) break;
+        uint2 o;
+        o.x = static_cast<uint32_t>(float_to_bf16(acc[j][0])) | (static_cast<uint32_t>(float_to_bf16(acc[j][1])) << 16);
+        o.y = static_cast<uint32_t>(float_to_bf16(acc[j][2])) | (static_cast<uint32_t>(float_to_bf16(acc[j][3])) << 16);
+        *reinterpret_cast<uint2*>(qa + (static_cast<long long>(r0 + r) * heads + h) * kLw + n0) = o;
+    }
+}
+
 // ---- The latent attention on the gfx11 matrix cores (v_wmma_f32_16x16x16_bf16).
 // Row r's keys: with `ids` null, positions 0 .. pos[0] + row0 + r (dense, causal); else its first count[r] entries of
 // ids (sparse[r] set) or positions 0 .. count[r] - 1 (sparse[r] 0): tf_fn_idx_select's lists. Block (row, HB heads,

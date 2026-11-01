@@ -33,6 +33,9 @@ pub const heads_tile = 16;
 pub const heads_tile_wide = 32;
 /// Rows at which a window takes the 32-head block (a prompt chunk); fewer take 16 (more blocks a row). Same bits.
 pub const wide_rows = 64;
+/// Rows from which the absorb takes its register-tiled form (G3-AE; fewer rows, as decode, keep the form by row). Same
+/// bits.
+pub const tile_rows = 64;
 /// sparse._index_write's LayerNorm epsilon.
 pub const index_eps: f32 = 1e-6;
 
@@ -41,6 +44,7 @@ pub const Kernels = struct {
     lat_write: Function,
     absorb_q: Function,
     expand_v: Function,
+    absorb_q_tile: Function,
     expand_v_ref: Function,
     scores_ref: Function,
     index_write: Function,
@@ -60,6 +64,7 @@ pub const Kernels = struct {
             .lat_write = try m.function("tf_glm_lat_write"),
             .absorb_q = try m.function("tf_glm_absorb_q"),
             .expand_v = try m.function("tf_glm_expand_v"),
+            .absorb_q_tile = try m.function("tf_glm_absorb_q_tile"),
             .expand_v_ref = try m.function("tf_glm_expand_v_ref"),
             .scores_ref = try m.function("tf_glm_scores_ref"),
             .index_write = try m.function("tf_glm_index_write"),
@@ -113,13 +118,29 @@ pub fn kvValues(kv_b: u64) u64 {
 /// kernel_tests/glm/dsa_fast.zig). Both give every output the same bytes.
 pub const Form = enum { fast, ref };
 
+/// The absorb's forms: `tile` (G3-AE, a thread 16 rows x 4 columns; served from tile_rows rows) or `rows`
+/// (tf_glm_absorb_q; served under tile_rows rows). The same bytes.
+pub const Tiling = enum { tile, rows };
+
+fn tilingFor(rows: usize) Tiling {
+    return if (rows >= tile_rows) .tile else .rows;
+}
+
 /// latent.absorb_q: qa [rows][heads][512] bf16 = q_h . Wk_h; q rows `q_stride` values apart (head h at column 256 h),
 /// Wk_h [256][512] at wk + h w_head elements.
 pub fn absorbQ(k: Kernels, s: S, q: u64, q_stride: usize, wk: u64, w_head: usize, qa: u64, rows: usize, heads: usize) Error!void {
+    return absorbQWith(k, tilingFor(rows), s, q, q_stride, wk, w_head, qa, rows, heads);
+}
+
+/// absorbQ in the form `t`. The tile form reads q 8 values at a time: q not 16-byte aligned or q_stride not a multiple
+/// of 8 takes the row form (the same bytes).
+pub fn absorbQWith(k: Kernels, t: Tiling, s: S, q: u64, q_stride: usize, wk: u64, w_head: usize, qa: u64, rows: usize, heads: usize) Error!void {
     if (rows == 0) return;
     try shape(wk % 16 == 0 and w_head % 8 == 0);
     var a: Args = .{};
     inline for (.{ q, @as(i64, @intCast(q_stride)), wk, @as(i64, @intCast(w_head)), qa, @as(c_int, @intCast(rows)), @as(c_int, @intCast(heads)) }) |v| try a.add(v);
+    if (t == .tile and q % 16 == 0 and q_stride % 8 == 0 and qa % 8 == 0)
+        return k.go(k.absorb_q_tile, dim(lw / 256, cdiv(rows, tile_rows), heads), dim(256, 1, 1), s, &a);
     try k.go(k.absorb_q, dim(heads, lw / 256, cdiv(rows, 16)), dim(256, 1, 1), s, &a);
 }
 
