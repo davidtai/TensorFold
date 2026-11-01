@@ -1098,6 +1098,145 @@ test "KDA: speed facts (no gate): K-5, the scans by staged steps, one layer, 64 
     }
 }
 
+/// tf_kda_fused in `form` over rows [from, from + rows) of b's prep outputs `sv` (q, k, v, beta) and b's decay rows.
+fn fusedAt(t: *Rig, form: Launcher.KdaFused, b: Block, dev: BlockDev, sv: Saves, state: u64, y: u64, from: usize, rows: usize) !void {
+    const n = b.n();
+    const h = b.heads;
+    try t.on.tf_kda_fused_as(form, cf(sv.q + from * n * 4), cf(sv.k + from * n * 4), cv(sv.v + from * n * 2), cv(dev.a + from * n * 2), @intCast(n), cf(dev.dt_bias), cf(dev.a_log), lower, cf(sv.b + from * h * 4), mf(state), mf(y + from * n * 4), @intCast(rows), @intCast(h), t.stream.handle);
+}
+
+test "KDA: K-8, the prompt scan computing its decays from the decay rows gives the bytes of prep's decays" {
+    // Oracle: prep writes the decays (fp32) and the 16-step scan reads them (tf_kda_as .t16). The fused scans (a, ab)
+    // read prep's q, k, v and beta (prep with g null writes those, the same bytes) and compute the decays themselves.
+    const t = try Rig.open(1 << 20);
+    defer t.close();
+    var checked: usize = 0;
+    const Shape = struct { heads: usize, rows: usize, lengths: []const usize };
+    for ([_]Shape{
+        .{ .heads = glm_heads, .rows = 2048, .lengths = &.{ 64, 65, 72, 100, 127, 128, 129, 1000, 2045, 2048 } },
+        .{ .heads = 8, .rows = 8192, .lengths = &.{ 4095, 8192 } },
+    }) |sh| {
+        const b = try Block.make(sh.heads, sh.rows, 0x6b38 + sh.rows, false);
+        defer b.free();
+        const n = b.n();
+        var h: Held = .{};
+        defer h.deinit();
+        const dev = try blockDev(&h, t, b);
+        const sv = try saves(&h, t, sh.rows, sh.heads);
+        try prepAt(t, .wave, b, dev, dev.cs, 0, sh.rows, sv);
+        // prep with no decays (g null): q, k, v and beta the same bytes (block and wave forms)
+        for ([_]Launcher.KdaForm{ .block, .wave }) |form| {
+            const rows = @min(sh.rows, 300);
+            const nd = try saves(&h, t, rows, sh.heads);
+            try t.on.tf_kda_prep_as(form, cv(dev.p), @intCast(b.width()), @intCast(b.bOff()), cv(dev.a), @intCast(n), cv(dev.cs), cv(dev.cw), cf(dev.a_log), cf(dev.dt_bias), lower, mf(nd.q), mf(nd.k), mv(nd.v), null, mf(nd.b), @intCast(rows), @intCast(sh.heads), t.stream.handle);
+            try t.stream.synchronize();
+            for ([_]u64{ nd.q, nd.k, nd.v, nd.b }, [_]u64{ sv.q, sv.k, sv.v, sv.b }, [_]usize{ 4 * n, 4 * n, 2 * n, 4 * sh.heads }) |got_at, want_at, row_bytes| {
+                const got = try download(u8, t, got_at, rows * row_bytes);
+                defer gpa.free(got);
+                const want = try download(u8, t, want_at, rows * row_bytes);
+                defer gpa.free(want);
+                try rig.expect(std.mem.eql(u8, want, got), "KDA K-8 prep {s} with no decays: an output differs", .{@tagName(form)});
+            }
+            checked += 1;
+        }
+        const st0 = try gpa.alloc(f32, sh.heads * d * d);
+        defer gpa.free(st0);
+        var rng: rig.Rng = .{ .state = 0x58 + sh.rows };
+        for (st0) |*x| x.* = @floatCast(0.1 * rng.normal());
+        const state = try h.up(t, st0);
+        const y = try h.zeros(t, sh.rows * n * 4);
+        for (sh.lengths) |len| {
+            try state.upload(0, std.mem.sliceAsBytes(st0));
+            try y.fill8(0);
+            try scanAs(t, .t16, sh.heads, sv, at(state), at(y), 0, len);
+            try t.stream.synchronize();
+            const want_y = try download(u8, t, at(y), len * n * 4);
+            defer gpa.free(want_y);
+            const want_s = try rig.download(u8, state);
+            defer gpa.free(want_s);
+            for ([_]Launcher.KdaFused{ .a, .ab }) |form| {
+                try state.upload(0, std.mem.sliceAsBytes(st0));
+                try y.fill8(0);
+                try fusedAt(t, form, b, dev, sv, at(state), at(y), 0, len);
+                try t.stream.synchronize();
+                const gy = try download(u8, t, at(y), len * n * 4);
+                defer gpa.free(gy);
+                const gs = try rig.download(u8, state);
+                defer gpa.free(gs);
+                try rig.expect(std.mem.eql(u8, want_y, gy) and std.mem.eql(u8, want_s, gs), "KDA K-8 {s} heads={d} at {d} rows: y or state differs from prep's decays", .{ @tagName(form), sh.heads, len });
+                checked += 1;
+            }
+        }
+        // a prompt cut into fused pieces and short tile pieces (prep's decays), against one call: the engine's seams
+        if (sh.rows == 2048) {
+            const cuts = [_]usize{ 3, 100, 170, 2045, 2048 };
+            try state.upload(0, std.mem.sliceAsBytes(st0));
+            try y.fill8(0);
+            try scanAs(t, .t16, sh.heads, sv, at(state), at(y), 0, sh.rows);
+            try t.stream.synchronize();
+            const want_y = try rig.download(u8, y);
+            defer gpa.free(want_y);
+            const want_s = try rig.download(u8, state);
+            defer gpa.free(want_s);
+            for ([_]Launcher.KdaFused{ .a, .ab }) |form| {
+                try state.upload(0, std.mem.sliceAsBytes(st0));
+                try y.fill8(0);
+                var from: usize = 0;
+                for (cuts) |c_at| {
+                    const len = c_at - from;
+                    if (len >= Launcher.kda_fused_rows) try fusedAt(t, form, b, dev, sv, at(state), at(y), from, len) else try scan(t, sh.heads, sv, at(state), at(y), from, len, 0);
+                    from = c_at;
+                }
+                try t.stream.synchronize();
+                const gy = try rig.download(u8, y);
+                defer gpa.free(gy);
+                const gs = try rig.download(u8, state);
+                defer gpa.free(gs);
+                try rig.expect(std.mem.eql(u8, want_y, gy) and std.mem.eql(u8, want_s, gs), "KDA K-8 {s}: a prompt cut at {any} differs from one call", .{ @tagName(form), cuts });
+                checked += 1;
+            }
+        }
+    }
+    std.debug.print("KDA K-8: {d} checks: prep with no decays and the fused scans (a, ab) bit-equal to prep's decays (64-2,048 rows at 64 heads, 4,095 and 8,192 at 8, cuts 3/100/170/2,045)\n", .{checked});
+}
+
+test "KDA: speed facts (no gate): K-8, the prompt scan's decays from prep or computed while staging, one layer" {
+    const t = try Rig.open(1 << 20);
+    defer t.close();
+    const heads = glm_heads;
+    const rows = 2048;
+    const b = try Block.make(heads, rows, 0x5eed8, false);
+    defer b.free();
+    const n = b.n();
+    var h: Held = .{};
+    defer h.deinit();
+    const dev = try blockDev(&h, t, b);
+    const sv = try saves(&h, t, rows, heads);
+    try prepAt(t, .wave, b, dev, dev.cs, 0, rows, sv);
+    const st0 = try gpa.alloc(f32, heads * d * d);
+    defer gpa.free(st0);
+    @memset(st0, 0);
+    const state = at(try h.up(t, st0));
+    const y = at(try h.zeros(t, rows * n * 4));
+    const Ctx = struct { t: *Rig, b: *const Block, dev: BlockDev, sv: Saves, state: u64, y: u64, which: u2 };
+    const run = struct {
+        fn f(c: Ctx) anyerror!void {
+            const s = c.t.stream.handle;
+            switch (c.which) {
+                0 => return scan(c.t, glm_heads, c.sv, c.state, c.y, 0, 2048, 0),
+                1 => return fusedAt(c.t, .a, c.b.*, c.dev, c.sv, c.state, c.y, 0, 2048),
+                2 => return fusedAt(c.t, .ab, c.b.*, c.dev, c.sv, c.state, c.y, 0, 2048),
+                3 => return c.t.on.tf_kda_prep_as(.wave, cv(c.dev.p), @intCast(c.b.width()), @intCast(c.b.bOff()), cv(c.dev.a), @intCast(c.b.n()), cv(c.dev.cs), cv(c.dev.cw), cf(c.dev.a_log), cf(c.dev.dt_bias), lower, mf(c.sv.q), mf(c.sv.k), mv(c.sv.v), null, mf(c.sv.b), 2048, glm_heads, s),
+            }
+        }
+    };
+    const names = [_][]const u8{ "scan on prep's decays (today)", "scan, decays while staging (a)", "scan, decays while staging + prefetch (ab)", "prep without decays" };
+    for (names, 0..) |name, i| {
+        const ms = try timeMs(t, 15, Ctx{ .t = t, .b = &b, .dev = dev, .sv = sv, .state = state, .y = y, .which = @intCast(i) }, run.f);
+        std.debug.print("KDA speed K-8 {s}, 2048 rows, 64 heads: {d:.4} ms\n", .{ name, ms });
+    }
+}
+
 /// The median of `runs` launches of `f` in ms, by events on the rig's stream, after two warm-up launches.
 fn timeMs(t: *Rig, runs: usize, ctx: anytype, comptime f: fn (@TypeOf(ctx)) anyerror!void) !f64 {
     const Event = @import("../stream.zig").Event;

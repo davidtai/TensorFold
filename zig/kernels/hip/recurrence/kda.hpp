@@ -51,6 +51,7 @@ __device__ __forceinline__ float wave_sum(float x) {
 // bf16; the decays of its 128 key channels and beta = bf16(sigmoid(b)); then q and k L2-normed (q by 128^-0.5 too).
 // Taps cw bf16 [3 heads 128][4] as the checkpoint stores q|k|v_conv1d (widened here, exactly; CUDA widens at load).
 // Out: q fp32, k fp32, v bf16, decays fp32 (rows, heads, 128) and beta fp32 (rows, heads). prep_kernel_body's values.
+// g_save null: no decays (a scan that computes them while staging, K-8), the rest the same.
 extern "C" __global__ void __launch_bounds__(512)
 tf_kda_prep(int H, const uint16_t* __restrict__ P, int p_stride, int b_off, const uint16_t* __restrict__ A,
             int a_stride, const uint16_t* __restrict__ cs, const uint16_t* __restrict__ cw,
@@ -79,8 +80,10 @@ tf_kda_prep(int H, const uint16_t* __restrict__ P, int p_stride, int b_off, cons
         else v_save[base + t - 2 * DK] = bf16_bits(act);
     } else {
         const int i = t - 3 * DK;
-        const float a = widen(A[static_cast<size_t>(r) * a_stride + h * DK + i]);
-        g_save[base + i] = decay(a, dt_bias[h * DK + i], a_log[h], lower);
+        if (g_save != nullptr) {
+            const float a = widen(A[static_cast<size_t>(r) * a_stride + h * DK + i]);
+            g_save[base + i] = decay(a, dt_bias[h * DK + i], a_log[h], lower);
+        }
         if (i == 0) b_save[r * H + h] = bf(sigmoid(widen(P[static_cast<size_t>(r) * p_stride + b_off + h])));
     }
     __syncthreads();
@@ -156,6 +159,11 @@ tf_kda_prep_wave(int H, const uint16_t* __restrict__ P, int p_stride, int b_off,
     const int r0 = seg * kKdaSeg, r1 = min(rows, r0 + kKdaSeg);
     const int ch = h * DK + lane * 4;  // the lane's first channel within a part
     if (part == 3) {
+        if (g_save == nullptr) {  // a scan that computes the decays itself (K-8): beta alone
+            if (lane == 0)
+                for (int r = r0; r < r1; ++r) b_save[r * H + h] = bf(sigmoid(widen(P[static_cast<size_t>(r) * p_stride + b_off + h])));
+            return;
+        }
         const float rate = a_log[h];
         float dtb[4];
 #pragma unroll

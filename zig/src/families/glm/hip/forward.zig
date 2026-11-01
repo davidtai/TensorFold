@@ -267,7 +267,9 @@ pub const Forward = struct {
         const q = try ar.of(f32, R * n);
         const k = if (f.hold) st.save_k + li * wr * n * 4 else try ar.of(f32, R * n);
         const v = if (f.hold) st.save_v + li * wr * n * 2 else try ar.of(u16, R * n);
-        const g = if (f.hold) st.save_g + li * wr * n * 4 else try ar.of(f32, R * n);
+        // a prompt's scan of kda_fused_rows rows or more computes its own decays from ka (G2 K-8): prep writes none
+        const fused = !f.hold and R >= hip.Launcher.kda_fused_rows;
+        const g = if (f.hold) st.save_g + li * wr * n * 4 else if (fused) 0 else try ar.of(f32, R * n);
         const beta = if (f.hold) st.save_b + li * wr * kda_heads * 4 else try ar.of(f32, R * kda_heads);
         const y = try ar.of(f32, R * n);
         const out = try ar.of(u16, R * n);
@@ -284,6 +286,8 @@ pub const Forward = struct {
         try f.pm(.kda_prep, R, 0);
         if (f.hold) {
             try f.l.tf_kda_hold(cf(q), cf(k), c(v), cf(g), cf(beta), mf(st.recAt(li)), mf(y), int(R), int(kda_heads), f.s);
+        } else if (fused) {
+            try f.l.tf_kda_fused(cf(q), cf(k), c(v), c(ka), @intCast(n), cf(w.dt_bias), cf(w.a_log), f.cfg.lower_bound, cf(beta), mf(st.recAt(li)), mf(y), int(R), int(kda_heads), f.s);
         } else try f.l.tf_kda(cf(q), cf(k), c(v), cf(g), cf(beta), mf(st.recAt(li)), mf(y), int(R), int(kda_heads), f.s, null, 0);
         try f.pm(.kda_scan, R, State.rec_layer * 4 * 2);
         try f.l.tf_kda_out(cf(y), c(kg), @intCast(n), c(w.o_norm), f.cfg.eps, m(out), int(R), int(kda_heads), f.s);

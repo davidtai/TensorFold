@@ -339,13 +339,31 @@ __device__ __forceinline__ float quad_sum(const float (&part)[8]) {
     return c;
 }
 
+// KDA's prompt-scan modes (GLM-5.3-Flash, G2 K-8), the prompt body's MODE bits. kKdaDecayA: a step's decays are
+// computed while staging from the bf16 decay rows (tf_kda::decay, prep's expression), not read from fp32 rows.
+// kKdaPrefetch: the next tile's operands load into registers while this tile computes. Neither changes a step's sums.
+constexpr int kKdaDecayA = 1, kKdaPrefetch = 2;
+
+// The decay rows a kKdaDecayA scan reads: bf16 a (row stride a_stride, head h's 128 channels at h * 128), dt_bias a
+// channel, A_log a head, the gate's lower bound.
+struct KdaDecayRows {
+    const uint16_t* a = nullptr;
+    int a_stride = 0;
+    const float* dt_bias = nullptr;
+    const float* a_log = nullptr;
+    float lower = 0.f;
+};
+
 // GD and VT as the tile's: KDA's decays stage transposed like k, and lane p takes its 32 in registers like k. T: steps
 // staged in LDS at a time (a step's arithmetic does not depend on it; it sets the LDS a block takes, so occupancy).
-template <int WAVES, int GD = 1, typename VT = float, int T = kPromptSteps>
+// MODE: 0 (every DeltaNet scan), or KDA's kKdaDecayA / kKdaPrefetch bits (batch 0, GD = DK).
+template <int WAVES, int GD = 1, typename VT = float, int T = kPromptSteps, int MODE = 0>
 __device__ __forceinline__ void
 gated_delta_prompt_body(const float* __restrict__ q, const float* __restrict__ k, const VT* __restrict__ v,
                         const float* __restrict__ gate, const float* __restrict__ beta, float* __restrict__ state,
-                        float* __restrict__ y, int length, int key_heads, int value_heads) {
+                        float* __restrict__ y, int length, int key_heads, int value_heads, KdaDecayRows dr = {}) {
+    static_assert(MODE == 0 || GD == 128, "the KDA modes are the decay-a-channel scan's");
+    static_assert(!(MODE & kKdaPrefetch) || (MODE & kKdaDecayA), "the prefetch carries the decay rows");
     constexpr int DK = 128, DV = 128, THREADS = 32 * WAVES, ROWS = 16 * WAVES;
     const int lane = threadIdx.x, wave = threadIdx.y;
     const int tid = wave * 32 + lane;
@@ -368,15 +386,64 @@ gated_delta_prompt_body(const float* __restrict__ q, const float* __restrict__ k
         for (int m = 0; m < 32; ++m) s[r][m] = at[p + 4 * m];
     }
 
+    // kKdaPrefetch (batch 0): a thread's share of a tile (KP of k, q and the decay rows, VP of v, one beta), in registers
+    constexpr int KP = (MODE & kKdaPrefetch) ? T * DK / THREADS : 1, VP = (MODE & kKdaPrefetch) ? T * ROWS / THREADS : 1;
+    static_assert(!(MODE & kKdaPrefetch) || (T * DK % THREADS == 0 && T * ROWS % THREADS == 0 && T <= THREADS),
+                  "a tile divides among the block's threads");
+    [[maybe_unused]] float pk[KP], pq[KP], pv[VP], pb = 0.f;
+    [[maybe_unused]] uint16_t pa[KP];
+    // tile t0's operands into the registers (rows past `length` are not read)
+    [[maybe_unused]] auto fetch = [&](int t0) {
+        const int n = min(T, length - t0);
+#pragma unroll
+        for (int r = 0; r < KP; ++r) {
+            const int i = tid + r * THREADS, step = i / DK, e = i - step * DK;
+            if (step >= n) continue;
+            const size_t at = (static_cast<size_t>(t0 + step) * key_heads + key_head) * DK + e;
+            pk[r] = k[at];
+            pq[r] = q[at];
+            pa[r] = dr.a[static_cast<size_t>(t0 + step) * dr.a_stride + head * DK + e];
+        }
+#pragma unroll
+        for (int r = 0; r < VP; ++r) {
+            const int i = tid + r * THREADS, step = i / ROWS, e = i - step * ROWS;
+            if (step < n) pv[r] = tf_kda::widen(v[(static_cast<size_t>(t0 + step) * value_heads + head) * DV + first + e]);
+        }
+        if (tid < n) pb = beta[static_cast<size_t>(t0 + tid) * value_heads + head];
+    };
+    if constexpr (MODE & kKdaPrefetch) fetch(0);
     for (int t0 = 0; t0 < length; t0 += T) {
         const int n = min(T, length - t0);
+        if constexpr (MODE & kKdaPrefetch) {
+            // this tile from the registers into LDS; the decays from their rows here (kKdaDecayA)
+#pragma unroll
+            for (int r = 0; r < KP; ++r) {
+                const int i = tid + r * THREADS, step = i / DK, e = i - step * DK;
+                if (step >= n) continue;
+                const int to = (e & 3) * 32 + (e >> 2);
+                ks[step][to] = pk[r];
+                qs[step][to] = pq[r];
+                gs[step][to] = tf_kda::decay(tf_kda::widen(pa[r]), dr.dt_bias[head * DK + e], dr.a_log[head], dr.lower);
+            }
+#pragma unroll
+            for (int r = 0; r < VP; ++r) {
+                const int i = tid + r * THREADS, step = i / ROWS, e = i - step * ROWS;
+                if (step < n) vs[step][e] = pv[r];
+            }
+            if (tid < n) bs[tid] = pb;
+            __syncthreads();
+            if (t0 + T < length) fetch(t0 + T);  // the next tile's loads fly while this one computes
+        } else {
         for (int i = tid; i < n * DK; i += THREADS) {
             const int step = i / DK, e = i - step * DK;
             const size_t at = ((static_cast<size_t>(batch) * length + (t0 + step)) * key_heads + key_head) * DK + e;
             const int to = (e & 3) * 32 + (e >> 2);
             ks[step][to] = k[at];
             qs[step][to] = q[at];
-            if constexpr (GD == DK) {
+            if constexpr (MODE & kKdaDecayA) {
+                gs[step][to] = tf_kda::decay(tf_kda::widen(dr.a[static_cast<size_t>(t0 + step) * dr.a_stride + head * DK + e]),
+                                             dr.dt_bias[head * DK + e], dr.a_log[head], dr.lower);
+            } else if constexpr (GD == DK) {
                 gs[step][to] = gate[((static_cast<size_t>(batch) * length + (t0 + step)) * value_heads + head) * DK + e];
             }
         }
@@ -390,6 +457,7 @@ gated_delta_prompt_body(const float* __restrict__ q, const float* __restrict__ k
             bs[i] = beta[at];
         }
         __syncthreads();
+        }
         for (int tt = 0; tt < n; ++tt) {
             const float decay = gs[tt][0], step_beta = bs[tt];
             float kv[32], qv[32], gv[GD == 1 ? 1 : 32];
@@ -565,6 +633,25 @@ extern "C" __global__ void __launch_bounds__(128)
 tf_kda_prompt_128(const float* q, const float* k, const uint16_t* v, const float* gate, const float* beta, float* state,
                   float* y, int length, int heads) {
     tf::rocm::gated_delta_prompt_body<4, 128, uint16_t, kKdaSteps>(q, k, v, gate, beta, state, y, length, heads, heads);
+}
+
+// K-8: the prompt scan with its decays computed while staging from the bf16 decay rows `a` (prep then writes none),
+// alone (_a) and with the next tile's operands prefetched into registers (_ab). The same bytes as tf_kda_prompt_128
+// on prep's decays; both are timed (kernel_tests/kda.zig), one stays.
+extern "C" __global__ void __launch_bounds__(128)
+tf_kda_prompt_128_a(const float* q, const float* k, const uint16_t* v, const uint16_t* a, int a_stride,
+                    const float* dt_bias, const float* a_log, float lower, const float* beta, float* state, float* y,
+                    int length, int heads) {
+    tf::rocm::gated_delta_prompt_body<4, 128, uint16_t, kKdaSteps, tf::rocm::kKdaDecayA>(
+        q, k, v, nullptr, beta, state, y, length, heads, heads, {a, a_stride, dt_bias, a_log, lower});
+}
+
+extern "C" __global__ void __launch_bounds__(128)
+tf_kda_prompt_128_ab(const float* q, const float* k, const uint16_t* v, const uint16_t* a, int a_stride,
+                     const float* dt_bias, const float* a_log, float lower, const float* beta, float* state, float* y,
+                     int length, int heads) {
+    tf::rocm::gated_delta_prompt_body<4, 128, uint16_t, kKdaSteps, tf::rocm::kKdaDecayA | tf::rocm::kKdaPrefetch>(
+        q, k, v, nullptr, beta, state, y, length, heads, heads, {a, a_stride, dt_bias, a_log, lower});
 }
 
 // The KDA scans as they were before K-5 (16 steps staged): the bit oracle of kernel_tests/kda.zig's K-5 test and the

@@ -130,6 +130,9 @@ pub const KdaFns = struct {
     out_wave: Function,
     /// The scans as before K-5 (16 steps staged): the tests' oracles.
     prompt_t16: Function,
+    /// K-8: the prompt scan computing its decays from the bf16 decay rows, alone and with the register prefetch.
+    prompt_a: Function,
+    prompt_ab: Function,
     tile_t16: Function,
     hold_t16: Function,
 
@@ -145,6 +148,8 @@ pub const KdaFns = struct {
             .prep_wave = try m.function("tf_kda_prep_wave"),
             .out_wave = try m.function("tf_kda_out_wave"),
             .prompt_t16 = try m.function("tf_kda_prompt_128_t16"),
+            .prompt_a = try m.function("tf_kda_prompt_128_a"),
+            .prompt_ab = try m.function("tf_kda_prompt_128_ab"),
             .tile_t16 = try m.function("tf_kda_tile_128_t16"),
             .hold_t16 = try m.function("tf_kda_hold_128_t16"),
         };
@@ -212,6 +217,31 @@ pub fn tf_kda_as(l: *const Launcher, steps: KdaSteps, q: CF, k: CF, v: C, gate: 
     var a: Args = .{};
     inline for (.{ ad(q), ad(k), ad(v), ad(gate), ad(beta), ad(state), ad(y), length, heads, ad(states), from }) |x| try a.add(x);
     try l.go(if (steps == .t16) l.kda.tile_t16 else l.kda.tile, dim(kda_dim / 8, heads, 1), dim(32, 8, 1), 0, s, &a);
+}
+
+/// K-8's two forms of the fused-decay prompt scan (gated_delta.hip tf_kda_prompt_128_a / _ab): `a` the decays from
+/// the bf16 decay rows while staging, `ab` that and the next tile prefetched into registers. The same bytes.
+pub const KdaFused = enum { a, ab };
+
+/// The form tf_kda_fused takes.
+pub const kda_fused_form: KdaFused = .ab;
+
+/// Rows from which a prompt's scan may compute its own decays (tf_kda_fused): the prompt blocks' (prompt_rows).
+pub const kda_fused_rows = prompt_rows;
+
+/// A prompt's KDA scan over `length` rows (at least kda_fused_rows; state in place) that computes each step's decays
+/// from the bf16 decay rows `a` (row stride a_stride; dt_bias a channel, A_log a head, the gate's bound `lower`), as
+/// tf_kda_prep writes them: tf_kda's bytes with prep's decays, and prep need not write them (its g null).
+pub fn tf_kda_fused(l: *const Launcher, q: CF, k: CF, v: C, a: C, a_stride: c_int, dt_bias: CF, a_log: CF, lower: f32, beta: CF, state: F, y: F, length: c_int, heads: c_int, s: S) Error!void {
+    return tf_kda_fused_as(l, kda_fused_form, q, k, v, a, a_stride, dt_bias, a_log, lower, beta, state, y, length, heads, s);
+}
+
+/// tf_kda_fused in a named form (the tests' and the timings').
+pub fn tf_kda_fused_as(l: *const Launcher, form: KdaFused, q: CF, k: CF, v: C, a: C, a_stride: c_int, dt_bias: CF, a_log: CF, lower: f32, beta: CF, state: F, y: F, length: c_int, heads: c_int, s: S) Error!void {
+    if (heads < 1 or length < kda_fused_rows or a_stride < heads * kda_dim) return invalid("kda fused");
+    var b: Args = .{};
+    inline for (.{ ad(q), ad(k), ad(v), ad(a), a_stride, ad(dt_bias), ad(a_log), lower, ad(beta), ad(state), ad(y), length, heads }) |x| try b.add(x);
+    try l.go(if (form == .a) l.kda.prompt_a else l.kda.prompt_ab, dim(2, heads, 1), dim(32, 4, 1), 0, s, &b);
 }
 
 /// A KDA verify window that holds its state: the rows' outputs only (tf_gdn_hold's). At most 16 rows.
