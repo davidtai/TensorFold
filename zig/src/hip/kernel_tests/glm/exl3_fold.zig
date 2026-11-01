@@ -80,11 +80,21 @@ const Case = struct {
 
     /// The item (expert 0, first, count) through the folded GEMM, or with `chain` the one-chain reference: z fp32.
     fn run(c: *Case, t: *Rig, first: usize, count: usize, chain: bool) ![]f32 {
+        return c.runOn(t, first, count, if (chain) .chain else .served);
+    }
+
+    const Form = enum { served, chain, nola };
+
+    fn runOn(c: *Case, t: *Rig, first: usize, count: usize, form: Form) ![]f32 {
         const it = [3]i32{ 0, @intCast(first), @intCast(count) };
         try c.items.upload(0, std.mem.asBytes(&it));
         try c.z.fill8(0xff);
         const p: launch.Product = .{ .x0 = at(c.x), .x1 = at(c.x), .x_div = 1, .tp0 = at(c.table), .tp1 = at(c.table), .mats = 1, .items = at(c.items), .count = 1, .members = at(c.members), .z = at(c.z), .k = c.k, .n = c.n, .pairs = c.m, .experts = 1 };
-        if (chain) try launch.gemmChain(&t.on, p, t.stream.handle) else try launch.gemm(&t.on, p, t.stream.handle);
+        switch (form) {
+            .served => try launch.gemm(&t.on, p, t.stream.handle),
+            .chain => try launch.gemmChain(&t.on, p, t.stream.handle),
+            .nola => try launch.gemmNola(&t.on, p, t.stream.handle),
+        }
         try t.stream.synchronize();
         return rig.download(f32, c.z);
     }
@@ -161,4 +171,29 @@ test "glm exl3 fold (F-K6): the prompt GEMM's 64-k groups within float64's bound
         }
         std.debug.print("RESULT glm exl3 gemm fold K {d}: 6 cuts (single rows, across the 64-row passes) bit-equal to the full call\n", .{k});
     }
+}
+
+test "glm exl3 gemm, fragment look-ahead: the bits of the GEMM without it at the gate/up and down shapes, over the 64-row passes" {
+    const t = try Rig.open(1 << 20);
+    defer t.close();
+    if (!t.bf16 or @import("../../exl3.zig").matrix() == false) return error.SkipZigTest;
+    var rng: rig.Rng = .{ .state = 0xB640_0001 };
+    const m = 200; // four 64-row passes, the last partial
+    var compared: usize = 0;
+    for ([_][2]usize{ .{ 4096, 2048 }, .{ 2048, 4096 } }) |kn| {
+        var c = try Case.init(t, &rng, m, kn[0], kn[1]);
+        defer c.deinit();
+        for ([_][2]usize{ .{ 0, m }, .{ 37, 91 }, .{ 199, 1 } }) |cut| {
+            const a = try c.runOn(t, cut[0], cut[1], .served);
+            defer gpa.free(a);
+            for ([_]Case.Form{.nola}) |ref| {
+                const b = try c.runOn(t, cut[0], cut[1], ref);
+                defer gpa.free(b);
+                const same = std.mem.eql(u32, @ptrCast(a), @ptrCast(b));
+                try rig.expect(same, "exl3 gemm K {d}: the served GEMM differs from the {s} form (cut {d}, {d})", .{ kn[0], @tagName(ref), cut[0], cut[1] });
+                compared += 1;
+            }
+        }
+    }
+    std.debug.print("RESULT glm exl3 gemm fragment look-ahead: {d} calls (gate/up and down shapes, 200 rows and cuts) bit-equal to the GEMM without it\n", .{compared});
 }
