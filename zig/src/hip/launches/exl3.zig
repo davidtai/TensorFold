@@ -26,6 +26,8 @@ pub const Fns = struct {
     gemm: Function,
     /// The GEMM on one WMMA chain over K (tf_exl3_gemm_chain): the numerics reference of the tests, not served.
     gemm_chain: Function,
+    /// The GEMM at 32-k stages (tf_exl3_gemm_bk32): the tests' bit check of the served 64-k stage, not served.
+    gemm_bk32: Function,
     /// The down GEMM with the down epilogue fused (tf_exl3_gemm_down): y [pair][D] in one launch, the same bits.
     gemm_down: Function,
     gateup: Function,
@@ -38,6 +40,7 @@ pub const Fns = struct {
             .gemv = .{ try m.function("tf_exl3_gemv_1"), try m.function("tf_exl3_gemv_2"), try m.function("tf_exl3_gemv_4"), try m.function("tf_exl3_gemv_8") },
             .gemm = try m.function("tf_exl3_gemm"),
             .gemm_chain = try m.function("tf_exl3_gemm_chain"),
+            .gemm_bk32 = try m.function("tf_exl3_gemm_bk32"),
             .gemm_down = try m.function("tf_exl3_gemm_down"),
             .gateup = try m.function("tf_exl3_gateup_epilogue"),
             .down = try m.function("tf_exl3_down_epilogue"),
@@ -136,10 +139,15 @@ pub fn gemmChain(l: *const Launcher, p: Product, s: S) Error!void {
     return gemmOn(l, l.exl3.gemm_chain, p, s);
 }
 
+/// The same product at 32-k stages (the tests' bit reference of the 64-k stage).
+pub fn gemmBk32(l: *const Launcher, p: Product, s: S) Error!void {
+    return gemmOn(l, l.exl3.gemm_bk32, p, s);
+}
+
 /// The down GEMM (mats 1) and the down epilogue in one launch: y [pairs][n] fp32 = the routed pairs' down outputs, the bits
 /// of `gemm` then `down` (sk 1). Other pairs keep y.
 pub fn gemmDown(l: *const Launcher, p: Product, svh_d: u64, y: u64, s: S) Error!void {
-    if (p.k % 32 != 0 or p.n % 128 != 0 or p.mats != 1) return invalid("exl3 gemm down");
+    if (p.k % 64 != 0 or p.n % 128 != 0 or p.mats != 1) return invalid("exl3 gemm down"); // k stages of 64 (exl3.hip kBK)
     if (p.count == 0) return;
     var a: Args = .{};
     try a.add(p.x0);
@@ -157,7 +165,7 @@ pub fn gemmDown(l: *const Launcher, p: Product, svh_d: u64, y: u64, s: S) Error!
 }
 
 fn gemmOn(l: *const Launcher, f: Function, p: Product, s: S) Error!void {
-    if (p.k % 32 != 0 or p.n % 128 != 0) return invalid("exl3 gemm");
+    if (p.k % 64 != 0 or p.n % 128 != 0) return invalid("exl3 gemm"); // k stages of 64 (exl3.hip kBK)
     if (p.count == 0) return;
     var a: Args = .{};
     try addProduct(&a, p);

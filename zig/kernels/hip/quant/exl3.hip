@@ -239,9 +239,9 @@ TF_EXL3_GEMV(8)
 
 // ---- 4. the prompt GEMM over the plan (gfx11 WMMA) ----------------------------------------------------------------
 // Grid (N / 128, items, mats), 256 threads (8 waves: 2 along m x 4 along n). A block owns one item and one 128-column
-// block; passes of 64 member rows. A k step of 32: the step's 2 x 8 trellis tiles decoded into LDS as fp16 [n][k] (the
-// B layout: a lane a column, 16 k), the rows' x into LDS [m][k], two v_wmma_f32_16x16x16_f16 a 16 x 16 accumulator;
-// the next step's loads go to registers while this step computes. FOLD > 0: each group of FOLD k steps (FOLD x 32 k)
+// block; passes of 64 member rows. A k stage of 64: the stage's 4 x 8 trellis tiles decoded into LDS as fp16 [n][k] (the
+// B layout: a lane a column, 16 k), the rows' x into LDS [m][k], four v_wmma_f32_16x16x16_f16 a 16 x 16 accumulator;
+// the next stage's loads go to registers while this stage computes. FOLD > 0: each group of FOLD k stages (FOLD x 64 k)
 // runs its WMMA chain from zero and is added to the fp32 sum on the VALU, groups in k order (gfx1151's f16 WMMA adds
 // with a truncating aligner, so a chain over all of K drifts: lane G4's probe, K 4,096: 0.66 % bf16 flips on one chain,
 // 0.017 % with 64-k groups). FOLD 0: one WMMA chain over K (the numerics reference). Either way one order for each
@@ -251,17 +251,19 @@ TF_EXL3_GEMV(8)
 
 namespace {
 
-constexpr int kBM = 64, kBK = 32, kLK = kBK + 8;  // rows a pass, k a step, halves an LDS row
+constexpr int kBM = 64;  // rows a pass
+constexpr int kBK = 64;  // the served k a stage (BK); 32 is the earlier form, kept for the tests' bit check
 
 typedef _Float16 h16 __attribute__((ext_vector_type(16)));
 typedef float f8 __attribute__((ext_vector_type(8)));
 
-template <int K2, int CB, int FOLD, int EPI>
+template <int K2, int CB, int FOLD, int EPI, int BK = kBK>
 __device__ void gemm(const uint16_t* X0, const uint16_t* X1, int x_div, const uint64_t* tp0, const uint64_t* tp1,
                      const int* items, const int* members, float* z, int k, int n, int pairs, int experts,
                      const uint16_t* svh_d, float* y) {
 #if TF_DEVICE_WMMA_GFX11
     constexpr int TW = tile_words<K2>();
+    constexpr int kKT = BK / 16, kLK = BK + 8, kAH = BK / 32;  // k tiles a stage, halves an LDS row, x chunks a thread
     const int it = blockIdx.y, mat = blockIdx.z, nb = blockIdx.x;
     const int e = items[3 * it], first = items[3 * it + 1], count = items[3 * it + 2];
     if (count <= 0 || e < 0 || e >= experts) return;
@@ -270,31 +272,35 @@ __device__ void gemm(const uint16_t* X0, const uint16_t* X1, int x_div, const ui
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int wm = warp & 1, wn = warp >> 1;  // rows 32 wm.., columns 32 wn..
     const int t = lane & 3, g = lane >> 2, l16 = lane & 15;
-    const int Nt = n >> 4, iters = k / kBK;
+    const int Nt = n >> 4, iters = k / BK;
     const uint16_t* X = mat ? X1 : X0;
     const uint32_t* T = reinterpret_cast<const uint32_t*>(mat ? tp1[e] : tp0[e]);
-    // a thread's x chunk: row tid / 4, 8 halves at k (tid % 4) * 8; a wave's 2 trellis tiles: q = 2 warp + u
+    // a thread's x chunks: row tid / 4, 8 halves at k (tid % 4) * 8 (+ 32 at BK 64); a wave's kKT trellis tiles:
+    // q = kKT warp + u (k tile q / 8, n tile q % 8)
     const int arow = threadIdx.x >> 2, akc = threadIdx.x & 3;
 
     for (int h0 = 0; h0 < count; h0 += kBM) {
         const int rows = count - h0 < kBM ? count - h0 : kBM;
         const bool alive = arow < rows;
         const uint16_t* xa = X + (alive ? static_cast<size_t>(members[first + h0 + arow] / x_div) * k : 0) + akc * 8;
-        uint4 ra;
-        uint32_t rb[2][lane_words<K2>()];
+        uint4 ra[kAH];
+        uint32_t rb[kKT][lane_words<K2>()];
         auto gload = [&](int s) {
-            ra = alive ? *reinterpret_cast<const uint4*>(xa + s * kBK) : make_uint4(0u, 0u, 0u, 0u);
 #pragma unroll
-            for (int u = 0; u < 2; ++u) {
-                const int q = 2 * warp + u, kk = q >> 3, nt = q & 7;
-                lane_load<K2>(T + (static_cast<size_t>(s * 2 + kk) * Nt + nb * 8 + nt) * TW, lane, rb[u]);
+            for (int h = 0; h < kAH; ++h)
+                ra[h] = alive ? *reinterpret_cast<const uint4*>(xa + s * BK + h * 32) : make_uint4(0u, 0u, 0u, 0u);
+#pragma unroll
+            for (int u = 0; u < kKT; ++u) {
+                const int q = kKT * warp + u, kk = q >> 3, nt = q & 7;
+                lane_load<K2>(T + (static_cast<size_t>(s * kKT + kk) * Nt + nb * 8 + nt) * TW, lane, rb[u]);
             }
         };
         auto sstore = [&](int buf) {
-            *reinterpret_cast<uint4*>(&As[buf][arow * kLK + akc * 8]) = ra;
 #pragma unroll
-            for (int u = 0; u < 2; ++u) {
-                const int q = 2 * warp + u, kk = q >> 3, nt = q & 7;
+            for (int h = 0; h < kAH; ++h) *reinterpret_cast<uint4*>(&As[buf][arow * kLK + akc * 8 + h * 32]) = ra[h];
+#pragma unroll
+            for (int u = 0; u < kKT; ++u) {
+                const int q = kKT * warp + u, kk = q >> 3, nt = q & 7;
                 uint32_t p[4];
                 decode_lane<K2, CB>(rb[u], lane, p);
                 _Float16* c0 = &Bs[buf][(nt * 16 + g) * kLK + kk * 16 + 2 * t];
@@ -319,7 +325,7 @@ __device__ void gemm(const uint16_t* X0, const uint16_t* X1, int x_div, const ui
             const int buf = s & 1;
             if (s + 1 < iters) gload(s + 1);
 #pragma unroll
-            for (int kk = 0; kk < 2; ++kk) {
+            for (int kk = 0; kk < kKT; ++kk) {
                 h16 af[2], bf[2];
 #pragma unroll
                 for (int i = 0; i < 2; ++i) af[i] = *reinterpret_cast<const h16*>(&As[buf][(wm * 32 + i * 16 + l16) * kLK + kk * 16]);
@@ -352,7 +358,7 @@ __device__ void gemm(const uint16_t* X0, const uint16_t* X1, int x_div, const ui
         }
         // accumulator element r of lane l: row 2 r + l / 16, column l % 16 of its 16 x 16 block
         if constexpr (EPI) {
-            // the sums of 32 rows (the waves of one wm) in LDS over Bs (20,480 B >= 32 x 128 x 4 B), then a wave a row:
+            // the sums of 32 rows (the waves of one wm) in LDS over Bs (36,864 B >= 32 x 128 x 4 B), then a wave a row:
             // tf_exl3_down_epilogue's statements (sk 1) on its 128 columns
             float* zs = reinterpret_cast<float*>(&Bs[0][0]);
             for (int hf = 0; hf < 2; ++hf) {
@@ -409,8 +415,8 @@ __device__ void gemm(const uint16_t* X0, const uint16_t* X1, int x_div, const ui
 
 }  // namespace
 
-// GLM's prompt GEMM: 64-k groups (2 steps) folded on the VALU.
-constexpr int kGemmFold = 2;
+// GLM's prompt GEMM: 64-k groups (one stage of kBK 64) folded on the VALU.
+constexpr int kGemmFold = 64 / kBK;
 
 extern "C" __global__ void __launch_bounds__(256) tf_exl3_gemm(const uint16_t* X0, const uint16_t* X1, int x_div,
                                                                const uint64_t* tp0, const uint64_t* tp1, const int* items,
@@ -433,6 +439,15 @@ extern "C" __global__ void __launch_bounds__(256) tf_exl3_gemm_chain(const uint1
                                                                      const int* items, const int* members, float* z,
                                                                      int k, int n, int pairs, int experts) {
     gemm<8, kMcg, 0, 0>(X0, X1, x_div, tp0, tp1, items, members, z, k, n, pairs, experts, nullptr, nullptr);
+}
+
+// The GEMM at the earlier 32-k stages (64-k groups of 2 stages): the tests' check that the served 64-k stage gives the
+// same bits (the same WMMA chain a group, groups in k order). Not served.
+extern "C" __global__ void __launch_bounds__(256) tf_exl3_gemm_bk32(const uint16_t* X0, const uint16_t* X1, int x_div,
+                                                                    const uint64_t* tp0, const uint64_t* tp1,
+                                                                    const int* items, const int* members, float* z,
+                                                                    int k, int n, int pairs, int experts) {
+    gemm<8, kMcg, 2, 0, 32>(X0, X1, x_div, tp0, tp1, items, members, z, k, n, pairs, experts, nullptr, nullptr);
 }
 
 // ---- 5. the epilogues -----------------------------------------------------------------------------------------------
