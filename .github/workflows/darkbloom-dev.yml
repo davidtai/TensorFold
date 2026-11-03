@@ -1,0 +1,13 @@
+name: Darkbloom dev sandbox e2e
+on: push
+jobs:
+  dev:
+    name: Darkbloom dev sandbox e2e
+    runs-on: [self-hosted, linux, ARM64, darkbloom-linux-arm64]
+    timeout-minutes: 20
+    steps:
+      - run: uname -a
+      - run: cat /etc/os-release
+      - run: nproc && free -h && df -h .
+      - run: git --version && python3 --version
+      - run: curl -sS -o /dev/null -w 'github.com %{http_code} in %{time_total}s\n' https://github.com
