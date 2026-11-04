@@ -8,8 +8,16 @@ jobs:
     runs-on: [self-hosted, linux, ARM64, darkbloom-linux-arm64]
     timeout-minutes: 20
     steps:
-      - run: uname -a
-      - run: cat /etc/os-release
-      - run: nproc && free -h && df -h .
-      - run: git --version && python3 --version
-      - run: curl -sS -o /dev/null -w 'github.com %{http_code} in %{time_total}s\n' https://github.com || echo "github.com not reachable"
+      - run: uname -a && nproc && free -h
+      - name: Egress probe every 5 s for 3 min
+        run: |
+          fails=0; tail=0
+          for i in $(seq 1 36); do
+            t=$(date -u +%H:%M:%S)
+            code=$(curl -sS -m 4 -o /dev/null -w '%{http_code}' https://github.com 2>/dev/null || echo ERR)
+            echo "$t probe $i github.com $code"
+            if [ "$code" = 200 ]; then tail=0; else fails=$((fails+1)); tail=$((tail+1)); fi
+            sleep 5
+          done
+          echo "probes failed: $fails of 36; failing at the end: $tail"
+          [ "$tail" -lt 3 ]
