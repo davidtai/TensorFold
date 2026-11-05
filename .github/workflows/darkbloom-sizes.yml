@@ -1,0 +1,23 @@
+name: Darkbloom dev sandbox job sizes
+on:
+  push:
+    branches: [sandbox-dev-sizes]
+permissions:
+  contents: read
+jobs:
+  size:
+    name: Darkbloom job size ${{ matrix.label }}
+    strategy:
+      fail-fast: false
+      matrix:
+        label: [darkbloom-linux-arm64-8x32, darkbloom-linux-arm64-4x16, darkbloom-linux-arm64]
+    runs-on: [self-hosted, linux, ARM64, "${{ matrix.label }}"]
+    timeout-minutes: 15
+    steps:
+      - name: VM size in the guest
+        run: |
+          echo "label ${{ matrix.label }}"
+          echo "nproc $(nproc)"
+          grep -E '^(MemTotal|MemAvailable):' /proc/meminfo
+          free -b
+          uname -a
