@@ -1,0 +1,51 @@
+# The drill's egress jobs (deploy/gcp/k8s/drill/drill.sh, the P6 cases and
+# DBX_DRILL_EGRESS_LOAD=1): a copy of this file is the probe repository's
+# .github/workflows/darkbloom-dev-egress.yml, on the probe branch and on the
+# default branch (GitHub dispatches only a workflow it finds there). The
+# drill refuses a probe branch whose copy differs.
+#
+# Each job downloads one file through the gateway's tunnel in one connection,
+# held to a rate that makes it last `seconds`: a tunnel that an
+# infrastructure event cuts ends the download, and the job fails (curl never
+# resumes), so the plane counts the cut and re-runs the job once (design
+# D-11). `url` is any file the probe's egress admits whose HEAD answer has a
+# Content-Length. `label` is the drill case's: the run's name carries it, so
+# the drill reads only the runs it dispatched.
+name: Darkbloom dev sandbox egress load
+run-name: egress load ${{ inputs.label }}
+on:
+  workflow_dispatch:
+    inputs:
+      label:
+        description: the drill case's label
+        required: true
+      url:
+        description: the file to download (https)
+        required: true
+      seconds:
+        description: how long the download lasts, 120 to 180
+        required: true
+        default: "150"
+permissions:
+  contents: read
+jobs:
+  egress:
+    name: Darkbloom dev sandbox egress load
+    runs-on: [self-hosted, linux, ARM64, darkbloom-linux-arm64]
+    timeout-minutes: 20
+    steps:
+      - name: One download through the tunnel
+        env:
+          URL: ${{ inputs.url }}
+          WANTED_S: ${{ inputs.seconds }}
+        run: |
+          set -eu
+          case "$WANTED_S" in 12[0-9] | 1[3-7][0-9] | 180) ;; *) echo "seconds: $WANTED_S is not 120 to 180"; exit 2 ;; esac
+          size="$(curl -fsSIL --proto '=https' --proto-redir '=https' --max-time 30 "$URL" | tr -d '\r' |
+            awk 'tolower($1) == "content-length:" { n = $2 } END { print n + 0 }')"
+          [ "$size" -gt 0 ] || { echo "no Content-Length for $URL"; exit 2; }
+          rate=$((size / WANTED_S + 1))
+          start="$(date +%s)"
+          curl -fsSL --proto '=https' --proto-redir '=https' --max-time $((WANTED_S * 2)) --limit-rate "$rate" \
+            -o /dev/null "$URL"
+          echo "downloaded $size bytes in $(($(date +%s) - start)) s at $rate bytes/s"
