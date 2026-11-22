@@ -1,4 +1,22 @@
 name: Darkbloom dev sandbox e2e
+# The drill's probe job (deploy/gcp/k8s/drill/drill.sh), as the probe
+# repository's .github/workflows/darkbloom-dev.yml on the probe branch, one
+# workflow under one approval. A push runs it; it holds no expression (the
+# plane's workflow policy refuses every one: crates/policy
+# validate_workflow, which a test runs on this file). The step reads its mode
+# from the head commit's message in the push event the runner writes
+# ($GITHUB_EVENT_PATH):
+#   neither key   today's probe: 36 egress probes 5 s apart, as the reviewed
+#                 file before this one ran them
+#   job_seconds=N (DBX_DRILL_LONG_JOBS=on) the job runs N seconds (60 to 900,
+#                 inside today's 20 minutes) and writes a heartbeat line every
+#                 10 s with its egress probe, so one job spans the faults of a
+#                 case; the drill reads the longest gap from the job's log
+#   egress_url=URL egress_seconds=N (the drill's egress load) one download of
+#                 URL through the gateway's tunnel in one connection, held to
+#                 a rate that makes it last N seconds (120 to 180): a cut
+#                 tunnel ends it and the job fails (curl never resumes)
+# The probes fail the job when the egress fails 3 times at the end.
 on: push
 permissions:
   contents: read
@@ -11,13 +29,42 @@ jobs:
       - run: uname -a && nproc && free -h
       - name: Egress probe every 5 s for 3 min
         run: |
+          head="$(tr -d '\n' <"$GITHUB_EVENT_PATH" | sed -n 's/.*"head_commit"//p')"
+          secs=$(printf '%s\n' "$head" | grep -oE 'job_seconds=[0-9]{2,4}' | head -n 1 | cut -d= -f2)
+          egress_url=$(printf '%s\n' "$head" | grep -oE 'egress_url=https://[A-Za-z0-9.-]+/[A-Za-z0-9./_~%+=-]*' | head -n 1 | cut -d= -f2-)
+          egress_s=$(printf '%s\n' "$head" | grep -oE 'egress_seconds=[0-9]{3}' | head -n 1 | cut -d= -f2)
           fails=0; tail=0
-          for i in $(seq 1 36); do
-            t=$(date -u +%H:%M:%S)
-            code=$(curl -sS -m 4 -o /dev/null -w '%{http_code}' https://github.com 2>/dev/null || echo ERR)
-            echo "$t probe $i github.com $code"
-            if [ "$code" = 200 ]; then tail=0; else fails=$((fails+1)); tail=$((tail+1)); fi
-            sleep 5
-          done
-          echo "probes failed: $fails of 36; failing at the end: $tail"
+          if [ -n "$egress_url" ]; then
+            case "$egress_s" in 12[0-9] | 1[3-7][0-9] | 180) ;; *) echo "egress_seconds=$egress_s is not 120 to 180"; exit 2 ;; esac
+            size="$(curl -fsSIL --proto '=https' --proto-redir '=https' --max-time 30 "$egress_url" | tr -d '\r' |
+              awk 'tolower($1) == "content-length:" { n = $2 } END { print n + 0 }')"
+            [ "$size" -gt 0 ] || { echo "no Content-Length for $egress_url"; exit 2; }
+            rate=$((size / egress_s + 1))
+            start="$(date +%s)"
+            curl -fsSL --proto '=https' --proto-redir '=https' --max-time $((egress_s * 2)) --limit-rate "$rate" \
+              -o /dev/null "$egress_url"
+            echo "downloaded $size bytes in $(($(date +%s) - start)) s at $rate bytes/s"
+            exit 0
+          fi
+          if [ -z "$secs" ]; then
+            for i in $(seq 1 36); do
+              t=$(date -u +%H:%M:%S)
+              code=$(curl -sS -m 4 -o /dev/null -w '%{http_code}' https://github.com 2>/dev/null || echo ERR)
+              echo "$t probe $i github.com $code"
+              if [ "$code" = 200 ]; then tail=0; else fails=$((fails+1)); tail=$((tail+1)); fi
+              sleep 5
+            done
+            echo "probes failed: $fails of 36; failing at the end: $tail"
+          else
+            [ "$secs" -ge 60 ] && [ "$secs" -le 900 ] || { echo "job_seconds=$secs is not 60 to 900"; exit 1; }
+            end=$(( $(date +%s) + secs )); n=0
+            while [ "$(date +%s)" -lt "$end" ]; do
+              n=$((n+1))
+              code=$(curl -sS -m 4 -o /dev/null -w '%{http_code}' https://github.com 2>/dev/null || echo ERR)
+              echo "$(date -u +%H:%M:%S) heartbeat $n github.com $code"
+              if [ "$code" = 200 ]; then tail=0; else fails=$((fails+1)); tail=$((tail+1)); fi
+              sleep 10
+            done
+            echo "heartbeats: $n in $secs s; probes failed: $fails; failing at the end: $tail"
+          fi
           [ "$tail" -lt 3 ]
