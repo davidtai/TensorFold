@@ -1,12 +1,4 @@
 name: Darkbloom dev sandbox e2e
-# The drill's probe job (deploy/gcp/k8s/drill/drill.sh), as the probe
-# repository's .github/workflows/darkbloom-dev.yml on the probe branch.
-# A push runs it. Without `job_seconds=N` in the head commit's message it is
-# today's probe: 36 egress probes 5 s apart. With it (DBX_DRILL_LONG_JOBS=on:
-# the drill's push helper adds it), the job runs N seconds (60 to 3600) and
-# writes a heartbeat line every 10 s with its egress probe, so one job spans
-# the faults of a case; the drill reads the job's log for the heartbeat's
-# longest gap. Either way it fails when the egress fails 3 times at the end.
 on: push
 permissions:
   contents: read
@@ -14,35 +6,18 @@ jobs:
   dev:
     name: Darkbloom dev sandbox e2e
     runs-on: [self-hosted, linux, ARM64, darkbloom-linux-arm64]
-    # Today's 20 minutes; 70 for a long job (up to 3600 s).
-    timeout-minutes: ${{ contains(github.event.head_commit.message, 'job_seconds=') && 70 || 20 }}
+    timeout-minutes: 20
     steps:
       - run: uname -a && nproc && free -h
-      - name: ${{ contains(github.event.head_commit.message, 'job_seconds=') && 'Egress probe and heartbeat every 10 s for job_seconds' || 'Egress probe every 5 s for 3 min' }}
-        env:
-          MESSAGE: ${{ github.event.head_commit.message }}
+      - name: Egress probe every 5 s for 3 min
         run: |
-          secs=$(printf '%s\n' "$MESSAGE" | sed -nE 's/.*job_seconds=([0-9]{2,4}).*/\1/p' | head -n 1)
           fails=0; tail=0
-          if [ -z "$secs" ]; then
-            for i in $(seq 1 36); do
-              t=$(date -u +%H:%M:%S)
-              code=$(curl -sS -m 4 -o /dev/null -w '%{http_code}' https://github.com 2>/dev/null || echo ERR)
-              echo "$t probe $i github.com $code"
-              if [ "$code" = 200 ]; then tail=0; else fails=$((fails+1)); tail=$((tail+1)); fi
-              sleep 5
-            done
-            echo "probes failed: $fails of 36; failing at the end: $tail"
-          else
-            [ "$secs" -ge 60 ] && [ "$secs" -le 3600 ] || { echo "job_seconds=$secs is not 60 to 3600"; exit 1; }
-            end=$(( $(date +%s) + secs )); n=0
-            while [ "$(date +%s)" -lt "$end" ]; do
-              n=$((n+1))
-              code=$(curl -sS -m 4 -o /dev/null -w '%{http_code}' https://github.com 2>/dev/null || echo ERR)
-              echo "$(date -u +%H:%M:%S) heartbeat $n github.com $code"
-              if [ "$code" = 200 ]; then tail=0; else fails=$((fails+1)); tail=$((tail+1)); fi
-              sleep 10
-            done
-            echo "heartbeats: $n in $secs s; probes failed: $fails; failing at the end: $tail"
-          fi
+          for i in $(seq 1 36); do
+            t=$(date -u +%H:%M:%S)
+            code=$(curl -sS -m 4 -o /dev/null -w '%{http_code}' https://github.com 2>/dev/null || echo ERR)
+            echo "$t probe $i github.com $code"
+            if [ "$code" = 200 ]; then tail=0; else fails=$((fails+1)); tail=$((tail+1)); fi
+            sleep 5
+          done
+          echo "probes failed: $fails of 36; failing at the end: $tail"
           [ "$tail" -lt 3 ]
